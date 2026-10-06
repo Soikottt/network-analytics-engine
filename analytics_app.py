@@ -52,18 +52,22 @@ def compute_dynamic_analytics(df: pd.DataFrame, group_by_col: str) -> pd.DataFra
 st.title("📊 Network & Campaign Intelligence Dashboard")
 st.markdown("Independent Analytics Engine for Google Sheets Data")
 
-# Hardcoded Sheet Name (Apni ekhane apnar ashol sheet er nam ta diye dite paren)
-TARGET_SHEET_NAME = "Ringba to Sheet QC" 
+# Input boxes with your exact sheet and tab names pre-filled
+col1, col2 = st.columns(2)
+with col1:
+    target_sheet_name = st.text_input("Google Sheet Name:", "Ringba to Sheet QC")
+with col2:
+    target_tab_name = st.text_input("Sheet Tab Name:", "ALL QC from 30 Sept 2026")
 
 if st.button("🔄 Fetch & Analyze Data"):
     try:
         with st.spinner("Connecting to Google Sheets..."):
             gc = get_google_client()
-            sheet = gc.open(TARGET_SHEET_NAME).worksheet("Sheet1")
+            sheet = gc.open(target_sheet_name).worksheet(target_tab_name)
             df = load_sheet_data(sheet)
 
         if not df.empty:
-            st.success(f"Successfully loaded {len(df)} records from '{TARGET_SHEET_NAME}'!")
+            st.success(f"Successfully loaded {len(df)} records from '{target_sheet_name}' ({target_tab_name})!")
 
             # Metric selector dropdown
             available_columns = [col for col in ['Publisher', 'Buyer', 'get_campaign_category', 'Line Type', 'Phone Company'] if col in df.columns]
