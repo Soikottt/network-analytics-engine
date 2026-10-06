@@ -16,16 +16,15 @@ def get_google_client():
 
 def load_sheet_data(worksheet) -> pd.DataFrame:
     try:
-        # get_all_values use korle khali header ba duplicate issues handle kora easy hoy
         rows = worksheet.get_all_values()
         if not rows or len(rows) < 2:
             return pd.DataFrame()
         
-        headers = rows[0]
+        headers = [str(h).strip() for h in rows[0]]
         data = rows[1:]
         
-        # Handle empty header names by assigning fallback names if any header is blank
-        cleaned_headers = [h.strip() if h and str(h).strip() != "" else f"Unnamed_{i}" for i, h in enumerate(headers)]
+        # Handle empty header names
+        cleaned_headers = [h if h != "" else f"Unnamed_{i}" for i, h in enumerate(headers)]
         
         df = pd.DataFrame(data, columns=cleaned_headers)
         return df
@@ -37,31 +36,49 @@ def compute_dynamic_analytics(df: pd.DataFrame, group_by_col: str) -> pd.DataFra
     if df.empty or group_by_col not in df.columns:
         return pd.DataFrame()
 
-    df['Quality Score'] = pd.to_numeric(df['Quality Score'], errors='coerce').fillna(0)
-    df['Duration'] = pd.to_numeric(df['Duration'], errors='coerce').fillna(0)
+    # Safe data type casting
+    if 'Quality Score' in df.columns:
+        df['Quality Score'] = pd.to_numeric(df['Quality Score'], errors='coerce').fillna(0)
+    else:
+        df['Quality Score'] = 0
+
+    if 'Duration' in df.columns:
+        df['Duration'] = pd.to_numeric(df['Duration'], errors='coerce').fillna(0)
+    else:
+        df['Duration'] = 0
+
     df[group_by_col] = df[group_by_col].fillna('Unknown').astype(str).str.strip()
 
-    summary = df.groupby(group_by_col).agg(
-        Total_Calls=('Call Date', 'count'),
-        Avg_Score=('Quality Score', 'mean'),
-        Avg_Duration=('Duration', 'mean'),
-        Qualified_Calls=('AI QC Report', lambda x: x.str.contains('Qualified', case=False, na=False).sum()),
-        Spam_Calls=('AI QC Report', lambda x: x.str.contains('Spam|Robo|Solicitation', case=False, na=False).sum()),
-        Non_Qualified=('AI QC Report', lambda x: x.str.contains('Non-Qualified|Info Only', case=False, na=False).sum())
-    ).reset_index()
+    # Dynamic aggregation based on available columns
+    agg_dict = {
+        'Total_Calls': ('Call Date', 'count') if 'Call Date' in df.columns else (df.columns[0], 'count'),
+        'Avg_Score': ('Quality Score', 'mean'),
+        'Avg_Duration': ('Duration', 'mean')
+    }
 
-    summary['Qualification_%'] = (summary['Qualified_Calls'] / summary['Total_Calls'] * 100).round(1)
-    summary['Spam_%'] = (summary['Spam_Calls'] / summary['Total_Calls'] * 100).round(1)
+    if 'AI QC Report' in df.columns:
+        agg_dict.update({
+            'Qualified_Calls': ('AI QC Report', lambda x: x.str.contains('Qualified', case=False, na=False).sum()),
+            'Spam_Calls': ('AI QC Report', lambda x: x.str.contains('Spam|Robo|Solicitation', case=False, na=False).sum()),
+            'Non_Qualified': ('AI QC Report', lambda x: x.str.contains('Non-Qualified|Info Only', case=False, na=False).sum())
+        })
+
+    summary = df.groupby(group_by_col).agg(**agg_dict).reset_index()
+
+    if 'Qualified_Calls' in summary.columns and 'Total_Calls' in summary.columns:
+        summary['Qualification_%'] = (summary['Qualified_Calls'] / summary['Total_Calls'] * 100).round(1)
+    if 'Spam_Calls' in summary.columns and 'Total_Calls' in summary.columns:
+        summary['Spam_%'] = (summary['Spam_Calls'] / summary['Total_Calls'] * 100).round(1)
+        
     summary['Avg_Score'] = summary['Avg_Score'].round(1)
     summary['Avg_Duration'] = summary['Avg_Duration'].round(1)
 
-    return summary.sort_values(by='Total_Calls', ascending=False)
+    return summary.sort_values(by=summary.columns[1], ascending=False)
 
 # --- STREAMLIT UI ---
 st.title("📊 Network & Campaign Intelligence Dashboard")
 st.markdown("Independent Analytics Engine for Google Sheets Data")
 
-# Input boxes with your exact sheet and tab names pre-filled
 col1, col2 = st.columns(2)
 with col1:
     target_sheet_name = st.text_input("Google Sheet Name:", "Ringba to Sheet QC")
@@ -78,18 +95,18 @@ if st.button("🔄 Fetch & Analyze Data"):
         if not df.empty:
             st.success(f"Successfully loaded {len(df)} records from '{target_sheet_name}' ({target_tab_name})!")
 
-            # Metric selector dropdown
-            available_columns = [col for col in ['Publisher', 'Buyer', 'get_campaign_category', 'Line Type', 'Phone Company'] if col in df.columns]
+            # Show ALL columns of the sheet in the dropdown
+            available_columns = [col for col in df.columns if not col.startswith("Unnamed_")]
             
             if available_columns:
-                selected_dimension = st.selectbox("Group / Analyze By:", available_columns)
+                selected_dimension = st.selectbox("Group / Analyze By (All Sheet Headings):", available_columns)
                 
                 result_df = compute_dynamic_analytics(df, selected_dimension)
 
                 st.subheader(f"Performance Breakdown by {selected_dimension}")
                 st.dataframe(result_df, use_container_width=True)
             else:
-                st.warning("Expected columns (Publisher, Buyer, etc.) not found in the Sheet headers.")
+                st.warning("No valid column headers found in the Sheet.")
         else:
             st.info("The sheet is empty.")
     except Exception as e:
