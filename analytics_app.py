@@ -1,22 +1,22 @@
 import streamlit as st
 import pandas as pd
 import gspread
+from datetime import datetime
 
-# Page Config (Wide layout for better data viewing)
-st.set_page_config(page_title="Network Analytics Dashboard", layout="wide", initial_sidebar_state="collapsed")
+# Page Config
+st.set_page_config(page_title="Network & Campaign Intelligence Dashboard", layout="wide", initial_sidebar_state="expanded")
 
 st.title("📊 Network & Campaign Intelligence Dashboard")
-st.markdown("Independent Analytics Engine for Google Sheets Data")
+st.markdown("Advanced Publisher & Campaign Intelligence Engine")
 
-# Connection Inputs
-col1, col2 = st.columns(2)
-with col1:
-    target_sheet_name = st.text_input("Google Sheet Name:", "Ringba to Sheet QC")
-with col2:
-    target_tab_name = st.text_input("Sheet Tab Name:", "ALL QC from 30 Sept 2026")
+# --- SIDEBAR: Controls & Connection ---
+st.sidebar.header("⚙️ Configuration & Filters")
 
-# Explicit Load Button to Prevent Startup Freezing
-if st.button("🔄 Connect & Load Data"):
+target_sheet_name = st.sidebar.text_input("Google Sheet Name:", "Ringba to Sheet QC")
+target_tab_name = st.sidebar.text_input("Sheet Tab Name:", "ALL QC from 30 Sept 2026")
+
+# Refresh / Connect Data Button
+if st.sidebar.button("🔄 Connect & Load Data") or 'sheet_loaded' not in st.session_state:
     try:
         with st.spinner("Connecting to Google Sheets..."):
             try:
@@ -28,7 +28,7 @@ if st.button("🔄 Connect & Load Data"):
             rows = sheet.get_all_values()
 
         if not rows or len(rows) < 2:
-            st.warning("The sheet is empty or contains no data rows.")
+            st.sidebar.warning("The sheet is empty or contains no data rows.")
             st.session_state['sheet_loaded'] = False
         else:
             headers = [str(h).strip() for h in rows[0]]
@@ -36,42 +36,57 @@ if st.button("🔄 Connect & Load Data"):
             cleaned_headers = [h if h != "" else f"Unnamed_{i}" for i, h in enumerate(headers)]
             
             df = pd.DataFrame(data, columns=cleaned_headers)
-            
             st.session_state['df'] = df
             st.session_state['sheet_loaded'] = True
-            st.success(f"Successfully loaded {len(df)} records!")
+            st.sidebar.success(f"Loaded {len(df):,} records successfully!")
 
     except Exception as e:
-        st.error(f"Failed to load data: {str(e)}")
+        st.sidebar.error(f"Failed: {str(e)}")
         st.session_state['sheet_loaded'] = False
 
-# Main Dashboard Execution (Only runs when data is loaded)
+# Main Execution Flow
 if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
     df = st.session_state['df']
-    
     available_columns = [col for col in df.columns if not col.startswith("Unnamed_")]
     
     if available_columns:
-        st.markdown("---")
+        # --- FEATURE 1: Global Search Box ---
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔍 Global Search")
+        search_query = st.sidebar.text_input("Search Phone, Caller ID, Note, etc.:", "").strip()
         
-        # --- LIGHTWEIGHT FEATURE 1: Global Search Box ---
-        search_query = st.text_input("🔍 Global Search (Filters entire dataset instantly by Phone, Caller ID, Note, etc.):", "").strip()
         if search_query:
-            # Fast filtering across all string columns
             mask = df.apply(lambda row: row.astype(str).str.contains(search_query, case=False, na=False).any(), axis=1)
             work_df = df[mask].copy()
-            st.info(f"Global search active: Found {len(work_df)} matching record(s).")
+            st.sidebar.info(f"Filtered: {len(work_df):,} records found")
         else:
             work_df = df.copy()
 
-        # --- LIGHTWEIGHT FEATURE 2: Top KPI Metric Cards ---
-        st.markdown("### 📈 Network Overview")
-        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        # --- FEATURE 2: Advanced Filters (Sliders for Score & Duration) ---
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🎛️ Advanced Range Filters")
+        
+        # Cast data types safely for filtering
+        if 'Quality Score' in work_df.columns:
+            work_df['Quality Score Num'] = pd.to_numeric(work_df['Quality Score'], errors='coerce').fillna(0)
+            min_score, max_score = int(work_df['Quality Score Num'].min()), int(work_df['Quality Score Num'].max())
+            selected_score_range = st.sidebar.slider("Quality Score Range:", min_score, max_score, (min_score, max_score))
+            work_df = work_df[(work_df['Quality Score Num'] >= selected_score_range[0]) & (work_df['Quality Score Num'] <= selected_score_range[1])]
+
+        if 'Duration' in work_df.columns:
+            work_df['Duration Num'] = pd.to_numeric(work_df['Duration'], errors='coerce').fillna(0)
+            min_dur, max_dur = int(work_df['Duration Num'].min()), int(work_df['Duration Num'].max())
+            selected_dur_range = st.sidebar.slider("Duration Range (secs):", min_dur, max_dur, (min_dur, max_dur))
+            work_df = work_df[(work_df['Duration Num'] >= selected_dur_range[0]) & (work_df['Duration Num'] <= selected_dur_range[1])]
+
+        # --- FEATURE 3: Top KPI Metric Cards (Including VoIP & VoIP %) ---
+        st.markdown("### 📈 Network Overview & Key Metrics")
+        kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
         
         total_calls_count = len(work_df)
-        kpi1.metric("Total Calls", f"{total_calls_count:,}")
+        kpi1.metric("Total Filtered Calls", f"{total_calls_count:,}")
         
-        # Safe metric calculations
+        # Safe QC calculations
         if 'AI QC Report' in work_df.columns:
             qual_count = work_df['AI QC Report'].str.contains('Qualified', case=False, na=False).sum()
             spam_count = work_df['AI QC Report'].str.contains('Spam|Robo|Solicitation', case=False, na=False).sum()
@@ -83,46 +98,55 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             kpi2.metric("Qualified Calls", "N/A")
             kpi3.metric("Spam / Fake Calls", "N/A")
 
-        if 'Quality Score' in work_df.columns:
-            numeric_scores = pd.to_numeric(work_df['Quality Score'], errors='coerce')
-            avg_scr = numeric_scores.mean()
-            kpi4.metric("Avg Quality Score", f"{avg_scr:.1f}" if not pd.isna(avg_scr) else "0.0")
+        # VoIP Calculation (Checking if 'VoIP' column or text exists in columns)
+        voip_cols = [c for c in work_df.columns if 'voip' in c.lower()]
+        if voip_cols:
+            voip_col_name = voip_cols[0]
+            voip_count = work_df[voip_col_name].astype(str).str.contains('yes|true|voip', case=False, na=False).sum()
+            voip_pct = (voip_count / total_calls_count * 100) if total_calls_count > 0 else 0
+            kpi4.metric("VoIP Calls", f"{voip_count:,} ({voip_pct:.1f}%)")
         else:
-            kpi4.metric("Avg Quality Score", "N/A")
+            kpi4.metric("VoIP Calls", "N/A (Col missing)")
+
+        if 'Quality Score Num' in work_df.columns:
+            avg_scr = work_df['Quality Score Num'].mean()
+            kpi5.metric("Avg Quality Score", f"{avg_scr:.1f}" if not pd.isna(avg_scr) else "0.0")
+        else:
+            kpi5.metric("Avg Quality Score", "N/A")
 
         st.markdown("---")
 
-        # Dimension Grouping Selection
+        # --- Dimension Grouping Section ---
         selected_dimension = st.selectbox("Group / Analyze By (All Sheet Headings):", available_columns)
         
         if selected_dimension:
             temp_df = work_df.copy()
             temp_df[selected_dimension] = temp_df[selected_dimension].fillna('Unknown').astype(str).str.strip()
             
-            # Safe data casting
-            if 'Quality Score' in temp_df.columns:
-                temp_df['Quality Score'] = pd.to_numeric(temp_df['Quality Score'], errors='coerce').fillna(0)
-            if 'Duration' in temp_df.columns:
-                temp_df['Duration'] = pd.to_numeric(temp_df['Duration'], errors='coerce').fillna(0)
-
+            # Aggregation Dictionary setup
             agg_dict = {'Total_Calls': (temp_df.columns[0], 'count')}
-            if 'Quality Score' in temp_df.columns:
-                agg_dict['Avg_Score'] = ('Quality Score', 'mean')
-            if 'Duration' in temp_df.columns:
-                agg_dict['Avg_Duration'] = ('Duration', 'mean')
+            if 'Quality Score Num' in temp_df.columns:
+                agg_dict['Avg_Score'] = ('Quality Score Num', 'mean')
+            if 'Duration Num' in temp_df.columns:
+                agg_dict['Avg_Duration'] = ('Duration Num', 'mean')
             if 'AI QC Report' in temp_df.columns:
                 agg_dict.update({
                     'Qualified_Calls': ('AI QC Report', lambda x: x.str.contains('Qualified', case=False, na=False).sum()),
                     'Spam_Calls': ('AI QC Report', lambda x: x.str.contains('Spam|Robo|Solicitation', case=False, na=False).sum()),
                     'Non_Qualified': ('AI QC Report', lambda x: x.str.contains('Non-Qualified|Info Only', case=False, na=False).sum())
                 })
+            if voip_cols:
+                agg_dict['VoIP_Calls'] = (voip_cols[0], lambda x: x.astype(str).str.contains('yes|true|voip', case=False, na=False).sum())
 
             summary = temp_df.groupby(selected_dimension).agg(**agg_dict).reset_index()
 
+            # Percentage & Rounding calculations
             if 'Qualified_Calls' in summary.columns and 'Total_Calls' in summary.columns:
                 summary['Qualification_%'] = (summary['Qualified_Calls'] / summary['Total_Calls'] * 100).round(1)
             if 'Spam_Calls' in summary.columns and 'Total_Calls' in summary.columns:
                 summary['Spam_%'] = (summary['Spam_Calls'] / summary['Total_Calls'] * 100).round(1)
+            if 'VoIP_Calls' in summary.columns and 'Total_Calls' in summary.columns:
+                summary['VoIP_%'] = (summary['VoIP_Calls'] / summary['Total_Calls'] * 100).round(1)
             if 'Avg_Score' in summary.columns:
                 summary['Avg_Score'] = summary['Avg_Score'].round(1)
             if 'Avg_Duration' in summary.columns:
@@ -132,14 +156,14 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             
             st.subheader(f"Performance Breakdown by {selected_dimension}")
             
-            # --- LIGHTWEIGHT FEATURE 3: Fast Native Bar Chart ---
+            # Fast Native Bar Chart
             if len(summary) > 0:
                 chart_data = summary.set_index(selected_dimension)['Total_Calls'].head(15)
                 st.bar_chart(chart_data)
 
             st.markdown("💡 *Select multiple rows in the table below to view and export their combined raw details:*")
 
-            # Interactive Table with multi-row selection enabled
+            # --- FEATURE 4: Multi-Row Interactive Selection Table ---
             event = st.dataframe(
                 summary, 
                 use_container_width=True, 
@@ -147,7 +171,7 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
                 selection_mode="multi-row"
             )
 
-            # --- DRILL-DOWN & LIGHTWEIGHT FEATURE 4: CSV Export ---
+            # --- FEATURE 5: Drill-Down & CSV Export ---
             selected_rows = event.selection.rows if hasattr(event, 'selection') else []
             
             if selected_rows:
@@ -157,9 +181,9 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
                 st.subheader(f"🔍 Full Details for selected `{selected_dimension}`: {', '.join(map(str, selected_vals))}")
                 
                 filtered_rows = work_df[temp_df[selected_dimension].isin(selected_vals)]
-                st.info(f"Total matching records found: {len(filtered_rows)}")
+                st.info(f"Total matching records found: {len(filtered_rows):,}")
                 
-                # Show Raw Details Table
+                # Raw Details Table
                 st.dataframe(filtered_rows, use_container_width=True)
                 
                 # Fast CSV Download Button
@@ -170,5 +194,15 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
                     file_name="filtered_network_records.csv",
                     mime="text/csv",
                 )
+
+            # --- FEATURE 6: Side-by-Side Comparison Section ---
+            st.markdown("---")
+            st.subheader("⚖️ Side-by-Side Comparison Mode")
+            compare_vals = st.multiselect(f"Select multiple items from '{selected_dimension}' to compare directly:", summary[selected_dimension].tolist())
+            
+            if compare_vals:
+                comparison_df = summary[summary[selected_dimension].isin(compare_vals)]
+                st.dataframe(comparison_df, use_container_width=True)
+                
     else:
         st.warning("No valid column headers found in the Sheet.")
