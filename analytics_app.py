@@ -16,10 +16,19 @@ def get_google_client():
 
 def load_sheet_data(worksheet) -> pd.DataFrame:
     try:
-        data = worksheet.get_all_records()
-        if not data:
+        # get_all_values use korle khali header ba duplicate issues handle kora easy hoy
+        rows = worksheet.get_all_values()
+        if not rows or len(rows) < 2:
             return pd.DataFrame()
-        return pd.DataFrame(data)
+        
+        headers = rows[0]
+        data = rows[1:]
+        
+        # Handle empty header names by assigning fallback names if any header is blank
+        cleaned_headers = [h.strip() if h and str(h).strip() != "" else f"Unnamed_{i}" for i, h in enumerate(headers)]
+        
+        df = pd.DataFrame(data, columns=cleaned_headers)
+        return df
     except Exception as e:
         st.error(f"Error loading sheet data: {e}")
         return pd.DataFrame()
