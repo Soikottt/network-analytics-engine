@@ -9,14 +9,14 @@ st.set_page_config(page_title="Network & Campaign Intelligence Dashboard", layou
 st.title("📊 Network & Campaign Intelligence Dashboard")
 st.markdown("Advanced Publisher & Campaign Intelligence Engine")
 
-# --- SIDEBAR: Controls & Connection ---
+# --- SIDEBAR: Controls, Connection & All Filters ---
 st.sidebar.header("⚙️ Configuration & Filters")
 
 target_sheet_name = st.sidebar.text_input("Google Sheet Name:", "Ringba to Sheet QC")
 target_tab_name = st.sidebar.text_input("Sheet Tab Name:", "ALL QC from 30 Sept 2026")
 
-# Refresh / Connect Data Button
-if st.sidebar.button("🔄 Connect & Load Data") or 'sheet_loaded' not in st.session_state:
+# Refresh / Connect Data Button (Cache Management)
+if st.sidebar.button("🔄 Connect & Load Fresh Data") or 'sheet_loaded' not in st.session_state:
     try:
         with st.spinner("Connecting to Google Sheets..."):
             try:
@@ -50,23 +50,43 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
     available_columns = [col for col in df.columns if not col.startswith("Unnamed_")]
     
     if available_columns:
+        work_df = df.copy()
+
         # --- FEATURE 1: Global Search Box ---
         st.sidebar.markdown("---")
         st.sidebar.subheader("🔍 Global Search")
         search_query = st.sidebar.text_input("Search Phone, Caller ID, Note, etc.:", "").strip()
         
         if search_query:
-            mask = df.apply(lambda row: row.astype(str).str.contains(search_query, case=False, na=False).any(), axis=1)
-            work_df = df[mask].copy()
-            st.sidebar.info(f"Filtered: {len(work_df):,} records found")
-        else:
-            work_df = df.copy()
+            mask = work_df.apply(lambda row: row.astype(str).str.contains(search_query, case=False, na=False).any(), axis=1)
+            work_df = work_df[mask].copy()
 
-        # --- FEATURE 2: Advanced Filters (Safe Sliders for Score & Duration) ---
+        # --- FEATURE 2: Date Range Filter ---
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🎛️ Advanced Range Filters")
+        st.sidebar.subheader("📅 Date Range Filter")
+        date_cols = [c for c in work_df.columns if 'date' in c.lower() or 'time' in c.lower() or 'day' in c.lower()]
         
-        # Safe Quality Score parsing
+        if date_cols:
+            date_col_name = date_cols[0]
+            work_df['Parsed_Date'] = pd.to_datetime(work_df[date_col_name], errors='coerce')
+            valid_dates = work_df['Parsed_Date'].dropna()
+            
+            if not valid_dates.empty:
+                min_d, max_d = valid_dates.min().date(), valid_dates.max().date()
+                date_range = st.sidebar.date_input("Select Date Range:", (min_d, max_d))
+                
+                if isinstance(date_range, tuple) and len(date_range) == 2:
+                    start_d, end_d = date_range
+                    work_df = work_df[(work_df['Parsed_Date'].dt.date >= start_d) & (work_df['Parsed_Date'].dt.date <= end_d)]
+            else:
+                st.sidebar.info("Date column found, but values could not be parsed.")
+        else:
+            st.sidebar.info("No date/time column detected for range filtering.")
+
+        # --- FEATURE 3: Advanced Score & Duration Sliders ---
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🎛️ Advanced Score & Duration")
+        
         if 'Quality Score' in work_df.columns:
             work_df['Quality Score Num'] = pd.to_numeric(work_df['Quality Score'], errors='coerce').fillna(0)
             min_score, max_score = int(work_df['Quality Score Num'].min()), int(work_df['Quality Score Num'].max())
@@ -75,7 +95,6 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             selected_score_range = st.sidebar.slider("Quality Score Range:", min_score, max_score, (min_score, max_score))
             work_df = work_df[(work_df['Quality Score Num'] >= selected_score_range[0]) & (work_df['Quality Score Num'] <= selected_score_range[1])]
 
-        # Safe Duration parsing (handles HH:MM:SS format strings)
         if 'Duration' in work_df.columns:
             def parse_duration(val):
                 try:
@@ -97,14 +116,14 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             selected_dur_range = st.sidebar.slider("Duration Range (secs):", min_dur, max_dur, (min_dur, max_dur))
             work_df = work_df[(work_df['Duration Num'] >= selected_dur_range[0]) & (work_df['Duration Num'] <= selected_dur_range[1])]
 
-        # --- FEATURE 3: Top KPI Metric Cards (Including VoIP & VoIP %) ---
+        # --- TOP KPI METRICS (Including VoIP & VoIP Percentage) ---
         st.markdown("### 📈 Network Overview & Key Metrics")
         kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
         
         total_calls_count = len(work_df)
         kpi1.metric("Total Filtered Calls", f"{total_calls_count:,}")
         
-        # Safe QC calculations
+        # Qualified & Spam Metrics
         if 'AI QC Report' in work_df.columns:
             qual_count = work_df['AI QC Report'].str.contains('Qualified', case=False, na=False).sum()
             spam_count = work_df['AI QC Report'].str.contains('Spam|Robo|Solicitation', case=False, na=False).sum()
@@ -116,7 +135,7 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             kpi2.metric("Qualified Calls", "N/A")
             kpi3.metric("Spam / Fake Calls", "N/A")
 
-        # VoIP Calculation
+        # VoIP & VoIP Percentage Tracking
         voip_cols = [c for c in work_df.columns if 'voip' in c.lower()]
         if voip_cols:
             voip_col_name = voip_cols[0]
@@ -181,7 +200,7 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
 
             st.markdown("💡 *Select multiple rows in the table below to view and export their combined raw details:*")
 
-            # --- FEATURE 4: Multi-Row Interactive Selection Table ---
+            # --- Multi-Row Interactive Selection Table ---
             event = st.dataframe(
                 summary, 
                 use_container_width=True, 
@@ -189,7 +208,7 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
                 selection_mode="multi-row"
             )
 
-            # --- FEATURE 5: Drill-Down & CSV Export ---
+            # --- Drill-Down & CSV Export Option ---
             selected_rows = event.selection.rows if hasattr(event, 'selection') else []
             
             if selected_rows:
@@ -213,7 +232,7 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
                     mime="text/csv",
                 )
 
-            # --- FEATURE 6: Side-by-Side Comparison Section ---
+            # --- FEATURE 6: Publisher Side-by-Side Comparison Mode ---
             st.markdown("---")
             st.subheader("⚖️ Side-by-Side Comparison Mode")
             compare_vals = st.multiselect(f"Select multiple items from '{selected_dimension}' to compare directly:", summary[selected_dimension].tolist())
