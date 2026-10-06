@@ -87,18 +87,28 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             summary = summary.sort_values(by='Total_Calls', ascending=False)
             
             st.subheader(f"Performance Breakdown by {selected_dimension}")
-            st.dataframe(summary, use_container_width=True)
+            st.markdown("💡 *Click on any row/publisher in the table below to view its full raw details:*")
 
-            # --- DRILL-DOWN / RAW DATA INSPECTOR (Niche Bosbe) ---
-            st.markdown("---")
-            st.subheader("🔍 Drill-Down: Inspect Raw Data")
+            # Interactive Table with row selection enabled
+            event = st.dataframe(
+                summary, 
+                use_container_width=True, 
+                on_select="rerun", 
+                selection_mode="single-row"
+            )
+
+            # --- DRILL-DOWN: Triggered when a table row is clicked ---
+            selected_rows = event.selection.rows if hasattr(event, 'selection') else []
             
-            unique_values = temp_df[selected_dimension].unique()
-            selected_val = st.selectbox(f"Select a value from '{selected_dimension}' to view raw records:", unique_values)
-            
-            if selected_val:
+            if selected_rows:
+                row_idx = selected_rows[0]
+                selected_val = summary.iloc[row_idx][selected_dimension]
+                
+                st.markdown("---")
+                st.subheader(f"🔍 Full Details for: `{selected_dimension} = {selected_val}`")
+                
                 filtered_rows = df[temp_df[selected_dimension] == selected_val]
-                st.write(f"Showing {len(filtered_rows)} record(s) for **{selected_dimension} = {selected_val}**:")
+                st.info(f"Total matching records found: {len(filtered_rows)}")
                 st.dataframe(filtered_rows, use_container_width=True)
     else:
-                st.warning("No valid column headers found in the Sheet.")
+        st.warning("No valid column headers found in the Sheet.")
