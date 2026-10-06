@@ -137,9 +137,9 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
         total_calls_count = len(work_df)
         kpi1.metric("Total Filtered Calls", f"{total_calls_count:,}")
         
-        # Qualified & Spam Metrics
+        # Qualified & Spam Metrics (Matched with 'QUAL' & 'SPAM')
         if selected_qc_col != "None":
-            qual_count = work_df[selected_qc_col].astype(str).str.contains('QUALIFIED', case=False, na=False).sum()
+            qual_count = work_df[selected_qc_col].astype(str).str.contains('QUAL', case=False, na=False).sum()
             spam_count = work_df[selected_qc_col].astype(str).str.contains('SPAM|ROBOT: YES', case=False, na=False).sum()
             qual_pct = (qual_count / total_calls_count * 100) if total_calls_count > 0 else 0
             
@@ -172,7 +172,7 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             temp_df = work_df.copy()
             temp_df[selected_dimension] = temp_df[selected_dimension].fillna('Unknown').astype(str).str.strip()
             
-            # Aggregation Dictionary setup
+            # Aggregation Dictionary setup with robust text checks
             agg_dict = {'Total_Calls': (temp_df.columns[0], 'count')}
             if 'Quality Score Num' in temp_df.columns:
                 agg_dict['Avg_Score'] = ('Quality Score Num', 'mean')
@@ -180,7 +180,7 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
                 agg_dict['Avg_Duration'] = ('Duration Num', 'mean')
             if selected_qc_col != "None":
                 agg_dict.update({
-                    'Qualified_Calls': (selected_qc_col, lambda x: x.astype(str).str.contains('QUALIFIED', case=False, na=False).sum()),
+                    'Qualified_Calls': (selected_qc_col, lambda x: x.astype(str).str.contains('QUAL', case=False, na=False).sum()),
                     'Spam_Calls': (selected_qc_col, lambda x: x.astype(str).str.contains('SPAM|ROBOT: YES', case=False, na=False).sum()),
                 })
             if selected_voip_col != "None":
