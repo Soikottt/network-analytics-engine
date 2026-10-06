@@ -15,10 +15,10 @@ st.sidebar.header("⚙️ Configuration & Filters")
 target_sheet_name = st.sidebar.text_input("Google Sheet Name:", "Ringba to Sheet QC")
 target_tab_name = st.sidebar.text_input("Sheet Tab Name:", "ALL QC from 30 Sept 2026")
 
-# Refresh / Connect Data Button (Cache Management)
+# Refresh / Connect Data Button (Forces clearing session cache to grab new headers)
 if st.sidebar.button("🔄 Connect & Load Fresh Data") or 'sheet_loaded' not in st.session_state:
     try:
-        with st.spinner("Connecting to Google Sheets..."):
+        with st.spinner("Connecting to Google Sheets & fetching fresh data..."):
             try:
                 gc = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
             except Exception:
@@ -58,9 +58,11 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
         
         default_voip = 'Line Type' if 'Line Type' in available_columns else (available_columns[0] if available_columns else 'None')
         default_qc = 'AI QC Report' if 'AI QC Report' in available_columns else (available_columns[0] if available_columns else 'None')
+        default_score = 'Quality Score' if 'Quality Score' in available_columns else (available_columns[0] if available_columns else 'None')
 
         selected_voip_col = st.sidebar.selectbox("Select VoIP / Line Type Column:", available_columns, index=available_columns.index(default_voip) if default_voip in available_columns else 0)
         selected_qc_col = st.sidebar.selectbox("Select AI QC / Status Column:", available_columns, index=available_columns.index(default_qc) if default_qc in available_columns else 0)
+        selected_score_col = st.sidebar.selectbox("Select Quality Score Column:", available_columns, index=available_columns.index(default_score) if default_score in available_columns else 0)
 
         # --- FEATURE 1: Global Search Box ---
         st.sidebar.markdown("---")
@@ -97,10 +99,8 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
         st.sidebar.markdown("---")
         st.sidebar.subheader("🎛️ Advanced Score & Duration")
         
-        score_cols = [c for c in available_columns if 'score' in c.lower() or 'quality' in c.lower()]
-        if score_cols:
-            score_col = score_cols[0]
-            work_df['Quality Score Num'] = pd.to_numeric(work_df[score_col], errors='coerce').fillna(0)
+        if selected_score_col != "None":
+            work_df['Quality Score Num'] = pd.to_numeric(work_df[selected_score_col], errors='coerce').fillna(0)
             min_score, max_score = int(work_df['Quality Score Num'].min()), int(work_df['Quality Score Num'].max())
             if min_score == max_score:
                 max_score = min_score + 1
@@ -137,8 +137,8 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
         total_calls_count = len(work_df)
         kpi1.metric("Total Filtered Calls", f"{total_calls_count:,}")
         
-        # Qualified & Spam Metrics (Checking inside the long descriptive text)
-        if selected_qc_col:
+        # Qualified & Spam Metrics
+        if selected_qc_col != "None":
             qual_count = work_df[selected_qc_col].astype(str).str.contains('QUALIFIED', case=False, na=False).sum()
             spam_count = work_df[selected_qc_col].astype(str).str.contains('SPAM|ROBOT: YES', case=False, na=False).sum()
             qual_pct = (qual_count / total_calls_count * 100) if total_calls_count > 0 else 0
@@ -150,7 +150,7 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             kpi3.metric("Spam / Fake Calls", "0")
 
         # VoIP & VoIP Percentage Tracking
-        if selected_voip_col:
+        if selected_voip_col != "None":
             voip_count = work_df[selected_voip_col].astype(str).str.contains('VOIP', case=False, na=False).sum()
             voip_pct = (voip_count / total_calls_count * 100) if total_calls_count > 0 else 0
             kpi4.metric("VoIP Calls", f"{voip_count:,} ({voip_pct:.1f}%)")
@@ -172,18 +172,18 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             temp_df = work_df.copy()
             temp_df[selected_dimension] = temp_df[selected_dimension].fillna('Unknown').astype(str).str.strip()
             
-            # Aggregation Dictionary setup with robust text checks
+            # Aggregation Dictionary setup
             agg_dict = {'Total_Calls': (temp_df.columns[0], 'count')}
             if 'Quality Score Num' in temp_df.columns:
                 agg_dict['Avg_Score'] = ('Quality Score Num', 'mean')
             if 'Duration Num' in temp_df.columns:
                 agg_dict['Avg_Duration'] = ('Duration Num', 'mean')
-            if selected_qc_col:
+            if selected_qc_col != "None":
                 agg_dict.update({
                     'Qualified_Calls': (selected_qc_col, lambda x: x.astype(str).str.contains('QUALIFIED', case=False, na=False).sum()),
                     'Spam_Calls': (selected_qc_col, lambda x: x.astype(str).str.contains('SPAM|ROBOT: YES', case=False, na=False).sum()),
                 })
-            if selected_voip_col:
+            if selected_voip_col != "None":
                 agg_dict['VoIP_Calls'] = (selected_voip_col, lambda x: x.astype(str).str.contains('VOIP', case=False, na=False).sum())
 
             summary = temp_df.groupby(selected_dimension).agg(**agg_dict).reset_index()
