@@ -4,7 +4,7 @@ import gspread
 
 st.set_page_config(page_title="Network Analytics Dashboard", layout="wide")
 
-# Google Sheets Connection Function
+@st.cache_resource
 def get_google_client():
     try:
         return gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
@@ -12,22 +12,22 @@ def get_google_client():
         try:
             return gspread.service_account(filename="service_account.json")
         except Exception:
-            raise RuntimeError("Google Sheets credentials not found in secrets or local file.") from exc
+            raise RuntimeError("Google Sheets credentials not found.") from exc
 
-def load_sheet_data(worksheet) -> pd.DataFrame:
+@st.cache_data(ttl=600)
+def load_sheet_data(sheet_name, tab_name) -> pd.DataFrame:
     try:
-        rows = worksheet.get_all_values()
+        gc = get_google_client()
+        sheet = gc.open(sheet_name).worksheet(tab_name)
+        rows = sheet.get_all_values()
         if not rows or len(rows) < 2:
             return pd.DataFrame()
         
         headers = [str(h).strip() for h in rows[0]]
         data = rows[1:]
-        
-        # Handle empty header names
         cleaned_headers = [h if h != "" else f"Unnamed_{i}" for i, h in enumerate(headers)]
         
-        df = pd.DataFrame(data, columns=cleaned_headers)
-        return df
+        return pd.DataFrame(data, columns=cleaned_headers)
     except Exception as e:
         st.error(f"Error loading sheet data: {e}")
         return pd.DataFrame()
@@ -36,7 +36,6 @@ def compute_dynamic_analytics(df: pd.DataFrame, group_by_col: str) -> pd.DataFra
     if df.empty or group_by_col not in df.columns:
         return pd.DataFrame()
 
-    # Safe data type casting
     if 'Quality Score' in df.columns:
         df['Quality Score'] = pd.to_numeric(df['Quality Score'], errors='coerce').fillna(0)
     else:
@@ -49,7 +48,6 @@ def compute_dynamic_analytics(df: pd.DataFrame, group_by_col: str) -> pd.DataFra
 
     df[group_by_col] = df[group_by_col].fillna('Unknown').astype(str).str.strip()
 
-    # Dynamic aggregation based on available columns
     agg_dict = {
         'Total_Calls': ('Call Date', 'count') if 'Call Date' in df.columns else (df.columns[0], 'count'),
         'Avg_Score': ('Quality Score', 'mean'),
@@ -77,7 +75,6 @@ def compute_dynamic_analytics(df: pd.DataFrame, group_by_col: str) -> pd.DataFra
 
 # --- STREAMLIT UI ---
 st.title("📊 Network & Campaign Intelligence Dashboard")
-st.markdown("Independent Analytics Engine for Google Sheets Data")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -85,29 +82,23 @@ with col1:
 with col2:
     target_tab_name = st.text_input("Sheet Tab Name:", "ALL QC from 30 Sept 2026")
 
-if st.button("🔄 Fetch & Analyze Data"):
-    try:
-        with st.spinner("Connecting to Google Sheets..."):
-            gc = get_google_client()
-            sheet = gc.open(target_sheet_name).worksheet(target_tab_name)
-            df = load_sheet_data(sheet)
+# Load data with caching so it doesn't freeze
+with st.spinner("Loading data from Google Sheets..."):
+    df = load_sheet_data(target_sheet_name, target_tab_name)
 
-        if not df.empty:
-            st.success(f"Successfully loaded {len(df)} records from '{target_sheet_name}' ({target_tab_name})!")
+if not df.empty:
+    st.success(f"Successfully loaded {len(df)} records!")
 
-            # Show ALL columns of the sheet in the dropdown
-            available_columns = [col for col in df.columns if not col.startswith("Unnamed_")]
-            
-            if available_columns:
-                selected_dimension = st.selectbox("Group / Analyze By (All Sheet Headings):", available_columns)
-                
-                result_df = compute_dynamic_analytics(df, selected_dimension)
+    available_columns = [col for col in df.columns if not col.startswith("Unnamed_")]
+    
+    if available_columns:
+        selected_dimension = st.selectbox("Group / Analyze By (All Sheet Headings):", available_columns)
+        
+        result_df = compute_dynamic_analytics(df, selected_dimension)
 
-                st.subheader(f"Performance Breakdown by {selected_dimension}")
-                st.dataframe(result_df, use_container_width=True)
-            else:
-                st.warning("No valid column headers found in the Sheet.")
-        else:
-            st.info("The sheet is empty.")
-    except Exception as e:
-        st.error(f"Failed to load analytics: {str(e)}")
+        st.subheader(f"Performance Breakdown by {selected_dimension}")
+        st.dataframe(result_df, use_container_width=True)
+    else:
+        st.warning("No valid column headers found.")
+else:
+    st.info("Please check sheet name, tab name, or credentials.")
