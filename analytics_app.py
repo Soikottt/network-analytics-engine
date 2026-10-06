@@ -87,27 +87,26 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             summary = summary.sort_values(by='Total_Calls', ascending=False)
             
             st.subheader(f"Performance Breakdown by {selected_dimension}")
-            st.markdown("💡 *Click on any row/publisher in the table below to view its full raw details:*")
+            st.markdown("💡 *Select multiple rows in the table below to view their combined raw details:*")
 
-            # Interactive Table with row selection enabled
+            # Interactive Table with multi-row selection enabled
             event = st.dataframe(
                 summary, 
                 use_container_width=True, 
                 on_select="rerun", 
-                selection_mode="single-row"
+                selection_mode="multi-row"
             )
 
-            # --- DRILL-DOWN: Triggered when a table row is clicked ---
+            # --- DRILL-DOWN: Triggered when multiple table rows are clicked ---
             selected_rows = event.selection.rows if hasattr(event, 'selection') else []
             
             if selected_rows:
-                row_idx = selected_rows[0]
-                selected_val = summary.iloc[row_idx][selected_dimension]
+                selected_vals = summary.iloc[selected_rows][selected_dimension].tolist()
                 
                 st.markdown("---")
-                st.subheader(f"🔍 Full Details for: `{selected_dimension} = {selected_val}`")
+                st.subheader(f"🔍 Full Details for selected `{selected_dimension}`: {', '.join(map(str, selected_vals))}")
                 
-                filtered_rows = df[temp_df[selected_dimension] == selected_val]
+                filtered_rows = df[temp_df[selected_dimension].isin(selected_vals)]
                 st.info(f"Total matching records found: {len(filtered_rows)}")
                 st.dataframe(filtered_rows, use_container_width=True)
     else:
