@@ -52,6 +52,19 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
     if available_columns:
         work_df = df.copy()
 
+        # --- MANUAL COLUMN MAPPING (To Fix Missing Columns Issue) ---
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("📌 Column Mapping Settings")
+        
+        # Select VoIP column manually if auto-detect fails
+        voip_default_idx = 0
+        voip_candidates = [c for c in available_columns if 'voip' in c.lower() or 'line' in c.lower() or 'type' in c.lower()]
+        selected_voip_col = st.sidebar.selectbox("Select VoIP / Line Type Column:", ["None"] + available_columns, index=(available_columns.index(voip_candidates[0])+1) if voip_candidates else 0)
+
+        # Select QC Report column manually
+        qc_candidates = [c for c in available_columns if 'qc' in c.lower() or 'report' in c.lower() or 'status' in c.lower()]
+        selected_qc_col = st.sidebar.selectbox("Select AI QC / Status Column:", ["None"] + available_columns, index=(available_columns.index(qc_candidates[0])+1) if qc_candidates else 0)
+
         # --- FEATURE 1: Global Search Box ---
         st.sidebar.markdown("---")
         st.sidebar.subheader("🔍 Global Search")
@@ -64,10 +77,10 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
         # --- FEATURE 2: Date Range Filter ---
         st.sidebar.markdown("---")
         st.sidebar.subheader("📅 Date Range Filter")
-        date_cols = [c for c in work_df.columns if 'date' in c.lower() or 'time' in c.lower() or 'day' in c.lower()]
+        date_cols = [c for c in available_columns if 'date' in c.lower() or 'time' in c.lower() or 'day' in c.lower()]
         
         if date_cols:
-            date_col_name = date_cols[0]
+            date_col_name = st.sidebar.selectbox("Select Date Column:", date_cols)
             work_df['Parsed_Date'] = pd.to_datetime(work_df[date_col_name], errors='coerce')
             valid_dates = work_df['Parsed_Date'].dropna()
             
@@ -79,23 +92,27 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
                     start_d, end_d = date_range
                     work_df = work_df[(work_df['Parsed_Date'].dt.date >= start_d) & (work_df['Parsed_Date'].dt.date <= end_d)]
             else:
-                st.sidebar.info("Date column found, but values could not be parsed.")
+                st.sidebar.info("Date values could not be parsed.")
         else:
-            st.sidebar.info("No date/time column detected for range filtering.")
+            st.sidebar.info("No date/time column detected.")
 
         # --- FEATURE 3: Advanced Score & Duration Sliders ---
         st.sidebar.markdown("---")
         st.sidebar.subheader("🎛️ Advanced Score & Duration")
         
-        if 'Quality Score' in work_df.columns:
-            work_df['Quality Score Num'] = pd.to_numeric(work_df['Quality Score'], errors='coerce').fillna(0)
+        score_cols = [c for c in available_columns if 'score' in c.lower() or 'quality' in c.lower()]
+        if score_cols:
+            score_col = score_cols[0]
+            work_df['Quality Score Num'] = pd.to_numeric(work_df[score_col], errors='coerce').fillna(0)
             min_score, max_score = int(work_df['Quality Score Num'].min()), int(work_df['Quality Score Num'].max())
             if min_score == max_score:
                 max_score = min_score + 1
             selected_score_range = st.sidebar.slider("Quality Score Range:", min_score, max_score, (min_score, max_score))
             work_df = work_df[(work_df['Quality Score Num'] >= selected_score_range[0]) & (work_df['Quality Score Num'] <= selected_score_range[1])]
 
-        if 'Duration' in work_df.columns:
+        dur_cols = [c for c in available_columns if 'duration' in c.lower() or 'time' in c.lower()]
+        if dur_cols:
+            dur_col = dur_cols[0]
             def parse_duration(val):
                 try:
                     val_str = str(val).strip()
@@ -109,14 +126,14 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
                 except:
                     return 0.0
 
-            work_df['Duration Num'] = work_df['Duration'].apply(parse_duration)
+            work_df['Duration Num'] = work_df[dur_col].apply(parse_duration)
             min_dur, max_dur = int(work_df['Duration Num'].min()), int(work_df['Duration Num'].max())
             if min_dur == max_dur:
                 max_dur = min_dur + 1
             selected_dur_range = st.sidebar.slider("Duration Range (secs):", min_dur, max_dur, (min_dur, max_dur))
             work_df = work_df[(work_df['Duration Num'] >= selected_dur_range[0]) & (work_df['Duration Num'] <= selected_dur_range[1])]
 
-        # --- TOP KPI METRICS (Including VoIP & VoIP Percentage) ---
+        # --- TOP KPI METRICS (Including VoIP, VoIP %, Qualified & Spam) ---
         st.markdown("### 📈 Network Overview & Key Metrics")
         kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
         
@@ -124,26 +141,24 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
         kpi1.metric("Total Filtered Calls", f"{total_calls_count:,}")
         
         # Qualified & Spam Metrics
-        if 'AI QC Report' in work_df.columns:
-            qual_count = work_df['AI QC Report'].str.contains('Qualified', case=False, na=False).sum()
-            spam_count = work_df['AI QC Report'].str.contains('Spam|Robo|Solicitation', case=False, na=False).sum()
+        if selected_qc_col != "None":
+            qual_count = work_df[selected_qc_col].str.contains('Qualif|Valid|Good', case=False, na=False).sum()
+            spam_count = work_df[selected_qc_col].str.contains('Spam|Robo|Solicitation|Bad', case=False, na=False).sum()
             qual_pct = (qual_count / total_calls_count * 100) if total_calls_count > 0 else 0
             
             kpi2.metric("Qualified Calls", f"{qual_count:,} ({qual_pct:.1f}%)")
             kpi3.metric("Spam / Fake Calls", f"{spam_count:,}")
         else:
-            kpi2.metric("Qualified Calls", "N/A")
-            kpi3.metric("Spam / Fake Calls", "N/A")
+            kpi2.metric("Qualified Calls", "Select QC Col")
+            kpi3.metric("Spam / Fake Calls", "Select QC Col")
 
         # VoIP & VoIP Percentage Tracking
-        voip_cols = [c for c in work_df.columns if 'voip' in c.lower()]
-        if voip_cols:
-            voip_col_name = voip_cols[0]
-            voip_count = work_df[voip_col_name].astype(str).str.contains('yes|true|voip', case=False, na=False).sum()
+        if selected_voip_col != "None":
+            voip_count = work_df[selected_voip_col].astype(str).str.contains('yes|true|voip|1', case=False, na=False).sum()
             voip_pct = (voip_count / total_calls_count * 100) if total_calls_count > 0 else 0
             kpi4.metric("VoIP Calls", f"{voip_count:,} ({voip_pct:.1f}%)")
         else:
-            kpi4.metric("VoIP Calls", "N/A (Col missing)")
+            kpi4.metric("VoIP Calls", "Select VoIP Col")
 
         if 'Quality Score Num' in work_df.columns:
             avg_scr = work_df['Quality Score Num'].mean()
@@ -166,14 +181,13 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
                 agg_dict['Avg_Score'] = ('Quality Score Num', 'mean')
             if 'Duration Num' in temp_df.columns:
                 agg_dict['Avg_Duration'] = ('Duration Num', 'mean')
-            if 'AI QC Report' in temp_df.columns:
+            if selected_qc_col != "None":
                 agg_dict.update({
-                    'Qualified_Calls': ('AI QC Report', lambda x: x.str.contains('Qualified', case=False, na=False).sum()),
-                    'Spam_Calls': ('AI QC Report', lambda x: x.str.contains('Spam|Robo|Solicitation', case=False, na=False).sum()),
-                    'Non_Qualified': ('AI QC Report', lambda x: x.str.contains('Non-Qualified|Info Only', case=False, na=False).sum())
+                    'Qualified_Calls': (selected_qc_col, lambda x: x.str.contains('Qualif|Valid|Good', case=False, na=False).sum()),
+                    'Spam_Calls': (selected_qc_col, lambda x: x.str.contains('Spam|Robo|Solicitation|Bad', case=False, na=False).sum()),
                 })
-            if voip_cols:
-                agg_dict['VoIP_Calls'] = (voip_cols[0], lambda x: x.astype(str).str.contains('yes|true|voip', case=False, na=False).sum())
+            if selected_voip_col != "None":
+                agg_dict['VoIP_Calls'] = (selected_voip_col, lambda x: x.astype(str).str.contains('yes|true|voip|1', case=False, na=False).sum())
 
             summary = temp_df.groupby(selected_dimension).agg(**agg_dict).reset_index()
 
@@ -232,9 +246,9 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
                     mime="text/csv",
                 )
 
-            # --- FEATURE 6: Publisher Side-by-Side Comparison Mode ---
+            # --- Publisher Side-by-Side Comparison Mode ---
             st.markdown("---")
-            st.subheader("⚖️ Side-by-Side Comparison Mode")
+            st.subheader("⚖️️ Side-by-Side Comparison Mode")
             compare_vals = st.multiselect(f"Select multiple items from '{selected_dimension}' to compare directly:", summary[selected_dimension].tolist())
             
             if compare_vals:
