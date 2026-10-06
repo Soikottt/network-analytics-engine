@@ -62,20 +62,38 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
         else:
             work_df = df.copy()
 
-        # --- FEATURE 2: Advanced Filters (Sliders for Score & Duration) ---
+        # --- FEATURE 2: Advanced Filters (Safe Sliders for Score & Duration) ---
         st.sidebar.markdown("---")
         st.sidebar.subheader("🎛️ Advanced Range Filters")
         
-        # Cast data types safely for filtering
+        # Safe Quality Score parsing
         if 'Quality Score' in work_df.columns:
             work_df['Quality Score Num'] = pd.to_numeric(work_df['Quality Score'], errors='coerce').fillna(0)
             min_score, max_score = int(work_df['Quality Score Num'].min()), int(work_df['Quality Score Num'].max())
+            if min_score == max_score:
+                max_score = min_score + 1
             selected_score_range = st.sidebar.slider("Quality Score Range:", min_score, max_score, (min_score, max_score))
             work_df = work_df[(work_df['Quality Score Num'] >= selected_score_range[0]) & (work_df['Quality Score Num'] <= selected_score_range[1])]
 
+        # Safe Duration parsing (handles HH:MM:SS format strings)
         if 'Duration' in work_df.columns:
-            work_df['Duration Num'] = pd.to_numeric(work_df['Duration'], errors='coerce').fillna(0)
+            def parse_duration(val):
+                try:
+                    val_str = str(val).strip()
+                    if ':' in val_str:
+                        parts = list(map(float, val_str.split(':')))
+                        if len(parts) == 3:
+                            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+                        elif len(parts) == 2:
+                            return parts[0] * 60 + parts[1]
+                    return float(val_str)
+                except:
+                    return 0.0
+
+            work_df['Duration Num'] = work_df['Duration'].apply(parse_duration)
             min_dur, max_dur = int(work_df['Duration Num'].min()), int(work_df['Duration Num'].max())
+            if min_dur == max_dur:
+                max_dur = min_dur + 1
             selected_dur_range = st.sidebar.slider("Duration Range (secs):", min_dur, max_dur, (min_dur, max_dur))
             work_df = work_df[(work_df['Duration Num'] >= selected_dur_range[0]) & (work_df['Duration Num'] <= selected_dur_range[1])]
 
@@ -98,7 +116,7 @@ if st.session_state.get('sheet_loaded', False) and 'df' in st.session_state:
             kpi2.metric("Qualified Calls", "N/A")
             kpi3.metric("Spam / Fake Calls", "N/A")
 
-        # VoIP Calculation (Checking if 'VoIP' column or text exists in columns)
+        # VoIP Calculation
         voip_cols = [c for c in work_df.columns if 'voip' in c.lower()]
         if voip_cols:
             voip_col_name = voip_cols[0]
