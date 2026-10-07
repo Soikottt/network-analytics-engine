@@ -1598,18 +1598,26 @@ with st.expander("🛠️ Step 5A Query Layer Interactive Explorer (Multi-Field 
 
     # Render results from session state safely
     if st.session_state.query_result_df is not None:
-        query_result_df = st.session_state.query_result_df
-        st.success(f"Query Engine matched **{len(query_result_df):,}** calls.")
+        res = st.session_state.query_result_df
         
-        if not query_result_df.empty:
-            st.dataframe(query_result_df.head(100), use_container_width=True)
-            st.download_button(
-                label="📥 Download Query Results as CSV",
-                data=query_result_df.to_csv(index=False).encode("utf-8"),
-                file_name="query_layer_results.csv",
-                mime="text/csv",
-                key="download_query_layer_csv",
-            )
+        # Check if the query was successful and has rows
+        if isinstance(res, dict) and res.get("status") == "ok":
+            df_results = res.get("df", pd.DataFrame())
+            st.success(f"Query Engine matched **{res.get('count', len(df_results)):,}** calls.")
+            
+            if not df_results.empty:
+                st.dataframe(df_results.head(100), use_container_width=True)
+                st.download_button(
+                    label="📥 Download Query Results as CSV",
+                    data=df_results.to_csv(index=False).encode("utf-8"),
+                    file_name="query_layer_results.csv",
+                    mime="text/csv",
+                    key="download_query_layer_csv",
+                )
+            else:
+                st.info("No matching calls found for the selected criteria.")
+        else:
+            st.warning(res.get("message", "No matching data available."))
 
 # Render secondary explorer with safe fallback defaults
 render_query_layer_explorer(
