@@ -402,7 +402,7 @@ DATE_PRESETS = [
 ]
 # Which calendar day counts as "Today". Change to the timezone your call times are in,
 # for example "America/New_York" or "UTC".
-DEFAULT_TIMEZONE = "Asia/Dhaka"
+DEFAULT_TIMEZONE = "America/New_York"
 
 
 def get_today(tz_name):
@@ -1548,3 +1548,43 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
         )
 
     render_period_comparison(compare_base, available_columns, selected_qc_col, selected_voip_col)
+
+
+# ---------------------------------------------------------------
+# Step 5A Query Layer Interactive Explorer Component
+# ---------------------------------------------------------------
+st.markdown("---")
+with st.expander("🛠️ Step 5A Query Layer Interactive Explorer (Multi-Field & Semantic)"):
+    st.markdown("Test the dimension-independent query engine across all A–O columns and AI QC attributes.")
+    
+    q_col1, q_col2, q_col3 = st.columns(3)
+    exp_pub = q_col1.text_input("Filter Publisher (Query Layer):", "")
+    exp_buy = q_col2.text_input("Filter Buyer (Query Layer):", "")
+    exp_cmp = q_col3.text_input("Filter Campaign (Query Layer):", "")
+    
+    q_col4, q_col5, q_col6 = st.columns(3)
+    exp_ins = q_col4.text_input("Semantic Insurance Search (e.g. Medicaid):", "")
+    exp_line = q_col5.text_input("Filter Line Type (e.g. VoIP):", "")
+    exp_dur = q_col6.number_input("Minimum Duration (seconds):", value=0, step=15)
+
+    if st.button("Execute Advanced Query"):
+        query_result_df = query_calls(
+            work_df,
+            publisher=exp_pub if exp_pub else None,
+            buyer=exp_buy if exp_buy else None,
+            campaign=exp_cmp if exp_cmp else None,
+            insurance_query=exp_ins if exp_ins else None,
+            line_type=exp_line if exp_line else None,
+            min_duration=exp_dur if exp_dur > 0 else None,
+        )
+        st.success(f"Query Engine matched **{len(query_result_df):,}** calls.")
+        if not query_result_df.empty:
+            st.dataframe(query_result_df.head(100), width="stretch")
+            st.download_button(
+                label="📥 Download Query Results as CSV",
+                data=query_result_df.to_csv(index=False).encode("utf-8"),
+                file_name="query_layer_results.csv",
+                mime="text/csv",
+                key="download_query_layer_csv",
+            )
+            
