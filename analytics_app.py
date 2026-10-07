@@ -404,7 +404,7 @@ DATE_PRESETS = [
 ]
 # Which calendar day counts as "Today". Change to the timezone your call times are in,
 # for example "America/New_York" or "UTC".
-DEFAULT_TIMEZONE = "Asia/Dhaka"
+DEFAULT_TIMEZONE = "America/New_York"
 
 
 def get_today(tz_name):
