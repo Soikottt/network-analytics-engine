@@ -114,7 +114,7 @@ QC_STRUCTURED_KEYS = {
     "qualification_reason": ["qualification reason"],
 }
 
-# Strict non-guessing guard for vague values (e.g. "Insurance: Discussed insurance")
+# Strict non-guessing guard for vague values
 VAGUE_VALUE_PAT = re.compile(
     r"^\s*(?:none|n/?a|unknown|not\s+mentioned|not\s+provided|not\s+discussed|"
     r"not\s+applicable|unspecified|unclear|discussed(?:\s+insurance)?|"
@@ -515,7 +515,7 @@ def add_percentages(stats):
     out["VoIP %"] = safe_pct(out["VoIP"], out["Calls"])
     out["Wrong Number %"] = safe_pct(out.get("Wrong Number", 0), out["Calls"])
     out["Silent %"] = safe_pct(out.get("Silent", 0), out["Calls"])
-    out["Fake Number %"] = safe_pct(out.get("Fake Number", 0), out["Calls"])
+    out["Fake Number %"] = safe_pct(out["Fake Number", 0] if "Fake Number" in out else 0, out["Calls"])
     out["QC Completion %"] = safe_pct(out["QC Done"], out["Calls"])
     out["Line Type Completion %"] = safe_pct(out["Line Done"], out["Calls"])
     return out
@@ -539,6 +539,18 @@ def parse_qc_report_row(text):
             if k_clean in alias_map:
                 out[alias_map[k_clean]] = v_part.strip()
     return out
+
+
+def extract_qc_field(qc_report_text, field_name):
+    parsed = parse_qc_report_row(qc_report_text)
+    key_norm = re.sub(r"[\s\-/]+", "_", str(field_name).strip().lower())
+    alias_map = {}
+    for k, aliases in QC_STRUCTURED_KEYS.items():
+        for a in aliases:
+            alias_map[a.replace(" ", "_")] = k
+        alias_map[k] = k
+    target_key = alias_map.get(key_norm, key_norm)
+    return parsed.get(target_key, "")
 
 
 def ensure_query_columns(df, qc_override=None, voip_override=None, date_override=None):
@@ -573,8 +585,6 @@ def is_meaningful_semantic_value(val):
 
 
 def classify_insurance_text(text, query_term=None):
-    """Strictly classify or match insurance terms without guessing.
-    'Insurance: Discussed insurance' -> [] / False."""
     if not is_meaningful_semantic_value(text):
         return False if query_term is not None else []
     s_clean = re.sub(r"^\s*insurance(?:\s+coverage|\s+type)?\s*:\s*", "", str(text).strip(), flags=re.IGNORECASE).strip()
@@ -868,6 +878,10 @@ def filter_calls(
         applied["repeat_caller_only"] = f">= {min_caller_id_count} calls"
 
     return {"status": "ok", "message": "OK" if len(work) > 0 else "No matching calls found for the selected criteria.", "count": int(len(work)), "df": work, "applied_filters": applied, "timeline": tl}
+
+
+# Alias query_calls to filter_calls for compatibility
+query_calls = filter_calls
 
 
 def search_calls(
@@ -1220,7 +1234,7 @@ def render_query_layer_explorer(base_df, timeline=None, qc_col="None", voip_col=
             if dim_res["status"] != "ok":
                 st.info(dim_res["message"])
             else:
-                st.dataframe(dim_res["stats_df"], width="stretch", hide_index=True)
+                st.dataframe(dim_res["stats_df"], use_container_width=True, hide_index=True)
 
         with q_tabs[1]:
             rk_c1, rk_c2, rk_c3 = st.columns(3)
@@ -1235,7 +1249,7 @@ def render_query_layer_explorer(base_df, timeline=None, qc_col="None", voip_col=
             if rk_res["status"] != "ok":
                 st.info(rk_res["message"])
             else:
-                st.dataframe(rk_res["stats_df"], width="stretch", hide_index=True)
+                st.dataframe(rk_res["stats_df"], use_container_width=True, hide_index=True)
 
         with q_tabs[2]:
             s_c1, s_c2, s_c3, s_c4 = st.columns(4)
@@ -1262,7 +1276,7 @@ def render_query_layer_explorer(base_df, timeline=None, qc_col="None", voip_col=
                 if s_res["source_breakdown"]:
                     st.caption("Matched Source Priority Breakdown: " + ", ".join(f"{k}: {v}" for k, v in s_res["source_breakdown"].items()))
                 display_cols = [c for c in s_res["df"].columns if not str(c).startswith("_qc_")]
-                st.dataframe(s_res["df"][display_cols], width="stretch", hide_index=True)
+                st.dataframe(s_res["df"][display_cols], use_container_width=True, hide_index=True)
 
         with q_tabs[3]:
             d_res = get_daily_breakdown(
@@ -1272,7 +1286,7 @@ def render_query_layer_explorer(base_df, timeline=None, qc_col="None", voip_col=
             if d_res["status"] != "ok":
                 st.info(d_res["message"])
             else:
-                st.dataframe(d_res["daily_df"], width="stretch", hide_index=True)
+                st.dataframe(d_res["daily_df"], use_container_width=True, hide_index=True)
                 with st.expander("Formatted Daily Summary Lines"):
                     for line in d_res["formatted_lines"]:
                         st.text(line)
@@ -1287,4 +1301,4 @@ def render_query_layer_explorer(base_df, timeline=None, qc_col="None", voip_col=
             if an_res["status"] != "ok" or an_res["anomalies_df"].empty:
                 st.info(an_res["message"])
             else:
-                st.dataframe(an_res["anomalies_df"], width="stretch", hide_index=True)
+                st.dataframe(an_res["anomalies_df"], use_container_width=True, hide_index=True)
