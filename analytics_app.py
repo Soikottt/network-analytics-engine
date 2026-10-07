@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import gspread
 from datetime import date, timedelta
+from query_layer import query_calls, get_group_stats, extract_qc_field
 
 # ---------------------------------------------------------------
 # Page config
