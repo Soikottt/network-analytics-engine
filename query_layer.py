@@ -515,7 +515,7 @@ def add_percentages(stats):
     out["VoIP %"] = safe_pct(out["VoIP"], out["Calls"])
     out["Wrong Number %"] = safe_pct(out.get("Wrong Number", 0), out["Calls"])
     out["Silent %"] = safe_pct(out.get("Silent", 0), out["Calls"])
-    out["Fake Number %"] = safe_pct(out["Fake Number", 0] if "Fake Number" in out else 0, out["Calls"])
+    out["Fake Number %"] = safe_pct(out["Fake Number"] if "Fake Number" in out else 0, out["Calls"])
     out["QC Completion %"] = safe_pct(out["QC Done"], out["Calls"])
     out["Line Type Completion %"] = safe_pct(out["Line Done"], out["Calls"])
     return out
