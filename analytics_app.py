@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import gspread
-from datetime import timedelta
+from datetime import date, timedelta
 
 # ---------------------------------------------------------------
 # Page config
@@ -359,6 +359,66 @@ def render_period_comparison(base_df, available_columns, qc_col, voip_col):
 
 
 # ---------------------------------------------------------------
+# Sidebar date filter presets
+# ---------------------------------------------------------------
+DATE_PRESETS = [
+    "All time",
+    "Today",
+    "Yesterday",
+    "This week",
+    "Last week",
+    "Last 7 days",
+    "Last 30 days",
+    "Last month",
+    "Last 6 months",
+    "This year",
+    "Last year",
+    "Custom date range",
+]
+# Which calendar day counts as "Today". Change to the timezone your call times are in,
+# for example "America/New_York" or "UTC".
+DEFAULT_TIMEZONE = "Asia/Dhaka"
+
+
+def get_today(tz_name):
+    """Today's date in the given timezone. Returns (date, warning_or_None)."""
+    try:
+        return pd.Timestamp.now(tz=tz_name.strip()).date(), None
+    except Exception:
+        return pd.Timestamp.now(tz="UTC").date(), f"Unknown timezone '{tz_name}', using UTC."
+
+
+def date_filter_range(preset, today):
+    """(start, end) dates, both inclusive, for a preset. Weeks start on Monday.
+    'Last 7 days' / 'Last 30 days' / 'Last 6 months' include today."""
+    day = timedelta(days=1)
+    this_mon = today - timedelta(days=today.weekday())
+    last_month_end = today.replace(day=1) - day
+    if preset == "Today":
+        return today, today
+    if preset == "Yesterday":
+        return today - day, today - day
+    if preset == "This week":
+        return this_mon, today
+    if preset == "Last week":
+        return this_mon - 7 * day, this_mon - day
+    if preset == "Last 7 days":
+        return today - 6 * day, today
+    if preset == "Last 30 days":
+        return today - 29 * day, today
+    if preset == "Last month":
+        return last_month_end.replace(day=1), last_month_end
+    if preset == "Last 6 months":
+        start = pd.Timestamp(today) - pd.DateOffset(months=6) + pd.Timedelta(days=1)
+        return start.date(), today
+    if preset == "This year":
+        return today.replace(month=1, day=1), today
+    if preset == "Last year":
+        return date(today.year - 1, 1, 1), date(today.year - 1, 12, 31)
+    return None, None  # "All time" / custom: handled by the caller
+
+
+# ---------------------------------------------------------------
 # Sidebar: connection
 # ---------------------------------------------------------------
 st.sidebar.header("⚙️ Configuration & Filters")
@@ -511,17 +571,37 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
 
         if not valid_dates.empty:
             min_d, max_d = valid_dates.min().date(), valid_dates.max().date()
-            date_range = st.sidebar.date_input("Select Date Range:", (min_d, max_d))
-            if unreadable:
-                st.sidebar.caption(f"{unreadable} rows have no readable date; they are always kept.")
+            quick_range = st.sidebar.selectbox("Quick range:", DATE_PRESETS, key="date_preset")
 
-            if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
-                start_d, end_d = date_range
+            start_d = end_d = None
+            if quick_range == "Custom date range":
+                picked = as_range(
+                    st.sidebar.date_input("Pick start and end date:", (min_d, max_d), key="date_custom")
+                )
+                if picked:
+                    start_d, end_d = picked
+            elif quick_range != "All time":
+                tz_name = st.sidebar.text_input(
+                    "Timezone for 'Today':", DEFAULT_TIMEZONE, key="date_tz"
+                )
+                today, tz_warning = get_today(tz_name)
+                if tz_warning:
+                    st.sidebar.warning(tz_warning)
+                start_d, end_d = date_filter_range(quick_range, today)
+
+            if start_d is not None:
                 in_range = (
                     (work_df["Parsed_Date"] >= pd.Timestamp(start_d))
                     & (work_df["Parsed_Date"] < pd.Timestamp(end_d) + pd.Timedelta(days=1))
                 )
-                work_df = work_df[in_range | work_df["Parsed_Date"].isna()]
+                work_df = work_df[in_range]
+                st.sidebar.caption(f"Showing: {describe_period(start_d, end_d)}")
+                if unreadable:
+                    st.sidebar.caption(
+                        f"{unreadable} rows with no readable date are left out while a date filter is on."
+                    )
+            elif unreadable:
+                st.sidebar.caption(f"{unreadable} rows have no readable date (shown under 'All time' only).")
         else:
             st.sidebar.info("Date values could not be parsed.")
     else:
@@ -539,6 +619,8 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
     # KPI metrics (counts only, no percentages)
     # ---------------------------------------------------------------
     st.markdown("### 📈 Network Overview & Key Metrics")
+    if len(work_df) == 0:
+        st.warning("No calls match the current filters (date range / search). Try a wider range.")
     kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
 
     kpi1.metric("Total Filtered Calls", f"{len(work_df):,}")
