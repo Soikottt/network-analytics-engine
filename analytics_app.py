@@ -2,7 +2,13 @@ import streamlit as st
 import pandas as pd
 import gspread
 from datetime import date, timedelta
-from query_layer import query_calls, get_group_stats, extract_qc_field
+
+from query_layer import (
+    query_calls,
+    get_group_stats,
+    extract_qc_field,
+    render_query_layer_explorer,
+)
 
 # ---------------------------------------------------------------
 # Page config
@@ -1554,21 +1560,26 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
 # Step 5A Query Layer Interactive Explorer Component
 # ---------------------------------------------------------------
 st.markdown("---")
-with st.expander("🛠️ Step 5A Query Layer Interactive Explorer (Multi-Field & Semantic)"):
-    st.markdown("Test the dimension-independent query engine across all A–O columns and AI QC attributes.")
-    
-    q_col1, q_col2, q_col3 = st.columns(3)
-    exp_pub = q_col1.text_input("Filter Publisher (Query Layer):", "")
-    exp_buy = q_col2.text_input("Filter Buyer (Query Layer):", "")
-    exp_cmp = q_col3.text_input("Filter Campaign (Query Layer):", "")
-    
-    q_col4, q_col5, q_col6 = st.columns(3)
-    exp_ins = q_col4.text_input("Semantic Insurance Search (e.g. Medicaid):", "")
-    exp_line = q_col5.text_input("Filter Line Type (e.g. VoIP):", "")
-    exp_dur = q_col6.number_input("Minimum Duration (seconds):", value=0, step=15)
 
-    if st.button("Execute Advanced Query"):
-        query_result_df = query_calls(
+with st.expander("🛠️ Step 5A Query Layer Interactive Explorer (Multi-Field & Semantic)", expanded=False):
+    st.markdown("Test the dimension-independent query engine across all A–O columns and AI QC attributes.")
+
+    q_col1, q_col2, q_col3 = st.columns(3)
+    exp_pub = q_col1.text_input("Filter Publisher (Query Layer):", "", key="exp_pub_input")
+    exp_buy = q_col2.text_input("Filter Buyer (Query Layer):", "", key="exp_buy_input")
+    exp_cmp = q_col3.text_input("Filter Campaign (Query Layer):", "", key="exp_cmp_input")
+
+    q_col4, q_col5, q_col6 = st.columns(3)
+    exp_ins = q_col4.text_input("Semantic Insurance Search (e.g. Medicaid):", "", key="exp_ins_input")
+    exp_line = q_col5.text_input("Filter Line Type (e.g. VoIP):", "", key="exp_line_input")
+    exp_dur = q_col6.number_input("Minimum Duration (seconds):", value=0, step=15, key="exp_dur_input")
+
+    # Initialize session state to keep query results persistent across reruns
+    if "query_result_df" not in st.session_state:
+        st.session_state.query_result_df = None
+
+    if st.button("Execute Advanced Query", key="execute_advanced_query_btn"):
+        st.session_state.query_result_df = query_calls(
             work_df,
             publisher=exp_pub if exp_pub else None,
             buyer=exp_buy if exp_buy else None,
@@ -1577,9 +1588,14 @@ with st.expander("🛠️ Step 5A Query Layer Interactive Explorer (Multi-Field 
             line_type=exp_line if exp_line else None,
             min_duration=exp_dur if exp_dur > 0 else None,
         )
+
+    # Render results from session state safely
+    if st.session_state.query_result_df is not None:
+        query_result_df = st.session_state.query_result_df
         st.success(f"Query Engine matched **{len(query_result_df):,}** calls.")
+        
         if not query_result_df.empty:
-            st.dataframe(query_result_df.head(100), width="stretch")
+            st.dataframe(query_result_df.head(100), use_container_width=True)
             st.download_button(
                 label="📥 Download Query Results as CSV",
                 data=query_result_df.to_csv(index=False).encode("utf-8"),
@@ -1587,4 +1603,13 @@ with st.expander("🛠️ Step 5A Query Layer Interactive Explorer (Multi-Field 
                 mime="text/csv",
                 key="download_query_layer_csv",
             )
-            
+
+# Render secondary explorer with safe fallback defaults
+render_query_layer_explorer(
+    base_df=compare_base if 'compare_base' in locals() and compare_base is not None else work_df,
+    timeline=timeline if 'timeline' in locals() else None,
+    qc_col=selected_qc_col if 'selected_qc_col' in locals() else None,
+    voip_col=selected_voip_col if 'selected_voip_col' in locals() else None,
+    date_col=date_col_name if 'date_cols' in locals() and date_cols else None,
+    health_rules=HEALTH_RULES if 'HEALTH_RULES' in locals() else {},
+)
