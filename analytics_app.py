@@ -57,7 +57,26 @@ def parse_duration(val):
                 return parts[0] * 60 + parts[1]
         return float(val_str)
     except Exception:
-        return 0.0
+        return float("nan")
+
+
+def parse_dates(series):
+    """Parse a column with MIXED date formats, row by row.
+    Handles '10/05/2026 10:23:18', '9/29/2026 22:38:23' and 'Oct 05 7:32:57 PM' (no year)."""
+    s = series.astype(str).str.strip()
+    out = pd.to_datetime(s, errors="coerce", format="mixed")
+    # Rows without a 4-digit year (e.g. 'Oct 05 7:32:57 PM'): assume current year
+    # (and roll back a year if that would put the date in the future).
+    no_year = out.isna() & s.str.match(r"^[A-Za-z]{3}\s+\d{1,2}\s")
+    if no_year.any():
+        now = pd.Timestamp.now()
+        fixed = pd.to_datetime(
+            s[no_year] + " " + str(now.year), errors="coerce", format="%b %d %I:%M:%S %p %Y"
+        )
+        fixed = fixed.where(fixed <= now + pd.Timedelta(days=1), fixed - pd.DateOffset(years=1))
+        out = out.copy()
+        out[no_year] = fixed
+    return out
 
 
 def get_client():
@@ -119,7 +138,10 @@ if st.sidebar.button("🔄 Connect & Load Fresh Data") or "sheet_loaded" not in 
             cleaned_headers = [h if h != "" else f"Unnamed_{i}" for i, h in enumerate(headers)]
 
             df = pd.DataFrame(rows[1:], columns=cleaned_headers)
-            df = df[(df.astype(str).apply(lambda c: c.str.strip()) != "").any(axis=1)].reset_index(drop=True)
+            df = df[(df.astype(str).apply(lambda c: c.str.strip()) != "").any(axis=1)]
+            # drop template/placeholder rows such as "[Call:CreatedAt]" / "[tag:Buyer:Name]"
+            is_placeholder = df.astype(str).apply(lambda c: c.str.strip().str.match(r"^\[[^\]]+\]$")).any(axis=1)
+            df = df[~is_placeholder].reset_index(drop=True)
 
             st.session_state["df"] = df
             st.session_state["meta"] = {
@@ -168,15 +190,15 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
         work_df["Quality_Score_Num"] = pd.to_numeric(
             work_df[score_col_name].astype(str).str.extract(r"(-?\d+\.?\d*)")[0],
             errors="coerce",
-        ).fillna(0)
+        )
     else:
-        work_df["Quality_Score_Num"] = 0.0
+        work_df["Quality_Score_Num"] = float("nan")
 
     dur_col_name = find_col(available_columns, ["Duration"], ["duration"])
     if dur_col_name:
         work_df["Duration_Num"] = work_df[dur_col_name].apply(parse_duration)
     else:
-        work_df["Duration_Num"] = 0.0
+        work_df["Duration_Num"] = float("nan")
 
     # --- Column mapping ---
     st.sidebar.markdown("---")
@@ -231,19 +253,23 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
 
     if date_cols:
         date_col_name = st.sidebar.selectbox("Select Date Column:", date_cols)
-        work_df["Parsed_Date"] = pd.to_datetime(work_df[date_col_name], errors="coerce")
+        work_df["Parsed_Date"] = parse_dates(work_df[date_col_name])
         valid_dates = work_df["Parsed_Date"].dropna()
+        unreadable = int(work_df["Parsed_Date"].isna().sum())
 
         if not valid_dates.empty:
             min_d, max_d = valid_dates.min().date(), valid_dates.max().date()
             date_range = st.sidebar.date_input("Select Date Range:", (min_d, max_d))
+            if unreadable:
+                st.sidebar.caption(f"{unreadable} rows have no readable date; they are always kept.")
 
             if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
                 start_d, end_d = date_range
-                work_df = work_df[
+                in_range = (
                     (work_df["Parsed_Date"].dt.date >= start_d)
                     & (work_df["Parsed_Date"].dt.date <= end_d)
-                ]
+                )
+                work_df = work_df[in_range | work_df["Parsed_Date"].isna()]
         else:
             st.sidebar.info("Date values could not be parsed.")
     else:
@@ -280,6 +306,15 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
     avg_scr = work_df["Quality_Score_Num"].mean()
     kpi5.metric("Avg Quality Score", f"{avg_scr:.1f}" if not pd.isna(avg_scr) else "0.0")
 
+    if selected_qc_col != "None":
+        pending = int((work_df[selected_qc_col].astype(str).str.strip() == "").sum())
+        if pending:
+            st.caption(
+                f"ℹ️ {pending:,} of {len(work_df):,} filtered calls have no AI QC result yet "
+                "(blank in the sheet). They count in Total Calls but not as Qualified / Spam / VoIP, "
+                "and are left out of Avg Quality Score."
+            )
+
     st.markdown("---")
 
     # ---------------------------------------------------------------
@@ -297,6 +332,7 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
         )
         temp_df.loc[temp_df[selected_dimension] == "", selected_dimension] = "Unknown"
 
+        temp_df["_row"] = 1
         temp_df["_is_qual"] = (
             temp_df[selected_qc_col].astype(str).str.contains(QUAL_PAT, case=False, na=False, regex=True)
             if selected_qc_col != "None" else False
@@ -313,7 +349,7 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
         summary = (
             temp_df.groupby(selected_dimension)
             .agg(
-                Total_Calls=("Quality_Score_Num", "count"),
+                Total_Calls=("_row", "sum"),
                 Avg_Score=("Quality_Score_Num", "mean"),
                 Avg_Duration=("Duration_Num", "mean"),
                 Qualified_Calls=("_is_qual", "sum"),
@@ -336,7 +372,7 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
 
         event = st.dataframe(
             summary,
-            use_container_width=True,
+            width="stretch",
             on_select="rerun",
             selection_mode="multi-row",
         )
@@ -354,7 +390,7 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
 
             filtered_rows = work_df.loc[temp_df[selected_dimension].isin(selected_vals)]
             st.info(f"Total matching records found: {len(filtered_rows):,}")
-            st.dataframe(filtered_rows, use_container_width=True)
+            st.dataframe(filtered_rows, width="stretch")
 
             st.download_button(
                 label="📥 Download Filtered Rows as CSV",
@@ -373,5 +409,5 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
         if compare_vals:
             st.dataframe(
                 summary[summary[selected_dimension].isin(compare_vals)],
-                use_container_width=True,
+                width="stretch",
             )
