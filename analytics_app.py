@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import gspread
+from datetime import timedelta
 
 # ---------------------------------------------------------------
 # Page config
@@ -64,18 +65,24 @@ def parse_dates(series):
     """Parse a column with MIXED date formats, row by row.
     Handles '10/05/2026 10:23:18', '9/29/2026 22:38:23' and 'Oct 05 7:32:57 PM' (no year)."""
     s = series.astype(str).str.strip()
-    out = pd.to_datetime(s, errors="coerce", format="mixed")
-    # Rows without a 4-digit year (e.g. 'Oct 05 7:32:57 PM'): assume current year
-    # (and roll back a year if that would put the date in the future).
-    no_year = out.isna() & s.str.match(r"^[A-Za-z]{3}\s+\d{1,2}\s")
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+
+    # 1) Rows WITHOUT a year, e.g. 'Oct 05 7:32:57 PM' (Google Sheets display format).
+    #    Parsed explicitly: pandas would otherwise silently use year 0001 or 1900.
+    #    Assume the current year, and roll back a year if that lands in the future.
+    no_year = s.str.match(r"^[A-Za-z]{3}\s+\d{1,2}\s")
     if no_year.any():
         now = pd.Timestamp.now()
         fixed = pd.to_datetime(
             s[no_year] + " " + str(now.year), errors="coerce", format="%b %d %I:%M:%S %p %Y"
         )
         fixed = fixed.where(fixed <= now + pd.Timedelta(days=1), fixed - pd.DateOffset(years=1))
-        out = out.copy()
-        out[no_year] = fixed
+        out[no_year] = fixed.astype("datetime64[ns]")
+
+    # 2) Everything else ('10/05/2026 10:23:18', '9/29/2026 22:38:23', ISO dates...), row by row
+    rest = ~no_year
+    if rest.any():
+        out[rest] = pd.to_datetime(s[rest], errors="coerce", format="mixed").astype("datetime64[ns]")
     return out
 
 
@@ -106,6 +113,248 @@ def get_worksheet(ss, tab):
             return ws
     raise ValueError(
         f"Tab '{tab}' not found. Available tabs: " + ", ".join(f"'{w.title}'" for w in sheets)
+    )
+
+
+# ---------------------------------------------------------------
+# Period comparison (any date range vs any date range)
+# ---------------------------------------------------------------
+WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+PRESETS = [
+    "Custom dates",
+    "Same weekday: this week vs last week",
+    "This week so far vs last week (same days)",
+    "This week vs last week (full weeks)",
+    "Last 7 days vs previous 7 days",
+    "Latest day vs the day before",
+]
+COUNT_METRICS = ["Calls", "Qualified", "Spam", "VoIP"]
+METRICS = COUNT_METRICS + ["Avg Score", "Avg Duration (sec)"]
+
+
+def preset_ranges(preset, anchor, weekday_idx):
+    """Return ((a_start, a_end), (b_start, b_end)). A = earlier period, B = later period.
+    `anchor` is the latest call date in the data. Weeks start on Monday."""
+    day = timedelta(days=1)
+    this_mon = anchor - timedelta(days=anchor.weekday())
+    last_mon = this_mon - 7 * day
+    if preset == PRESETS[1]:  # same weekday, latest occurrence vs the week before
+        b = anchor - timedelta(days=(anchor.weekday() - weekday_idx) % 7)
+        a = b - 7 * day
+        return (a, a), (b, b)
+    if preset == PRESETS[2]:  # this week so far vs the same number of days last week
+        span = (anchor - this_mon).days
+        return (last_mon, last_mon + span * day), (this_mon, anchor)
+    if preset == PRESETS[3]:  # full Mon-Sun weeks
+        return (last_mon, last_mon + 6 * day), (this_mon, this_mon + 6 * day)
+    if preset == PRESETS[4]:
+        return (anchor - 13 * day, anchor - 7 * day), (anchor - 6 * day, anchor)
+    if preset == PRESETS[5]:
+        return (anchor - day, anchor - day), (anchor, anchor)
+    # Custom: start from "same weekday last week vs latest day"
+    return (anchor - 7 * day, anchor - 7 * day), (anchor, anchor)
+
+
+def as_range(value):
+    """date_input returns a date, or a tuple with 1 or 2 dates while the user is still picking."""
+    if isinstance(value, (tuple, list)):
+        if len(value) == 2:
+            return value[0], value[1]
+        if len(value) == 1:
+            return value[0], value[0]
+        return None
+    return value, value
+
+
+def slice_period(frame, start_d, end_d):
+    d = frame["Parsed_Date"]
+    return frame[(d >= pd.Timestamp(start_d)) & (d < pd.Timestamp(end_d) + pd.Timedelta(days=1))]
+
+
+def describe_period(start_d, end_d):
+    if start_d == end_d:
+        return f"{start_d:%a %b %d, %Y}"
+    return f"{start_d:%a %b %d, %Y} to {end_d:%a %b %d, %Y}"
+
+
+def period_stats(frame, cols, qc_col, voip_col):
+    f = frame.copy()
+    f["_row"] = 1
+    f["_is_qual"] = (
+        f[qc_col].astype(str).str.contains(QUAL_PAT, case=False, na=False, regex=True)
+        if qc_col != "None" else False
+    )
+    f["_is_spam"] = (
+        f[qc_col].astype(str).str.contains(SPAM_PAT, case=False, na=False, regex=True)
+        if qc_col != "None" else False
+    )
+    f["_is_voip"] = (
+        f[voip_col].astype(str).str.contains(VOIP_PAT, case=False, na=False, regex=True)
+        if voip_col != "None" else False
+    )
+    return f.groupby(cols).agg(
+        **{
+            "Calls": ("_row", "sum"),
+            "Qualified": ("_is_qual", "sum"),
+            "Spam": ("_is_spam", "sum"),
+            "VoIP": ("_is_voip", "sum"),
+            "Avg Score": ("Quality_Score_Num", "mean"),
+            "Avg Duration (sec)": ("Duration_Num", "mean"),
+        }
+    )
+
+
+def period_kpis(frame, qc_col, voip_col):
+    return {
+        "Calls": len(frame),
+        "Qualified": count_match(frame[qc_col], QUAL_PAT) if qc_col != "None" else 0,
+        "Spam": count_match(frame[qc_col], SPAM_PAT) if qc_col != "None" else 0,
+        "VoIP": count_match(frame[voip_col], VOIP_PAT) if voip_col != "None" else 0,
+        "Avg Score": frame["Quality_Score_Num"].mean(),
+    }
+
+
+def render_period_comparison(base_df, available_columns, qc_col, voip_col):
+    st.markdown("---")
+    st.subheader("⚖ Period Comparison Mode")
+    st.caption(
+        "Compare any two date ranges (for example last Tuesday vs this Tuesday, or last week vs "
+        "this week) by Publisher, Buyer or any other column. A = earlier period, B = later period. "
+        "This section ignores the sidebar Date Range filter, but still uses Global Search and "
+        "the column mapping."
+    )
+
+    if base_df is None or base_df["Parsed_Date"].notna().sum() == 0:
+        st.info("Period comparison needs a readable date column.")
+        return
+
+    anchor = base_df["Parsed_Date"].max().date()
+    default_group = ["Publisher"] if "Publisher" in available_columns else available_columns[:1]
+
+    # --- Row 1: preset, weekday, compare-by columns ---
+    r1 = st.columns(3)
+    preset = r1[0].selectbox("Quick compare:", PRESETS, key="cmp_preset")
+    weekday_idx = anchor.weekday()
+    if preset == PRESETS[1]:
+        weekday = r1[1].selectbox(
+            "Weekday:", WEEKDAYS, index=anchor.weekday(), key="cmp_weekday"
+        )
+        weekday_idx = WEEKDAYS.index(weekday)
+    group_cols = r1[2].multiselect(
+        "Compare by (one or more columns):",
+        available_columns,
+        default=default_group,
+        key="cmp_group",
+    )
+    st.caption(
+        f"Latest call date in the data: {anchor:%a %b %d, %Y}. "
+        "'This week' and 'latest day' are measured from it; weeks start on Monday."
+    )
+
+    # --- Row 2: the two periods (changing the preset resets them) ---
+    a_def, b_def = preset_ranges(preset, anchor, weekday_idx)
+    suffix = f"{PRESETS.index(preset)}_{weekday_idx}_{anchor}"
+    r2 = st.columns(2)
+    pick_a = r2[0].date_input("Period A (earlier):", value=a_def, key=f"cmp_a_{suffix}")
+    pick_b = r2[1].date_input("Period B (later):", value=b_def, key=f"cmp_b_{suffix}")
+
+    range_a, range_b = as_range(pick_a), as_range(pick_b)
+    if range_a is None or range_b is None:
+        st.info("Pick both the start and end date for each period (click the same day twice for a single day).")
+        return
+    if not group_cols:
+        st.info("Pick at least one column to compare by.")
+        return
+
+    # --- Normalise group columns and build one label per group ---
+    base = base_df.copy()
+    for c in group_cols:
+        base[c] = base[c].fillna("Unknown").astype(str).str.strip()
+        base.loc[base[c] == "", c] = "Unknown"
+    base["_label"] = base[group_cols].apply(" | ".join, axis=1)
+
+    # --- Row 3: metrics and optional value filter ---
+    r3 = st.columns(2)
+    show_metrics = r3[0].multiselect(
+        "Metrics to show:", METRICS, default=METRICS[:5], key="cmp_metrics"
+    ) or ["Calls"]
+    labels_by_freq = base["_label"].value_counts().index.tolist()
+    only = r3[1].multiselect(
+        "Only these values (leave empty for all):",
+        labels_by_freq,
+        key="cmp_only_" + "|".join(group_cols),
+    )
+    if only:
+        base = base[base["_label"].isin(only)]
+
+    frame_a, frame_b = slice_period(base, *range_a), slice_period(base, *range_b)
+    st.caption(
+        f"**A:** {describe_period(*range_a)}, {len(frame_a):,} calls   |   "
+        f"**B:** {describe_period(*range_b)}, {len(frame_b):,} calls"
+    )
+    if len(frame_a) == 0 and len(frame_b) == 0:
+        st.warning("No calls found in either period.")
+        return
+    if len(frame_a) == 0 or len(frame_b) == 0:
+        st.warning(
+            "One of the two periods has no calls, so the comparison is one-sided. "
+            "Check the dates (your data starts/ends on a different day)."
+        )
+
+    # --- Summary cards: B value, difference vs A ---
+    kpi_a = period_kpis(frame_a, qc_col, voip_col)
+    kpi_b = period_kpis(frame_b, qc_col, voip_col)
+    cards = st.columns(5)
+    for card, m in zip(cards, ["Calls", "Qualified", "Spam", "VoIP", "Avg Score"]):
+        a, b = kpi_a[m], kpi_b[m]
+        if pd.isna(b):
+            card.metric(f"{m} (B)", "n/a")
+        elif pd.isna(a):
+            card.metric(f"{m} (B)", f"{b:.1f}" if m == "Avg Score" else f"{b:,}")
+        else:
+            diff = round(b - a, 1) if m == "Avg Score" else b - a
+            value = f"{b:.1f}" if m == "Avg Score" else f"{b:,}"
+            delta = (
+                f"{diff:+.1f} vs A ({a:.1f})" if m == "Avg Score" else f"{diff:+,} vs A ({a:,})"
+            )
+            color = "off" if diff == 0 else ("inverse" if m == "Spam" else "normal")
+            card.metric(f"{m} (B)", value, delta=delta, delta_color=color)
+
+    # --- Per-group comparison table ---
+    stats_a = period_stats(frame_a, group_cols, qc_col, voip_col)
+    stats_b = period_stats(frame_b, group_cols, qc_col, voip_col)
+    idx = stats_a.index.union(stats_b.index).set_names(group_cols)
+    stats_a, stats_b = stats_a.reindex(idx), stats_b.reindex(idx)
+
+    res = pd.DataFrame(index=idx)
+    for m in METRICS:
+        a, b = stats_a[m], stats_b[m]
+        if m in COUNT_METRICS:
+            a, b = a.fillna(0).astype(int), b.fillna(0).astype(int)
+            diff = b - a
+        else:
+            a, b = a.round(1), b.round(1)
+            diff = (b - a).round(1)
+        res[f"{m} A"], res[f"{m} B"], res[f"{m} Δ"] = a, b, diff
+    res["_total"] = res["Calls A"] + res["Calls B"]
+    res = res.sort_values("_total", ascending=False).drop(columns="_total").reset_index()
+
+    table_cols = group_cols + [f"{m} {s}" for m in show_metrics for s in ("A", "B", "Δ")]
+    table = res[table_cols]
+
+    st.markdown("**Calls per group: A vs B** (top 15)")
+    chart = res.copy()
+    chart["Group"] = chart[group_cols].astype(str).apply(" | ".join, axis=1)
+    st.bar_chart(chart.set_index("Group")[["Calls A", "Calls B"]].head(15))
+
+    st.dataframe(table, width="stretch", hide_index=True)
+    st.caption("Δ = B minus A. Avg Score ignores calls that have no AI QC result yet.")
+    st.download_button(
+        label="📥 Download Comparison as CSV",
+        data=table.to_csv(index=False).encode("utf-8"),
+        file_name="period_comparison.csv",
+        mime="text/csv",
+        key="cmp_download",
     )
 
 
@@ -251,9 +500,12 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
         if "date" in c.lower() or "time" in c.lower() or "day" in c.lower()
     ]
 
+    compare_base = None  # data for Period Comparison (ignores the sidebar date range)
+
     if date_cols:
         date_col_name = st.sidebar.selectbox("Select Date Column:", date_cols)
         work_df["Parsed_Date"] = parse_dates(work_df[date_col_name])
+        compare_base = work_df.copy()
         valid_dates = work_df["Parsed_Date"].dropna()
         unreadable = int(work_df["Parsed_Date"].isna().sum())
 
@@ -266,8 +518,8 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
             if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
                 start_d, end_d = date_range
                 in_range = (
-                    (work_df["Parsed_Date"].dt.date >= start_d)
-                    & (work_df["Parsed_Date"].dt.date <= end_d)
+                    (work_df["Parsed_Date"] >= pd.Timestamp(start_d))
+                    & (work_df["Parsed_Date"] < pd.Timestamp(end_d) + pd.Timedelta(days=1))
                 )
                 work_df = work_df[in_range | work_df["Parsed_Date"].isna()]
         else:
@@ -399,15 +651,4 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
                 mime="text/csv",
             )
 
-        st.markdown("---")
-        st.subheader("⚖ Side-by-Side Comparison Mode")
-        compare_vals = st.multiselect(
-            f"Select multiple items from '{selected_dimension}' to compare directly:",
-            summary[selected_dimension].tolist(),
-        )
-
-        if compare_vals:
-            st.dataframe(
-                summary[summary[selected_dimension].isin(compare_vals)],
-                width="stretch",
-            )
+    render_period_comparison(compare_base, available_columns, selected_qc_col, selected_voip_col)
