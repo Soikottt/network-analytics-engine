@@ -1,14 +1,10 @@
+import re
+from dataclasses import dataclass, field
+
 import streamlit as st
 import pandas as pd
 import gspread
 from datetime import date, timedelta
-
-from query_layer import (
-    query_calls,
-    get_group_stats,
-    extract_qc_field,
-    render_query_layer_explorer,
-)
 
 # ---------------------------------------------------------------
 # Page config
@@ -408,7 +404,7 @@ DATE_PRESETS = [
 ]
 # Which calendar day counts as "Today". Change to the timezone your call times are in,
 # for example "America/New_York" or "UTC".
-DEFAULT_TIMEZONE = "America/New_York"
+DEFAULT_TIMEZONE = "Asia/Dhaka"
 
 
 def get_today(tz_name):
@@ -1183,6 +1179,1223 @@ def render_trends_and_insights(timeline, work_df, base_df, dim, qc_col, voip_col
 
 
 # ---------------------------------------------------------------
+# Step 5A: Analytics Query Layer
+# Deterministic Python / pandas only (no AI, no LLM). Every function works on ANY field or
+# combination of fields from the A-O sheet columns, never on Publisher alone.
+#
+#   prepare_query_frame()      one-time preparation of the sheet data (dates, numbers, QC fields)
+#   make_timeline()            "yesterday", "last week", custom dates ... (reuses the sidebar date logic)
+#   filter_calls()             filter calls by any combination of fields, text and meaning
+#   search_calls()             text search in the AI QC Report (primary), ShortSummary and Note
+#   get_group_stats()          standard metrics for the network or ANY grouping (Buyer, Publisher + Campaign ...)
+#   compare_group_periods()    selected period vs previous equivalent period, with trends and changes
+#   rank_groups()              rank any metric (highest / lowest, biggest improvement / decline)
+#   time_series()              daily / weekly / monthly breakdown
+#   detect_anomalies()         transparent threshold rules (no AI)
+#   insurance_breakdown(), repeat_callers()   examples of call-level intelligence
+#   run_analytics_query()      one call: filter + stats + comparison + anomalies + daily series
+#
+# Reliability rule: nothing is estimated or guessed. When the data cannot answer a question the
+# result carries UNAVAILABLE_MSG / INSUFFICIENT_MSG instead of a number.
+# ---------------------------------------------------------------
+UNAVAILABLE_MSG = "Information not available in the current data."
+INSUFFICIENT_MSG = "Insufficient data for this query."
+
+NONQUAL_PAT = r"CALL TYPE:\s*NON"
+WRONG_PAT = r"CALL TYPE:\s*WRONG"
+SILENT_PAT = r"CALL TYPE:\s*SILENT"
+INFO_ONLY_PAT = r"CALL TYPE:\s*INFORMATION"
+OTHER_TYPE_PAT = r"CALL TYPE:\s*OTHER"
+
+
+@dataclass
+class QueryResult:
+    """Structured answer. `data` is a table, `scalars` the headline numbers, `notes` the caveats.
+    `message` is set (and `available` is False) when the data cannot answer the question."""
+    title: str = ""
+    data: pd.DataFrame = None
+    scalars: dict = field(default_factory=dict)
+    notes: list = field(default_factory=list)
+    message: str = None
+    extra: dict = field(default_factory=dict)
+
+    @property
+    def available(self):
+        return self.message is None
+
+
+def _unavailable(title, detail=None, message=UNAVAILABLE_MSG):
+    return QueryResult(title=title, message=message + (f" ({detail})" if detail else ""))
+
+
+# ---------------- Field mapping (A-O columns) ----------------
+QUERY_FIELDS = {  # logical name: (exact header names, header keywords)
+    "date": (["Call Date"], ["date"]),
+    "buyer": (["Buyer"], ["buyer"]),
+    "publisher": (["Publisher"], ["publisher"]),
+    "campaign": (["Campaign"], ["campaign"]),
+    "caller_id": (["Caller ID"], ["caller id", "caller_id"]),
+    "duration": (["Duration"], ["duration"]),
+    "note": (["Note"], ["note"]),
+    "summary": (["ShortSummary"], ["summary"]),
+    "recording": (["Recording"], ["recording"]),
+    "hangup": (["Hangup By"], ["hangup", "hang up"]),
+    "qc": (["AI QC Report"], ["ai qc", "qc report"]),
+    "score": (["Quality Score"], ["score"]),
+    "line_type": (["Line Type"], ["line type"]),
+    "phone_company": (["Phone Company"], ["phone company", "carrier"]),
+    "fake": (["Fake Number"], ["fake"]),
+}
+QUERY_LABELS = {
+    "date": "Call Date", "buyer": "Buyer", "publisher": "Publisher", "campaign": "Campaign",
+    "caller_id": "Caller ID", "duration": "Duration", "note": "Note", "summary": "ShortSummary",
+    "recording": "Recording", "hangup": "Hangup By", "qc": "AI QC Report", "score": "Quality Score",
+    "line_type": "Line Type", "phone_company": "Phone Company", "fake": "Fake Number",
+}
+GROUPABLE = ["buyer", "publisher", "campaign", "hangup", "line_type", "phone_company", "fake", "caller_id"]
+
+
+def resolve_query_columns(available_columns, overrides=None):
+    """Map the logical fields to the real sheet headers (None when a column does not exist)."""
+    cols = {k: find_col(available_columns, exact, kws) for k, (exact, kws) in QUERY_FIELDS.items()}
+    for k, v in (overrides or {}).items():
+        if v and v != "None" and v in available_columns:
+            cols[k] = v
+    return cols
+
+
+# ---------------- AI QC Report parsing ----------------
+QC_PREFIX = "QC: "
+QC_ALIASES = {"Why Called": "Why They Called", "Service Interest": "Treatment/Service Interest"}
+_QC_KEY = re.compile(r"[A-Za-z][A-Za-z /&()'-]*")
+_NOT_AVAILABLE = {
+    "", "n/a", "na", "none", "unknown", "not mentioned", "not provided", "not specified", "unspecified",
+    "not available", "no information", "null", "nan", "-", "--", "not stated", "not discussed",
+}
+
+
+def is_unavailable(value):
+    """True for blank / 'N/A' / 'None' / 'Unknown' style values: they carry no information."""
+    return str(value).strip().lower().rstrip(".") in _NOT_AVAILABLE
+
+
+def parse_qc_text(text):
+    """'Call Type: X | Insurance: Y | ...' -> {'Call Type': 'X', 'Insurance': 'Y', ...}.
+    A part without a 'Key:' prefix continues the previous value."""
+    out, last = {}, None
+    for part in str(text).split("|"):
+        key, sep, val = part.partition(":")
+        k = key.strip()
+        if sep and 0 < len(k) <= 40 and _QC_KEY.fullmatch(k):
+            canon = QC_ALIASES.get(k, k)
+            if canon in out:
+                last = None
+            else:
+                out[canon] = val.strip()
+                last = canon
+        elif last is not None and part.strip():
+            out[last] += " | " + part.strip()
+    return out
+
+
+def prepare_query_frame(df, cols):
+    """Add the helper columns every query uses (Parsed_Date, Quality_Score_Num, Duration_Num,
+    Caller_ID_Norm, Fake_Flag, Fake_Known and one 'QC: <field>' column per AI QC field).
+    The sheet columns themselves are never changed."""
+    q = df.copy()
+    if cols.get("date"):
+        q["Parsed_Date"] = parse_dates(q[cols["date"]])
+    else:
+        q["Parsed_Date"] = pd.Series(pd.NaT, index=q.index, dtype="datetime64[ns]")
+    if cols.get("score"):
+        q["Quality_Score_Num"] = pd.to_numeric(
+            q[cols["score"]].astype(str).str.extract(r"(-?\d+\.?\d*)")[0], errors="coerce"
+        )
+    else:
+        q["Quality_Score_Num"] = float("nan")
+    q["Duration_Num"] = q[cols["duration"]].apply(parse_duration) if cols.get("duration") else float("nan")
+    if cols.get("caller_id"):
+        digits = q[cols["caller_id"]].astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
+        q["Caller_ID_Norm"] = digits.str.replace(r"\D", "", regex=True)
+    else:
+        q["Caller_ID_Norm"] = ""
+    if cols.get("fake"):
+        raw = q[cols["fake"]].astype(str).str.strip().str.lower()
+        q["Fake_Known"] = raw != ""
+        q["Fake_Flag"] = raw.isin(["yes", "true", "y", "1", "fake"])
+    else:
+        q["Fake_Known"] = False
+        q["Fake_Flag"] = False
+    if cols.get("qc"):
+        parsed = pd.DataFrame([parse_qc_text(t) for t in q[cols["qc"]]], index=q.index)
+        for c in parsed.columns:
+            q[QC_PREFIX + c] = parsed[c].fillna("")
+    return q
+
+
+def apply_timeline(frame, timeline):
+    """Rows inside the timeline (both end dates included). All time / None keeps every row,
+    including rows with no readable date."""
+    if not timeline or timeline.get("start") is None or timeline.get("end") is None:
+        return frame
+    return slice_period(frame, timeline["start"], timeline["end"])
+
+
+def make_timeline(preset, today=None, start=None, end=None, tz=DEFAULT_TIMEZONE):
+    """Timeline dict {'preset','start','end'} from a preset name (case-insensitive), reusing the
+    same date logic as the sidebar. Custom needs start and end. All time has no dates."""
+    names = {p.lower(): p for p in DATE_PRESETS}
+    names.update({"custom": "Custom date range", "alltime": "All time"})
+    key = str(preset).strip().lower()
+    if key not in names:
+        raise ValueError(f"Unknown timeline '{preset}'")
+    name = names[key]
+    if name == "All time":
+        return {"preset": name}
+    if name == "Custom date range":
+        if start is None or end is None:
+            raise ValueError("A custom timeline needs a start and an end date")
+        return {"preset": name, "start": start, "end": end}
+    s, e = date_filter_range(name, today or get_today(tz)[0])
+    return {"preset": name, "start": s, "end": e}
+
+
+# ---------------- Text search that never guesses ----------------
+_NEGATION = re.compile(
+    r"(?:\bno|\bnot|\bwithout|\bnever|n't)\s+"
+    r"(?:(?!because\b|but\b|so\b|due\b|since\b|as\b)\w+\s+){0,2}$"
+)
+
+
+def _norm_text(s, lower=True):
+    s = re.sub("[‐-―−]", "-", str(s))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.lower() if lower else s
+
+
+def _source_text(frame, cols, source, lower=True):
+    """Text of one search source: 'qc' (whole AI QC Report), 'qc:<Field>' (one parsed field),
+    'summary' or 'note'. None when that source does not exist in the data."""
+    if source == "qc":
+        col = cols.get("qc")
+    elif source.startswith("qc:"):
+        col = QC_PREFIX + source[3:]
+        if col not in frame.columns:
+            return None
+    else:
+        col = cols.get(source)
+    if not col or col not in frame.columns:
+        return None
+    return frame[col].map(lambda v: _norm_text(v, lower))
+
+
+def _term_hits(texts, pattern, flags=re.IGNORECASE, negation=True):
+    """Boolean Series: the pattern is found and is not negated ('no Medicaid', 'does not have ...')."""
+    rx = re.compile(pattern, flags)
+
+    def hit(t):
+        for m in rx.finditer(t):
+            if negation and _NEGATION.search(t[max(0, m.start() - 30):m.start()]):
+                continue
+            return True
+        return False
+
+    return texts.map(hit).astype(bool)
+
+
+def _first_hits(frame, cols, steps):
+    """steps = [(source, regex, lower_case, negation)] in priority order. Returns
+    (hit, matched_in, has_info): has_info = at least one searched source holds real text."""
+    hit = pd.Series(False, index=frame.index)
+    where = pd.Series("", index=frame.index, dtype=object)
+    info = pd.Series(False, index=frame.index)
+    for source, pattern, lower, negation in steps:
+        texts = _source_text(frame, cols, source, lower)
+        if texts is None:
+            continue
+        info |= ~texts.map(is_unavailable)
+        found = _term_hits(texts, pattern, 0 if not lower else re.IGNORECASE, negation) & ~hit
+        hit |= found
+        where[found] = source
+    return hit, where, info
+
+
+def _as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple, set)):
+        return list(v)
+    return [v]
+
+
+def _terms_regex(terms, regex=False):
+    """Search terms (a list, or one string where a comma means 'any of') as one regex."""
+    if isinstance(terms, str):
+        terms = terms.split(",")
+    terms = [str(t).strip() for t in _as_list(terms) if str(t).strip()]
+    if not terms:
+        return None
+    return "|".join(terms if regex else (re.escape(_norm_text(t)) for t in terms))
+
+
+SEARCH_SOURCES = ("qc", "summary", "note")
+
+
+def search_calls(frame, cols, terms, sources=SEARCH_SOURCES, regex=False, title="Call search"):
+    """Calls whose text contains ANY of the terms. The AI QC Report is searched first, then
+    ShortSummary, then Note. 'Matched In' shows which source answered. Negated mentions
+    ('no Medicaid') are not counted. Calls with no usable text in any source cannot answer and
+    are reported separately, never counted as 'no match'."""
+    pattern = _terms_regex(terms, regex)
+    if pattern is None:
+        return _unavailable(title, "no search term given", INSUFFICIENT_MSG)
+    steps = [(s, pattern, True, True) for s in sources]
+    if all(_source_text(frame, cols, s) is None for s in sources):
+        return _unavailable(title, "none of the searched columns exist")
+    hit, where, info = _first_hits(frame, cols, steps)
+    out = frame[hit].copy()
+    out["Matched In"] = where[hit].map(lambda s: {"qc": "AI QC Report", "summary": "ShortSummary",
+                                                  "note": "Note"}.get(s, s.replace("qc:", "AI QC: ")))
+    res = QueryResult(title=title, data=out)
+    res.scalars = {"Calls searched": len(frame), "Matching calls": int(hit.sum()),
+                   "Calls with searchable text": int(info.sum())}
+    if len(frame) - int(info.sum()):
+        res.notes.append(
+            f"{len(frame) - int(info.sum()):,} calls have no usable text in the searched sources, "
+            "so they could not be checked."
+        )
+    return res
+
+
+# ---------------- Insurance / location / service (meaning-based, explicit terms only) ----------------
+INSURANCE_PATTERNS = {
+    "public": (
+        r"medicaid|medicare|medi[- ]cal\b|public (?:health )?insurance"
+        r"|government(?:-| )(?:funded |sponsored |run )?(?:health )?(?:insurance|plan)"
+        r"|state(?:-| )(?:funded |run |sponsored )?(?:health )?(?:insurance|plan)"
+    ),
+    "private": (
+        r"private (?:health )?insurance|commercial insurance|blue ?cross|blue ?shield|\bbcbs\b|aetna|cigna"
+        r"|united ?health ?care|\buhc\b|anthem|humana|kaiser"
+    ),
+    "none": (
+        r"\b(?:no|without) (?:any |health )?insurance\b"
+        r"|\b(?:doesn'?t|does not|don'?t|do not) have (?:any |health )?insurance\b|\buninsured\b|\bno coverage\b"
+    ),
+}
+# Only inside the dedicated 'Insurance' field, a bare 'public' / 'government' is explicit enough.
+INSURANCE_FIELD_PUBLIC = r"\bpublic\b|\bgovernment\b"
+INSURANCE_LABELS = {
+    "public": "Public (Medicaid / Medicare / state / government)",
+    "private": "Private (named commercial insurer)",
+    "none": "No insurance",
+    "mixed": "Public and private both mentioned",
+    "unspecified": "Insurance mentioned, type not stated",
+    "unknown": "No insurance information",
+}
+
+
+def classify_insurance(frame, cols):
+    """One row per call: Insurance_Category (public / private / none / mixed / unspecified / unknown)
+    and Insurance_Source. Only explicit terms count: 'Discussed insurance' or just 'state' is
+    'unspecified', never Medicaid / Medicare / public / private. Order searched: the QC
+    'Insurance' field, the whole AI QC Report, ShortSummary, Note."""
+    idx = frame.index
+    flags = {k: pd.Series(False, index=idx) for k in ("public", "private", "none")}
+    source = pd.Series("", index=idx, dtype=object)
+    resolved = pd.Series(False, index=idx)
+    has_field_text = pd.Series(False, index=idx)
+    for src in ("qc:Insurance", "qc", "summary", "note"):
+        texts = _source_text(frame, cols, src)
+        if texts is None:
+            continue
+        if src == "qc:Insurance":
+            has_field_text = ~texts.map(is_unavailable)
+        for kind, pat in INSURANCE_PATTERNS.items():
+            if src == "qc:Insurance" and kind == "public":
+                pat = pat + "|" + INSURANCE_FIELD_PUBLIC
+            hits = _term_hits(texts, pat, negation=(kind != "none")) & ~resolved
+            flags[kind] |= hits
+        newly = (flags["public"] | flags["private"] | flags["none"]) & ~resolved
+        source[newly] = src
+        resolved |= newly
+    cat = pd.Series("unknown", index=idx, dtype=object)
+    cat[has_field_text] = "unspecified"
+    cat[flags["none"]] = "none"
+    cat[flags["private"]] = "private"
+    cat[flags["public"]] = "public"
+    cat[flags["public"] & flags["private"]] = "mixed"
+    cat[flags["none"] & (flags["public"] | flags["private"])] = "mixed"
+    return pd.DataFrame({"Insurance_Category": cat, "Insurance_Source": source}, index=idx)
+
+
+US_STATES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA", "colorado": "CO",
+    "connecticut": "CT", "delaware": "DE", "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS", "kentucky": "KY", "louisiana": "LA",
+    "maine": "ME", "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY", "north carolina": "NC",
+    "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA",
+    "rhode island": "RI", "south carolina": "SC", "south dakota": "SD", "tennessee": "TN", "texas": "TX",
+    "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY",
+}
+
+
+def _place_steps(place):
+    """Search steps for a place: the QC 'Location' field first (state abbreviations such as 'CA'
+    count only there, upper-case), then the rest of the AI QC Report, ShortSummary and Note
+    (full names only)."""
+    p = _norm_text(place)
+    name = r"\b" + re.escape(p) + r"\b"
+    steps = [("qc:Location", name, True, True)]
+    if p in US_STATES:
+        steps.append(("qc:Location", r"(?<![A-Za-z])" + US_STATES[p] + r"(?![A-Za-z])", False, False))
+    steps += [("qc", name, True, True), ("summary", name, True, True), ("note", name, True, True)]
+    return steps
+
+
+def _service_steps(terms):
+    pat = _terms_regex(terms)
+    return [("qc:Treatment/Service Interest", pat, True, True), ("qc:Caller Intent", pat, True, True),
+            ("qc:Why They Called", pat, True, True), ("qc", pat, True, True),
+            ("summary", pat, True, True), ("note", pat, True, True)]
+
+
+# ---------------- filter_calls ----------------
+CALL_TYPE_PATTERNS = {
+    "qualified": QUAL_PAT, "non-qualified": NONQUAL_PAT, "spam": SPAM_PAT, "wrong number": WRONG_PAT,
+    "silent": SILENT_PAT, "information only": INFO_ONLY_PAT, "other": OTHER_TYPE_PAT,
+}
+FILTER_COLUMN_KEYS = ("buyer", "publisher", "campaign", "hangup", "line_type", "phone_company")
+
+
+def _isin_ci(series, values):
+    s = series.astype(str).str.strip().str.lower().replace("", "unknown")
+    return s.isin({str(v).strip().lower() for v in values})
+
+
+def filter_calls(frame, cols, spec=None, title="Matching calls"):
+    """Filter calls by any combination of these spec keys (all optional, all combined with AND):
+
+      timeline            dict from make_timeline()
+      buyer, publisher, campaign, hangup, line_type, phone_company     value or list of values
+      caller_id           digits (or part of them)
+      duration_min / duration_max      seconds
+      score_min / score_max            quality score
+      fake_number         True (Yes) / False (explicit No)
+      call_type           qualified | non-qualified | spam | wrong number | silent | information only | other
+      qc_text, summary_text, note_text   text contained in that column (comma = any of)
+      any_text            text found in the AI QC Report, ShortSummary or Note
+      insurance           public | private | none | mixed | unspecified | any named insurer ('Aetna')
+      location            place name (state name, city ...)
+      service             treatment / service words ('inpatient', 'detox')
+
+    Returns a QueryResult whose `data` holds the matching rows. A filter that needs a column which
+    does not exist makes the result 'not available' instead of silently ignoring it."""
+    spec = spec or {}
+    f = frame
+    notes = []
+    scalars = {"Calls before filters": len(frame)}
+
+    def need(key):
+        return None if cols.get(key) else QUERY_LABELS[key]
+
+    if spec.get("timeline"):
+        f = apply_timeline(f, spec["timeline"])
+        scalars["Calls in timeline"] = len(f)
+
+    for key in FILTER_COLUMN_KEYS:
+        vals = _as_list(spec.get(key))
+        if vals:
+            if need(key):
+                return _unavailable(title, f"column '{QUERY_LABELS[key]}' not found")
+            f = f[_isin_ci(f[cols[key]], vals)]
+
+    if spec.get("fake_number") is not None:
+        if need("fake"):
+            return _unavailable(title, "column 'Fake Number' not found")
+        if spec["fake_number"]:
+            f = f[f["Fake_Flag"]]
+        else:
+            f = f[f["Fake_Known"] & ~f["Fake_Flag"]]
+            notes.append("'Fake Number = No' counts only calls where the Fake Number column says No.")
+
+    cid = str(spec.get("caller_id") or "").strip()
+    if cid:
+        if need("caller_id"):
+            return _unavailable(title, "column 'Caller ID' not found")
+        digits = re.sub(r"\D", "", re.sub(r"\.0+$", "", cid))
+        if digits:
+            f = f[f["Caller_ID_Norm"].str.contains(digits, regex=False)]
+        else:
+            f = f[f[cols["caller_id"]].astype(str).str.contains(cid, case=False, regex=False)]
+
+    for key, col_key, num_col, label, op in (
+        ("duration_min", "duration", "Duration_Num", "Duration", ">="),
+        ("duration_max", "duration", "Duration_Num", "Duration", "<="),
+        ("score_min", "score", "Quality_Score_Num", "Quality Score", ">="),
+        ("score_max", "score", "Quality_Score_Num", "Quality Score", "<="),
+    ):
+        if spec.get(key) is not None:
+            if need(col_key):
+                return _unavailable(title, f"column '{QUERY_LABELS[col_key]}' not found")
+            known = f[num_col].notna()
+            if (~known).any():
+                notes.append(f"{int((~known).sum()):,} calls without a {label} value were left out of the {label} filter.")
+            f = f[known & ((f[num_col] >= spec[key]) if op == ">=" else (f[num_col] <= spec[key]))]
+
+    ctype = str(spec.get("call_type") or "").strip().lower()
+    if ctype:
+        if ctype == "voip":
+            if need("line_type"):
+                return _unavailable(title, "column 'Line Type' not found")
+            f = f[f[cols["line_type"]].astype(str).str.contains(VOIP_PAT, case=False, regex=True)]
+        elif ctype in CALL_TYPE_PATTERNS:
+            if need("qc"):
+                return _unavailable(title, "column 'AI QC Report' not found")
+            f = f[f[cols["qc"]].astype(str).str.contains(CALL_TYPE_PATTERNS[ctype], case=False, regex=True)]
+        else:
+            return _unavailable(title, f"unknown call type '{ctype}'", INSUFFICIENT_MSG)
+
+    for key, col_key in (("qc_text", "qc"), ("summary_text", "summary"), ("note_text", "note")):
+        txt = str(spec.get(key) or "").strip()
+        if txt:
+            if need(col_key):
+                return _unavailable(title, f"column '{QUERY_LABELS[col_key]}' not found")
+            parts = [p.strip() for p in txt.split(",") if p.strip()]
+            f = f[f[cols[col_key]].astype(str).map(lambda t: any(p.lower() in t.lower() for p in parts))]
+
+    if spec.get("any_text"):
+        sub = search_calls(f, cols, spec["any_text"], title=title)
+        if not sub.available:
+            return sub
+        f = sub.data.drop(columns=["Matched In"])
+        notes += sub.notes
+
+    # ---- meaning-based filters: only calls whose data actually answers the question ----
+    ins = spec.get("insurance")
+    if ins:
+        key = str(ins).strip().lower()
+        if key in INSURANCE_LABELS:
+            cls = classify_insurance(f, cols)
+            known = cls["Insurance_Category"] != "unknown"
+            if not known.any():
+                return _unavailable(title, "no insurance information in these calls")
+            notes.append(
+                f"Insurance information exists for {int(known.sum()):,} of {len(f):,} calls; the other "
+                f"{int((~known).sum()):,} are left out of this insurance filter."
+            )
+            if key in ("public", "private", "none"):
+                match = cls["Insurance_Category"].isin([key, "mixed"]) if key != "none" else cls["Insurance_Category"].isin(["none", "mixed"])
+            else:
+                match = cls["Insurance_Category"] == key
+            f = f[match]
+        else:
+            hit, _, info = _first_hits(f, cols, [("qc:Insurance", re.escape(_norm_text(ins)), True, True),
+                                                 ("qc", re.escape(_norm_text(ins)), True, True),
+                                                 ("summary", re.escape(_norm_text(ins)), True, True),
+                                                 ("note", re.escape(_norm_text(ins)), True, True)])
+            if not info.any():
+                return _unavailable(title, "no insurance information in these calls")
+            f = f[hit]
+    loc = str(spec.get("location") or "").strip()
+    if loc:
+        hit, _, info = _first_hits(f, cols, _place_steps(loc))
+        if not info.any():
+            return _unavailable(title, "no location information in these calls")
+        notes.append(f"{int(info.sum()):,} of {len(f):,} calls have text in the searched sources (AI QC Report, ShortSummary, Note).")
+        f = f[hit]
+    svc = _terms_regex(spec.get("service"))
+    if svc:
+        hit, _, info = _first_hits(f, cols, _service_steps(spec.get("service")))
+        if not info.any():
+            return _unavailable(title, "no treatment / service information in these calls")
+        f = f[hit]
+
+    scalars["Matching calls"] = len(f)
+    res = QueryResult(title=title, data=f, scalars=scalars, notes=notes)
+    if f.empty:
+        res.notes.append("No calls match these filters.")
+    return res
+
+
+# ---------------- Grouping and standard statistics ----------------
+STAT_COLUMNS = [
+    "Calls", "Qualified", "Non-Qualified", "Spam", "VoIP", "Wrong Number", "Silent", "Fake Numbers",
+    "Avg Score", "Avg Duration (sec)", "Qualification %", "Spam %", "VoIP %", "Fake %",
+    "QC Completion %", "QC Done",
+]
+RANK_METRICS = [
+    "Calls", "Qualified", "Non-Qualified", "Spam", "VoIP", "Wrong Number", "Silent", "Fake Numbers",
+    "Avg Score", "Avg Duration (sec)", "Qualification %", "Spam %", "VoIP %", "Fake %", "QC Completion %",
+]
+RATE_METRICS = {"Avg Score", "Avg Duration (sec)", "Qualification %", "Spam %", "VoIP %", "Fake %", "QC Completion %"}
+
+
+def _with_group_columns(frame, cols, by):
+    """(frame copy with clean group columns, group column names, missing field labels).
+    `by` items: a logical field ('publisher'), a sheet header, or day / week / month.
+    Blank values become 'Unknown'. An empty `by` means the whole network."""
+    f = frame.copy()
+    gcols, missing = [], []
+    for item in _as_list(by):
+        key = str(item).strip()
+        low = key.lower()
+        if low in ("day", "week", "month"):
+            d = f["Parsed_Date"].dt.normalize()
+            if low == "week":
+                d = d - pd.to_timedelta(d.dt.weekday, unit="D")
+            elif low == "month":
+                d = d.dt.to_period("M").dt.to_timestamp()
+            name = low.capitalize()
+            f[name] = d.dt.strftime("%Y-%m-%d")
+        elif low in cols:
+            if not cols[low]:
+                missing.append(QUERY_LABELS[low])
+                continue
+            name = "Caller_ID_Norm" if low == "caller_id" else cols[low]
+        elif key in f.columns:
+            name = key
+        else:
+            missing.append(key)
+            continue
+        if name not in gcols:
+            gcols.append(name)
+    f = normalize_groups(f, gcols) if gcols else f
+    if not gcols and not missing:
+        f["Network"] = "All calls"
+        gcols = ["Network"]
+    return f, gcols, missing
+
+
+def _stats_indexed(frame, cols, gcols):
+    """Standard metrics per group, indexed by the group columns (reuses period_stats /
+    add_percentages, so the numbers equal the dashboard's)."""
+    qc = cols.get("qc") or "None"
+    vo = cols.get("line_type") or "None"
+    stats = add_percentages(period_stats(frame, gcols, qc, vo))
+    t = frame[gcols].copy()
+    qcs = frame[qc].astype(str) if qc != "None" else pd.Series("", index=frame.index)
+    t["_nq"] = qcs.str.contains(NONQUAL_PAT, case=False, na=False, regex=True)
+    t["_wn"] = qcs.str.contains(WRONG_PAT, case=False, na=False, regex=True)
+    t["_si"] = qcs.str.contains(SILENT_PAT, case=False, na=False, regex=True)
+    t["_fk"] = frame["Fake_Flag"]
+    t["_fc"] = frame["Fake_Known"]
+    extra = t.groupby(gcols).sum()
+    stats["Non-Qualified"] = extra["_nq"]
+    stats["Wrong Number"] = extra["_wn"]
+    stats["Silent"] = extra["_si"]
+    if cols.get("fake"):
+        stats["Fake Numbers"] = extra["_fk"]
+        stats["Fake Checked"] = extra["_fc"]
+        stats["Fake %"] = safe_pct(stats["Fake Numbers"], stats["Fake Checked"].where(stats["Fake Checked"] > 0))
+    else:
+        stats["Fake Numbers"] = float("nan")
+        stats["Fake Checked"] = float("nan")
+        stats["Fake %"] = float("nan")
+    return stats
+
+
+def _round(df):
+    out = df.copy()
+    for c in out.columns:
+        if pd.api.types.is_float_dtype(out[c]):
+            out[c] = out[c].round(1)
+    return out
+
+
+def get_group_stats(frame, cols, by=None, health=True, title="Statistics"):
+    """The standard metrics for the network (by=None) or ANY grouping: ['buyer'], ['publisher',
+    'campaign'], ['phone_company'], ['hangup'], 'day' ... Same engine for every dimension.
+    Percentages are a share of TOTAL calls (Fake % is a share of calls with a Fake Number value)."""
+    f, gcols, missing = _with_group_columns(frame, cols, by)
+    if missing:
+        return _unavailable(title, "column not found: " + ", ".join(missing))
+    if f.empty:
+        return QueryResult(title=title, data=pd.DataFrame(columns=gcols + STAT_COLUMNS),
+                           scalars={"Calls": 0, "Qualified": 0, "Spam": 0, "VoIP": 0, "Avg Score": float("nan"), "QC Done": 0},
+                           notes=["No calls match, so there is nothing to calculate."])
+    stats = _stats_indexed(f, cols, gcols)
+    if health:
+        stats["Health"], stats["Health_Reason"] = health_columns(stats)
+    out = stats.reset_index().sort_values("Calls", ascending=False).reset_index(drop=True)
+    keep = gcols + STAT_COLUMNS + (["Health", "Health_Reason"] if health else [])
+    out = _round(out[keep])
+    res = QueryResult(title=title, data=out, scalars=period_kpis(f, cols.get("qc") or "None", cols.get("line_type") or "None"))
+    n_qc = res.scalars["QC Done"]
+    if cols.get("qc") and n_qc < len(f):
+        res.notes.append(
+            f"Qualified / Non-Qualified / Spam / Wrong Number / Silent are known only for calls with a "
+            f"completed AI QC ({n_qc:,} of {len(f):,})."
+        )
+    return res
+
+
+# ---------------- Period comparison ----------------
+CHANGE_COLUMN = {
+    "Calls": "Volume change", "Qualification %": "Qualification % change", "Spam %": "Spam % change",
+    "VoIP %": "VoIP % change", "Avg Score": "Avg Score change", "Avg Duration (sec)": "Avg Duration change",
+    "Fake %": "Fake % change",
+}
+TREND_LABELS = {"improving": "↑ Improving", "declining": "↓ Declining", "stable": "→ Stable", "n/a": "n/a"}
+
+
+def _compare_core(frame, cols, by, timeline):
+    """Shared by compare_group_periods() and detect_anomalies()."""
+    if not timeline or timeline.get("start") is None or timeline.get("end") is None:
+        return None, _unavailable("Period comparison", "All time has no comparison period")
+    info = equivalent_previous(timeline["preset"], timeline["start"], timeline["end"])
+    if info is None:
+        return None, _unavailable("Period comparison", "no comparison period for this timeline")
+    win = trend_windows(info, timeline["start"], timeline["end"], frame)
+    cur = slice_window(frame, *win["cur"])
+    prev = slice_window(frame, *win["prev"])
+    cur_f, gcols, missing = _with_group_columns(cur, cols, by)
+    if missing:
+        return None, _unavailable("Period comparison", "column not found: " + ", ".join(missing))
+    prev_f, _, _ = _with_group_columns(prev, cols, by)
+    for g in (cur_f, prev_f):
+        g["_group"] = g[gcols].astype(str).agg(" | ".join, axis=1) if len(g) else pd.Series(dtype=object)
+    parts = pd.concat([cur_f[["_group"] + gcols], prev_f[["_group"] + gcols]]).drop_duplicates("_group").set_index("_group")
+    core = {"info": info, "win": win, "gcols": gcols, "parts": parts, "cur_n": len(cur_f), "prev_n": len(prev_f)}
+    if cur_f.empty and prev_f.empty:
+        return core, _unavailable("Period comparison", "no calls in either period", INSUFFICIENT_MSG)
+    empty = pd.DataFrame(columns=["Calls"])
+    cur_stats = _stats_indexed(cur_f, cols, ["_group"]) if len(cur_f) else empty
+    prev_stats = _stats_indexed(prev_f, cols, ["_group"]) if len(prev_f) else empty
+    if cur_f.empty or prev_f.empty:
+        core.update(cur_stats=cur_stats, prev_stats=prev_stats, records=[], order=[])
+        return core, None
+    records, order = build_trends(cur_stats, prev_stats)
+    core.update(cur_stats=cur_stats, prev_stats=prev_stats, records=records, order=order)
+    return core, None
+
+
+def _pp(cur, prev):
+    return float("nan") if pd.isna(cur) or pd.isna(prev) else cur - prev
+
+
+def compare_group_periods(frame, cols, by=None, timeline=None, title="Period comparison"):
+    """Selected period vs its previous equivalent period for the network or ANY grouping.
+    Columns: now / before / change for volume, qualification, spam, VoIP, score, duration, fake,
+    plus a trend arrow per metric (same rules and minimum-data guards as the dashboard trends)."""
+    core, err = _compare_core(frame, cols, by, timeline)
+    if err:
+        err.title = title
+        return err
+    info, win, gcols, parts = core["info"], core["win"], core["gcols"], core["parts"]
+    cur_s, prev_s = core["cur_stats"], core["prev_stats"]
+    trend_of = {(r["group"], r["key"]): r["trend"] for r in core["records"]}
+    groups = core["order"] or sorted(set(cur_s.index) | set(prev_s.index))
+    cur_h = dict(zip(cur_s.index, health_columns(add_percentages(cur_s))[0])) if len(cur_s) and "QC Done" in cur_s else {}
+    prev_h = dict(zip(prev_s.index, health_columns(add_percentages(prev_s))[0])) if len(prev_s) and "QC Done" in prev_s else {}
+    rows = []
+    for g in groups:
+        c = cur_s.loc[g] if g in cur_s.index else None
+        p = prev_s.loc[g] if g in prev_s.index else None
+        val = lambda row, k: float("nan") if row is None else row[k]
+        calls_c, calls_p = (0 if c is None else c["Calls"]), (0 if p is None else p["Calls"])
+        row = {name: parts.loc[g, name] for name in gcols}
+        row.update({
+            "Calls (now)": int(calls_c), "Calls (before)": int(calls_p), "Volume change": int(calls_c - calls_p),
+            "Volume change %": (calls_c - calls_p) / calls_p * 100 if calls_p else float("nan"),
+            "Qualified (now)": 0 if c is None else int(c["Qualified"]),
+            "Qualified (before)": 0 if p is None else int(p["Qualified"]),
+        })
+        for key, label in (("Qualification %", "Qualification %"), ("Spam %", "Spam %"), ("VoIP %", "VoIP %"),
+                           ("Fake %", "Fake %"), ("Avg Score", "Avg Score"), ("Avg Duration (sec)", "Avg Duration")):
+            row[f"{label} (now)"], row[f"{label} (before)"] = val(c, key), val(p, key)
+            row[CHANGE_COLUMN[key]] = _pp(val(c, key), val(p, key))
+        for key, label, _ in TREND_METRICS:
+            row[f"Trend: {label}"] = TREND_LABELS.get(trend_of.get((g, key), "n/a"), "n/a")
+        row["Enough data"] = "Yes" if min(calls_c, calls_p) >= TREND_MIN_CALLS else f"No (< {TREND_MIN_CALLS} calls in a period)"
+        row["Health (now)"] = cur_h.get(g, "–")
+        row["Health (before)"] = prev_h.get(g, "–")
+        rows.append(row)
+    out = _round(pd.DataFrame(rows))
+    res = QueryResult(title=title, data=out, extra=core)
+    res.scalars = {
+        "Current period": f"{info['cur_name']}: {describe_period(timeline['start'], timeline['end'])}"
+                          f"{' (so far)' if win['in_progress'] else ''}",
+        "Comparison period": f"{info['prev_name']}: {describe_window(*win['prev'])}"
+                             f"{', same elapsed time' if win['trimmed'] else ''}",
+        "Calls (now)": core["cur_n"], "Calls (before)": core["prev_n"],
+    }
+    if core["cur_n"] == 0 or core["prev_n"] == 0:
+        res.notes.append("One of the two periods has no calls, so trends are not available.")
+    first = frame["Parsed_Date"].min()
+    if pd.notna(first) and first > win["prev"][0]:
+        res.notes.append(f"The comparison period starts before the first call in the sheet ({first:%b %d, %Y}); it may be incomplete.")
+    return res
+
+
+def rank_groups(table, metric, n=10, ascending=False, min_calls=None, calls_cols=("Calls",), title=None):
+    """Rank ANY table of groups by ANY numeric column (from get_group_stats() or
+    compare_group_periods()). Rates and averages need a minimum number of calls (default
+    TREND_MIN_CALLS) so a group with 2 calls can never be 'best'. Ties: more calls first."""
+    title = title or f"Ranking by {metric}"
+    if table is None or metric not in table.columns:
+        return _unavailable(title, f"'{metric}' is not in the data")
+    if min_calls is None:
+        min_calls = TREND_MIN_CALLS if (metric in RATE_METRICS or metric.endswith("change") or metric.endswith("change %")) else 1
+    df = table[pd.to_numeric(table[metric], errors="coerce").notna()]
+    no_value = len(table) - len(df)
+    keep = pd.Series(True, index=df.index)
+    for c in calls_cols:
+        if c in df.columns:
+            keep &= df[c] >= min_calls
+    left_out = int((~keep).sum())
+    ranked = df[keep].copy()
+    ranked[metric] = pd.to_numeric(ranked[metric])
+    sort_cols = [metric] + [c for c in calls_cols if c in ranked.columns][:1]
+    ranked = ranked.sort_values(sort_cols, ascending=[ascending] + [False] * (len(sort_cols) - 1), kind="mergesort")
+    if ranked.empty:
+        return _unavailable(title, "no group has enough data", INSUFFICIENT_MSG)
+    ranked.insert(0, "Rank", range(1, len(ranked) + 1))
+    res = QueryResult(title=title, data=ranked.head(n).reset_index(drop=True))
+    if left_out:
+        res.notes.append(f"{left_out} group(s) with fewer than {min_calls} calls were left out of this ranking.")
+    if no_value:
+        res.notes.append(f"{no_value} group(s) have no value for {metric} (not available in the data).")
+    return res
+
+
+def rank_improvement(comparison, key, improving=True, n=10):
+    """Biggest improvement (or decline) of a metric between the two periods. 'Improvement' means
+    better quality: a lower spam % / VoIP % is an improvement, a higher qualification % / score is."""
+    if comparison is None or not comparison.available or key not in CHANGE_COLUMN:
+        return _unavailable(f"Biggest {'improvement' if improving else 'decline'}", "no comparison available")
+    good = {k: g for k, _, g in TREND_METRICS}.get(key, 1)
+    tbl = comparison.data.copy()
+    col = CHANGE_COLUMN[key]
+    tbl["_quality_change"] = pd.to_numeric(tbl[col], errors="coerce") * good
+    res = rank_groups(tbl, "_quality_change", n=n, ascending=not improving,
+                      calls_cols=("Calls (now)", "Calls (before)"),
+                      title=f"Biggest {'improvement' if improving else 'decline'} in {key}")
+    if res.available:
+        res.data = res.data.drop(columns=["_quality_change"])
+    return res
+
+
+# ---------------- Daily / weekly / monthly series ----------------
+SERIES_COLUMNS = ["Calls", "Qualified", "Spam", "VoIP", "Avg Score", "Qualification %", "Spam %",
+                  "VoIP %", "Avg Duration (sec)", "QC Completion %"]
+
+
+def time_series(frame, cols, timeline=None, by=None, freq="day", title=None):
+    """Daily (default), weekly (Monday start) or monthly breakdown of the standard metrics for
+    the network or any grouping. Days without calls are shown with 0 calls and blank rates."""
+    freq = str(freq).lower()
+    title = title or f"{freq.capitalize()} breakdown"
+    if freq not in ("day", "week", "month"):
+        return _unavailable(title, f"unknown frequency '{freq}'", INSUFFICIENT_MSG)
+    if not cols.get("date"):
+        return _unavailable(title, "column 'Call Date' not found")
+    cur = apply_timeline(frame, timeline)
+    dated = cur[cur["Parsed_Date"].notna()]
+    undated = len(cur) - len(dated)
+    f, gcols, missing = _with_group_columns(dated, cols, by if _as_list(by) else None)
+    if missing:
+        return _unavailable(title, "column not found: " + ", ".join(missing))
+    network = gcols == ["Network"]
+    gcols = [] if network else gcols
+    res = QueryResult(title=title)
+    if undated:
+        res.notes.append(f"{undated:,} calls have no readable date and are not in this series.")
+    if f.empty:
+        res.data = pd.DataFrame(columns=["Period"] + gcols + SERIES_COLUMNS)
+        res.notes.append("No dated calls in this timeline.")
+        return res
+    d = f["Parsed_Date"].dt.normalize()
+    if freq == "week":
+        d = d - pd.to_timedelta(d.dt.weekday, unit="D")
+    elif freq == "month":
+        d = d.dt.to_period("M").dt.to_timestamp()
+    f["Period"] = d
+    stats = _stats_indexed(f, cols, ["Period"] + gcols)
+    if network:
+        step = {"day": "D", "week": "7D", "month": "MS"}[freq]
+        lo, hi = d.min(), d.max()
+        tl = timeline or {}
+        if tl.get("start") is not None and tl.get("end") is not None:
+            lo, hi = min(lo, pd.Timestamp(tl["start"])), max(hi, pd.Timestamp(tl["end"]))
+            if freq == "week":
+                lo = lo - pd.Timedelta(days=lo.weekday())
+            elif freq == "month":
+                lo = lo.to_period("M").to_timestamp()
+        full = pd.date_range(lo, hi, freq=step)
+        if len(full) <= 800:
+            stats = stats.reindex(full)
+            stats.index.name = "Period"
+            for c in ("Calls", "Qualified", "Spam", "VoIP", "QC Done", "Non-Qualified", "Wrong Number", "Silent"):
+                stats[c] = stats[c].fillna(0).astype(int)
+    out = stats.reset_index()
+    label = out["Period"].dt.strftime({"day": "%a %Y-%m-%d", "week": "Week of %Y-%m-%d", "month": "%Y-%m"}[freq])
+    out.insert(0, "Label", label)
+    out = _round(out[["Label", "Period"] + gcols + SERIES_COLUMNS])
+    out["Period"] = out["Period"].dt.date
+    res.data = out.sort_values(["Period"] + gcols).reset_index(drop=True)
+    res.scalars = {"Periods": int(out["Period"].nunique()), "Calls": int(out["Calls"].sum())}
+    return res
+
+
+# ---------------- Anomaly detection ----------------
+ANOMALY_LABELS = {
+    "Spam %": "Sudden spam increase", "Qualification %": "Sudden qualification decline",
+    "Avg Score": "Significant score decline", "Calls": "Unusual call-volume change",
+    "VoIP %": "Significant VoIP increase", "Avg Duration (sec)": "Unusual duration change",
+    "Fake %": "Sudden increase in fake numbers",
+}
+ANOMALY_BAD_DIRECTION = {"Spam %": 1, "VoIP %": 1, "Qualification %": -1, "Avg Score": -1}  # +1 = a rise is bad
+ANOMALY_FAKE = {"pp": 5.0, "min_events": 3}  # fake-number share up by 5 points, at least 3 fake numbers now
+
+
+def anomaly_rules_text():
+    """The anomaly thresholds in plain words, generated from the same numbers the trends use."""
+    t = TREND_THRESHOLDS
+    return (
+        f"Spam % up ≥ {t['Spam %'][1]:.0f} points · Qualification % down ≥ {t['Qualification %'][1]:.0f} points · "
+        f"Avg score down ≥ {t['Avg Score'][1]:.0f} · VoIP % up ≥ {t['VoIP %'][1]:.0f} points · "
+        f"Calls change ≥ {CALLS_RULE['rel'][1]:.0%} and ≥ {CALLS_RULE['abs'][1]} calls · "
+        f"Avg duration change ≥ {DURATION_RULE['rel'][1]:.0%} and ≥ {DURATION_RULE['abs'][1]}s · "
+        f"Fake-number share up ≥ {ANOMALY_FAKE['pp']:.0f} points with ≥ {ANOMALY_FAKE['min_events']} fake numbers. "
+        f"Only groups with ≥ {TREND_MIN_CALLS} calls in both periods are checked (volume needs ≥ {TREND_MIN_VOLUME})."
+    )
+
+
+def _fmt_change(key, diff, prev):
+    if key == "Calls":
+        rel = f" ({diff / prev:+.0%})" if prev else ""
+        return f"{diff:+,.0f} calls{rel}"
+    if key.endswith("%"):
+        return f"{diff:+.1f} points"
+    if key == "Avg Score":
+        return f"{diff:+.1f}"
+    return f"{diff:+.0f}s"
+
+
+def detect_anomalies(frame, cols, by=None, timeline=None, title="Anomalies"):
+    """Compare the selected period with the previous equivalent period and flag only SIGNIFICANT
+    moves (the same 'significant' thresholds as the dashboard trends). Pure threshold rules; groups
+    with too little data are skipped, never guessed. Works for the network or any grouping."""
+    core, err = _compare_core(frame, cols, by, timeline)
+    if err:
+        err.title = title
+        return err
+    gcols, parts, info = core["gcols"], core["parts"], core["info"]
+    rows = []
+    for r in core["records"]:
+        key = r["key"]
+        if r["trend"] == "n/a" or r["level"] != 2:
+            continue
+        diff = r["cur"] - r["prev"]
+        bad = ANOMALY_BAD_DIRECTION.get(key)
+        if bad is not None and diff * bad <= 0:
+            continue
+        rows.append((r["group"], key, r["prev"], r["cur"], diff, r["cur_row"], r["prev_row"]))
+    skipped = 0
+    for g in core["order"]:  # fake-number rule (not part of the dashboard trends)
+        if g not in core["cur_stats"].index or g not in core["prev_stats"].index:
+            skipped += 1
+            continue
+        c, p = core["cur_stats"].loc[g], core["prev_stats"].loc[g]
+        if min(c["Calls"], p["Calls"]) < TREND_MIN_CALLS or pd.isna(c["Fake %"]) or pd.isna(p["Fake %"]):
+            skipped += 1
+            continue
+        diff = c["Fake %"] - p["Fake %"]
+        if diff >= ANOMALY_FAKE["pp"] and c["Fake Numbers"] >= ANOMALY_FAKE["min_events"]:
+            rows.append((g, "Fake %", p["Fake %"], c["Fake %"], diff, c, p))
+    records = []
+    for g, key, pv, cv, diff, c, p in rows:
+        rec = {name: parts.loc[g, name] for name in gcols}
+        rec.update({
+            "Anomaly": ANOMALY_LABELS[key], "Severity": "🔴 High", "Metric": key,
+            "Previous": fmt_trend_value(key, pv), "Current": fmt_trend_value(key, cv),
+            "Change": _fmt_change(key, diff, pv), "Calls (now)": int(c["Calls"]), "Calls (before)": int(p["Calls"]),
+            "Details": f"{ANOMALY_LABELS[key]}: {fmt_trend_value(key, pv)} → {fmt_trend_value(key, cv)} "
+                       f"({_fmt_change(key, diff, pv)}) compared with {info['prev_name']}.",
+        })
+        records.append(rec)
+    cols_out = gcols + ["Anomaly", "Severity", "Metric", "Previous", "Current", "Change", "Calls (now)", "Calls (before)", "Details"]
+    out = pd.DataFrame(records, columns=cols_out)
+    res = QueryResult(title=title, data=out, extra=core, scalars={"Anomalies found": len(out)})
+    if out.empty:
+        res.notes.append("No anomalies found: no significant change, or not enough data in both periods.")
+    res.notes.append("Rules: " + anomaly_rules_text())
+    return res
+
+
+# ---------------- Call-level intelligence examples ----------------
+def insurance_breakdown(frame, cols, title="Insurance breakdown"):
+    """How many calls fall in each insurance category, using only explicit terms (never guessed),
+    plus the distinct values of the QC 'Insurance' field so any named insurer can be queried."""
+    if not cols.get("qc"):
+        return _unavailable(title, "column 'AI QC Report' not found")
+    cls = classify_insurance(frame, cols)
+    counts = cls["Insurance_Category"].value_counts()
+    known = int((cls["Insurance_Category"] != "unknown").sum())
+    if known == 0:
+        return _unavailable(title, "no insurance information in these calls")
+    rows = [{"Category": INSURANCE_LABELS[k], "Calls": int(counts.get(k, 0)),
+             "% of calls with insurance info": (counts.get(k, 0) / known * 100) if k != "unknown" else float("nan")}
+            for k in ("public", "private", "none", "mixed", "unspecified", "unknown")]
+    res = QueryResult(title=title, data=_round(pd.DataFrame(rows)),
+                      scalars={"Calls": len(frame), "Calls with insurance info": known})
+    res.notes.append("Only explicit terms are classified. 'Discussed insurance', 'state' alone or an unlisted "
+                     "insurer stay 'type not stated'; calls with no insurance information are not counted.")
+    if "QC: Insurance" in frame.columns:
+        vals = frame["QC: Insurance"].map(_norm_text)
+        vals = vals[~vals.map(is_unavailable)].value_counts().reset_index()
+        vals.columns = ["Insurance value in the QC report", "Calls"]
+        res.extra["values"] = vals
+    return res
+
+
+def repeat_callers(frame, cols, min_calls=2, title="Repeat Caller IDs"):
+    """Caller IDs that called more than once (the same Caller ID repeating)."""
+    if not cols.get("caller_id"):
+        return _unavailable(title, "column 'Caller ID' not found")
+    f = frame[frame["Caller_ID_Norm"] != ""]
+    if f.empty:
+        return _unavailable(title, "no Caller ID values")
+    g = f.groupby("Caller_ID_Norm")
+    out = pd.DataFrame({
+        "Calls": g.size(), "First call": g["Parsed_Date"].min(), "Last call": g["Parsed_Date"].max(),
+    })
+    if cols.get("publisher"):
+        out["Publishers"] = g[cols["publisher"]].nunique()
+    if cols.get("qc"):
+        out["Qualified"] = g[cols["qc"]].apply(lambda s: int(count_match(s, QUAL_PAT)))
+        out["Spam"] = g[cols["qc"]].apply(lambda s: int(count_match(s, SPAM_PAT)))
+    out = out[out["Calls"] >= min_calls].sort_values("Calls", ascending=False).reset_index()
+    out = out.rename(columns={"Caller_ID_Norm": "Caller ID"})
+    res = QueryResult(title=title, data=out, scalars={
+        "Repeat Caller IDs": len(out), "Calls from repeat Caller IDs": int(out["Calls"].sum()) if len(out) else 0,
+        "Calls with a Caller ID": len(f)})
+    if out.empty:
+        res.notes.append(f"No Caller ID appears {min_calls} or more times.")
+    return res
+
+
+# ---------------- One-call query ----------------
+def run_analytics_query(frame, cols, spec=None, group_by=None):
+    """Filter + statistics + comparison + anomalies + daily series in one call.
+    `spec` is the same dict as filter_calls (its 'timeline' is the CURRENT period; all other
+    filters apply to both periods so the comparison is like-for-like)."""
+    spec = dict(spec or {})
+    timeline = spec.pop("timeline", None)
+    scope = filter_calls(frame, cols, spec, title="Calls in scope")
+    out = {"scope": scope}
+    if not scope.available:
+        return out
+    cur = apply_timeline(scope.data, timeline)
+    out["calls"] = QueryResult(title="Matching calls", data=cur, scalars={"Matching calls": len(cur)},
+                               notes=list(scope.notes))
+    out["stats"] = get_group_stats(cur, cols, group_by)
+    out["comparison"] = compare_group_periods(scope.data, cols, group_by, timeline)
+    out["anomalies"] = detect_anomalies(scope.data, cols, group_by, timeline)
+    out["daily"] = time_series(scope.data, cols, timeline, by=group_by)
+    return out
+
+
+# ---------------- Streamlit panel for the Query Layer ----------------
+def _distinct_values(frame, col, limit=500):
+    s = frame[col].astype(str).str.strip()
+    return list(s[s != ""].value_counts().head(limit).index)
+
+
+def show_query_result(res, key, file_stub):
+    """Notes, table and CSV export of a QueryResult; the 'not available' message when it cannot answer."""
+    if res is None:
+        return
+    if not res.available:
+        st.warning(res.message)
+        return
+    for n in res.notes:
+        st.caption(n)
+    if res.data is None or res.data.empty:
+        st.info("No results for the selected filters.")
+        return
+    st.dataframe(res.data, width="stretch", hide_index=True)
+    st.download_button(
+        label="📥 Download as CSV",
+        data=res.data.to_csv(index=False).encode("utf-8"),
+        file_name=f"{file_stub}.csv",
+        mime="text/csv",
+        key=f"q_dl_{key}",
+    )
+
+
+def render_query_layer(df, available_columns, overrides, sidebar_timeline):
+    """Panel for the Analytics Query Layer: choose timeline, grouping and filters, then read
+    statistics, rankings, daily breakdown, period comparison, anomalies and the matching calls."""
+    cols = resolve_query_columns(available_columns, overrides)
+    qf = prepare_query_frame(df, cols)
+    st.markdown("---")
+    with st.expander("🔎 Analytics Query Layer (any field, any combination)"):
+        st.caption(
+            "Answers come only from your sheet data (no AI, nothing estimated). Pick a timeline, optionally group by "
+            "one or more fields, and add any filters. If the data cannot answer, you will see "
+            f"“{UNAVAILABLE_MSG}”."
+        )
+        missing = [QUERY_LABELS[k] for k, v in cols.items() if v is None]
+        if missing:
+            st.info("Columns not found in the sheet: " + ", ".join(missing) + ". Queries that need them report that the information is not available.")
+
+        # ---- timeline (same date logic as the sidebar) ----
+        choice = st.selectbox("Timeline:", ["Same as sidebar"] + DATE_PRESETS, key="q_timeline")
+        if choice == "Same as sidebar":
+            tl = sidebar_timeline or {"preset": "All time"}
+        elif choice == "Custom date range":
+            valid = qf["Parsed_Date"].dropna()
+            lo = valid.min().date() if len(valid) else date.today()
+            hi = valid.max().date() if len(valid) else date.today()
+            picked = as_range(st.date_input("Custom dates:", (lo, hi), key="q_custom"))
+            tl = make_timeline("Custom date range", start=picked[0], end=picked[1]) if picked else {"preset": "All time"}
+        else:
+            today, _ = get_today(st.session_state.get("date_tz", DEFAULT_TIMEZONE))
+            tl = make_timeline(choice, today=today)
+        if tl.get("start") is not None:
+            st.caption(f"Timeline: {tl['preset']} · {describe_period(tl['start'], tl['end'])}")
+        else:
+            st.caption("Timeline: All time (no comparison period).")
+
+        # ---- grouping ----
+        labels = {QUERY_LABELS[k]: k for k in GROUPABLE if cols.get(k)}
+        picked_by = st.multiselect("Group by (leave empty for the whole network):", list(labels), key="q_by")
+        by = [labels[x] for x in picked_by]
+
+        # ---- filters ----
+        st.markdown("**Filters** (all optional, combined with AND)")
+        spec = {}
+        cs = st.columns(3)
+        for i, key in enumerate(FILTER_COLUMN_KEYS):
+            if cols.get(key):
+                chosen = cs[i % 3].multiselect(QUERY_LABELS[key] + ":", _distinct_values(qf, cols[key]), key=f"q_f_{key}")
+                if chosen:
+                    spec[key] = chosen
+        cs = st.columns(3)
+        fake = cs[0].selectbox("Fake Number:", ["Any", "Yes", "No"], key="q_fake")
+        if fake != "Any":
+            spec["fake_number"] = fake == "Yes"
+        ctype = cs[1].selectbox(
+            "Call type:", ["Any", "Qualified", "Non-qualified", "Spam", "Wrong number", "Silent",
+                           "Information only", "Other", "VoIP line"], key="q_ctype")
+        if ctype != "Any":
+            spec["call_type"] = "voip" if ctype == "VoIP line" else ctype.lower()
+        cid = cs[2].text_input("Caller ID contains:", "", key="q_cid").strip()
+        if cid:
+            spec["caller_id"] = cid
+        cs = st.columns(4)
+        for col_ui, (lab, key, step) in zip(cs, (("Min duration (sec, 0 = off)", "duration_min", 10),
+                                                 ("Max duration (sec, 0 = off)", "duration_max", 10),
+                                                 ("Min quality score (0 = off)", "score_min", 5),
+                                                 ("Max quality score (0 = off)", "score_max", 5))):
+            v = col_ui.number_input(lab, min_value=0, value=0, step=step, key=f"q_{key}")
+            if v:
+                spec[key] = v
+        cs = st.columns(4)
+        for col_ui, (lab, key) in zip(cs, (("AI QC Report contains:", "qc_text"), ("ShortSummary contains:", "summary_text"),
+                                           ("Note contains:", "note_text"), ("Anywhere (QC / summary / note):", "any_text"))):
+            v = col_ui.text_input(lab, "", key=f"q_{key}").strip()
+            if v:
+                spec[key] = v
+        cs = st.columns(4)
+        ins_options = ["Any"] + list(INSURANCE_LABELS.values())
+        ins = cs[0].selectbox("Insurance type:", ins_options, key="q_ins")
+        named = cs[1].text_input("…or a named insurer (e.g. Aetna):", "", key="q_ins_name").strip()
+        if named:
+            spec["insurance"] = named
+        elif ins != "Any":
+            spec["insurance"] = {v: k for k, v in INSURANCE_LABELS.items()}[ins]
+        v = cs[2].text_input("Location (state, city …):", "", key="q_loc").strip()
+        if v:
+            spec["location"] = v
+        v = cs[3].text_input("Treatment / service (e.g. inpatient):", "", key="q_svc").strip()
+        if v:
+            spec["service"] = v
+
+        # ---- run ----
+        results = run_analytics_query(qf, cols, {**spec, "timeline": tl}, by)
+        scope = results["scope"]
+        if not scope.available:
+            st.warning(scope.message)
+            return
+        for n in scope.notes:
+            st.caption(n)
+        calls_df = results["calls"].data
+        st.markdown(f"**{len(calls_df):,} calls** match the timeline and filters.")
+
+        t_stats, t_rank, t_daily, t_comp, t_anom, t_calls = st.tabs(
+            ["📊 Statistics", "🏆 Rankings", "📅 Daily breakdown", "↔️ Period comparison", "🚨 Anomalies", "📞 Matching calls"]
+        )
+        with t_stats:
+            stats = results["stats"]
+            if stats.available:
+                k = stats.scalars
+                n = k["Calls"]
+                m = st.columns(6)
+                m[0].metric("Calls", f"{n:,}")
+                m[1].metric("Qualified", count_with_pct(k["Qualified"], n))
+                m[2].metric("Spam / Fake", count_with_pct(k["Spam"], n))
+                m[3].metric("VoIP", count_with_pct(k["VoIP"], n))
+                m[4].metric("Avg Score", "–" if pd.isna(k["Avg Score"]) else f"{k['Avg Score']:.1f}")
+                m[5].metric("QC Completion", "–" if not n else f"{k['QC Done'] / n * 100:.1f}%")
+            show_query_result(stats, "stats", "query_statistics")
+
+        with t_rank:
+            how = st.selectbox("Rank by:", ["Current values", "Change vs previous period"], key="q_rank_how")
+            top_n = st.number_input("Show top:", min_value=1, max_value=200, value=10, step=1, key="q_rank_n")
+            if how == "Current values":
+                metric = st.selectbox("Metric:", RANK_METRICS, key="q_rank_metric")
+                order = st.selectbox("Order:", ["Highest first", "Lowest first"], key="q_rank_order")
+                res = rank_groups(stats.data if stats.available else None, metric, n=int(top_n),
+                                  ascending=order == "Lowest first")
+            else:
+                metric = st.selectbox("Metric:", list(CHANGE_COLUMN), key="q_rank_cmetric")
+                order = st.selectbox("Order:", ["Biggest improvement", "Biggest decline"], key="q_rank_corder")
+                res = rank_improvement(results["comparison"], metric, improving=order == "Biggest improvement", n=int(top_n))
+            show_query_result(res, "rank", "query_ranking")
+
+        with t_daily:
+            freq = st.selectbox("Breakdown:", ["Day", "Week", "Month"], key="q_freq")
+            ts = results["daily"] if freq == "Day" else time_series(scope.data, cols, tl, by=by, freq=freq.lower())
+            show_query_result(ts, "daily", "query_" + freq.lower() + "ly")
+            if ts.available and ts.data is not None and not ts.data.empty and not by:
+                st.line_chart(ts.data.set_index("Label")[["Calls"]])
+
+        with t_comp:
+            comp = results["comparison"]
+            if comp.available:
+                st.caption(f"**Current:** {comp.scalars['Current period']}  |  **Comparison:** {comp.scalars['Comparison period']}")
+            show_query_result(comp, "comp", "query_period_comparison")
+
+        with t_anom:
+            show_query_result(results["anomalies"], "anom", "query_anomalies")
+
+        with t_calls:
+            st.caption(f"{len(calls_df):,} matching calls (showing the first 1,000).")
+            view = calls_df[[c for c in calls_df.columns if c in df.columns]]
+            st.dataframe(view.head(1000), width="stretch")
+            st.download_button(
+                label="📥 Download Matching Calls as CSV",
+                data=view.to_csv(index=False).encode("utf-8"),
+                file_name="query_matching_calls.csv",
+                mime="text/csv",
+                key="q_dl_calls",
+            )
+            st.markdown("**Repeat Caller IDs** (the same Caller ID calling more than once)")
+            show_query_result(repeat_callers(calls_df, cols), "repeat", "query_repeat_callers")
+            st.markdown("**Insurance breakdown** (explicit terms only)")
+            ib = insurance_breakdown(calls_df, cols)
+            show_query_result(ib, "ins", "query_insurance")
+            if ib.available and "values" in ib.extra:
+                st.dataframe(ib.extra["values"], width="stretch", hide_index=True)
+
+
+# ---------------------------------------------------------------
 # Sidebar: connection
 # ---------------------------------------------------------------
 st.sidebar.header("⚙️ Configuration & Filters")
@@ -1555,76 +2768,14 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
 
     render_period_comparison(compare_base, available_columns, selected_qc_col, selected_voip_col)
 
-
-# ---------------------------------------------------------------
-# Step 5A Query Layer Interactive Explorer Component
-# ---------------------------------------------------------------
-st.markdown("---")
-
-with st.expander("🛠️ Step 5A Query Layer Interactive Explorer (Multi-Field & Semantic)", expanded=False):
-    st.markdown("Test the dimension-independent query engine across all A–O columns and AI QC attributes.")
-
-    q_col1, q_col2, q_col3 = st.columns(3)
-    exp_pub = q_col1.text_input("Filter Publisher (Query Layer):", "", key="exp_pub_input")
-    exp_buy = q_col2.text_input("Filter Buyer (Query Layer):", "", key="exp_buy_input")
-    exp_cmp = q_col3.text_input("Filter Campaign (Query Layer):", "", key="exp_cmp_input")
-
-    q_col4, q_col5, q_col6 = st.columns(3)
-    exp_ins = q_col4.text_input("Semantic Insurance Search (e.g. Medicaid):", "", key="exp_ins_input")
-    exp_line = q_col5.text_input("Filter Line Type (e.g. VoIP):", "", key="exp_line_input")
-    exp_dur = q_col6.number_input("Minimum Duration (seconds):", value=0, step=15, key="exp_dur_input")
-
-    # Initialize session state
-    if "query_result_df" not in st.session_state:
-        st.session_state.query_result_df = None
-
-    if st.button("Execute Advanced Query", key="execute_advanced_query_btn"):
-        try:
-            # Make sure work_df exists before querying
-            if 'work_df' in locals() and work_df is not None:
-                st.session_state.query_result_df = query_calls(
-                    work_df,
-                    publisher=exp_pub if exp_pub else None,
-                    buyer=exp_buy if exp_buy else None,
-                    campaign=exp_cmp if exp_cmp else None,
-                    insurance=exp_ins if exp_ins else None, # Note: using 'insurance' matching query_layer parameter
-                    line_type=exp_line if exp_line else None,
-                    duration=f">={exp_dur}" if exp_dur > 0 else None,
-                )
-            else:
-                st.error("⚠️ `work_df` is not loaded yet. Please ensure your data source is loaded first.")
-        except Exception as e:
-            st.error(f"⚠️ Query execution error: {e}")
-
-    # Render results from session state safely
-    if st.session_state.query_result_df is not None:
-        res = st.session_state.query_result_df
-        
-        # Check if the query was successful and has rows
-        if isinstance(res, dict) and res.get("status") == "ok":
-            df_results = res.get("df", pd.DataFrame())
-            st.success(f"Query Engine matched **{res.get('count', len(df_results)):,}** calls.")
-            
-            if not df_results.empty:
-                st.dataframe(df_results.head(100), use_container_width=True)
-                st.download_button(
-                    label="📥 Download Query Results as CSV",
-                    data=df_results.to_csv(index=False).encode("utf-8"),
-                    file_name="query_layer_results.csv",
-                    mime="text/csv",
-                    key="download_query_layer_csv",
-                )
-            else:
-                st.info("No matching calls found for the selected criteria.")
-        else:
-            st.warning(res.get("message", "No matching data available."))
-
-# Render secondary explorer with safe fallback defaults
-render_query_layer_explorer(
-    base_df=compare_base if 'compare_base' in locals() and compare_base is not None else work_df,
-    timeline=timeline if 'timeline' in locals() else None,
-    qc_col=selected_qc_col if 'selected_qc_col' in locals() else None,
-    voip_col=selected_voip_col if 'selected_voip_col' in locals() else None,
-    date_col=date_col_name if 'date_cols' in locals() and date_cols else None,
-    health_rules=HEALTH_RULES if 'HEALTH_RULES' in locals() else {},
-)
+    # Step 5A: Analytics Query Layer (reads the loaded sheet; does not change anything above)
+    render_query_layer(
+        df,
+        available_columns,
+        {
+            "qc": selected_qc_col,
+            "line_type": selected_voip_col,
+            "date": date_col_name if date_cols else None,
+        },
+        timeline,
+    )
