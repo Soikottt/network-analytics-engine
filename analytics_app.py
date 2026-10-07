@@ -1574,20 +1574,27 @@ with st.expander("🛠️ Step 5A Query Layer Interactive Explorer (Multi-Field 
     exp_line = q_col5.text_input("Filter Line Type (e.g. VoIP):", "", key="exp_line_input")
     exp_dur = q_col6.number_input("Minimum Duration (seconds):", value=0, step=15, key="exp_dur_input")
 
-    # Initialize session state to keep query results persistent across reruns
+    # Initialize session state
     if "query_result_df" not in st.session_state:
         st.session_state.query_result_df = None
 
     if st.button("Execute Advanced Query", key="execute_advanced_query_btn"):
-        st.session_state.query_result_df = query_calls(
-            work_df,
-            publisher=exp_pub if exp_pub else None,
-            buyer=exp_buy if exp_buy else None,
-            campaign=exp_cmp if exp_cmp else None,
-            insurance_query=exp_ins if exp_ins else None,
-            line_type=exp_line if exp_line else None,
-            min_duration=exp_dur if exp_dur > 0 else None,
-        )
+        try:
+            # Make sure work_df exists before querying
+            if 'work_df' in locals() and work_df is not None:
+                st.session_state.query_result_df = query_calls(
+                    work_df,
+                    publisher=exp_pub if exp_pub else None,
+                    buyer=exp_buy if exp_buy else None,
+                    campaign=exp_cmp if exp_cmp else None,
+                    insurance=exp_ins if exp_ins else None, # Note: using 'insurance' matching query_layer parameter
+                    line_type=exp_line if exp_line else None,
+                    duration=f">={exp_dur}" if exp_dur > 0 else None,
+                )
+            else:
+                st.error("⚠️ `work_df` is not loaded yet. Please ensure your data source is loaded first.")
+        except Exception as e:
+            st.error(f"⚠️ Query execution error: {e}")
 
     # Render results from session state safely
     if st.session_state.query_result_df is not None:
