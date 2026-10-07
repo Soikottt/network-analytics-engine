@@ -697,19 +697,19 @@ def qc_failure_groups(grouped, failed, dim):
 
 
 # ---------------- Total report (selected rows, or everything on the page) ----------------
-def render_total_report(frame, dim, selected_vals, n_groups, qc_col, voip_col):
-    """Combined totals for the ticked rows of the breakdown table, or for every row currently
-    on the page (filters / timeline / search) when nothing is ticked."""
-    if selected_vals:
-        shown = ", ".join(map(str, selected_vals[:8]))
-        if len(selected_vals) > 8:
-            shown += f" and {len(selected_vals) - 8} more"
-        st.subheader(f"📊 Total Report – selected {dim}: {shown}")
-    else:
-        st.subheader(f"📊 Total Report – all {dim} values currently shown ({n_groups:,})")
-        st.caption("Nothing is selected, so this is the total of everything on this page. "
-                   "Tick rows in the table above to see the total for only those.")
+def breakdown_column_config(dim):
+    """Same column widths for the breakdown table and the Totals row, so the columns line up."""
+    cfg = {dim: st.column_config.Column(width="large")}
+    for c in ("Total_Calls", "Avg_Score", "Avg_Duration", "Qualified_Calls", "Spam_Calls", "VoIP_Calls",
+              "Qualification_%", "Spam_%", "VoIP_%", "QC_Completion_%"):
+        cfg[c] = st.column_config.Column(width="small")
+    cfg["Health"] = st.column_config.Column(width="medium")
+    cfg["Health_Reason"] = st.column_config.Column(width="large")
+    return cfg
 
+
+def totals_row(frame, dim, label, columns, qc_col, voip_col):
+    """One 'Totals' row with exactly the columns of the breakdown table (zero-safe)."""
     k = period_kpis(frame, qc_col, voip_col)
     calls = k["Calls"]
     duration = frame["Duration_Num"].mean() if calls else float("nan")
@@ -717,21 +717,41 @@ def render_total_report(frame, dim, selected_vals, n_groups, qc_col, voip_col):
     qual_pct = safe_pct(k["Qualified"], calls)
     spam_pct = safe_pct(k["Spam"], calls)
     voip_pct = safe_pct(k["VoIP"], calls)
-
-    r1 = st.columns(4)
-    r1[0].metric("Total Calls", f"{calls:,}")
-    r1[1].metric("Qualified", count_with_pct(k["Qualified"], calls))
-    r1[2].metric("Spam / Fake", count_with_pct(k["Spam"], calls))
-    r1[3].metric("VoIP", count_with_pct(k["VoIP"], calls))
-    r2 = st.columns(4)
-    r2[0].metric("QC Completion", "–" if pd.isna(qc_pct) else f"{qc_pct:.1f}%",
-                 delta=f"{k['QC Done']:,} of {calls:,} calls", delta_color="off")
-    r2[1].metric("Avg Quality Score", "–" if pd.isna(k["Avg Score"]) else f"{k['Avg Score']:.1f}")
-    r2[2].metric("Avg Duration", "–" if pd.isna(duration) else f"{duration:.1f} sec")
-    r2[3].metric("Calls without QC result", f"{calls - k['QC Done']:,}")
-
     status, reason = health_status(calls, k["QC Done"], qc_pct, qual_pct, spam_pct, voip_pct, k["Avg Score"])
-    st.markdown(f"**Overall health:** {status} – {reason}")
+    row = {
+        dim: label, "Total_Calls": calls, "Avg_Score": k["Avg Score"], "Avg_Duration": duration,
+        "Qualified_Calls": k["Qualified"], "Spam_Calls": k["Spam"], "VoIP_Calls": k["VoIP"],
+        "Qualification_%": qual_pct, "Spam_%": spam_pct, "VoIP_%": voip_pct, "QC_Completion_%": qc_pct,
+        "Health": status, "Health_Reason": reason,
+    }
+    out = pd.DataFrame([row])[list(columns)]
+    for c in ("Avg_Score", "Avg_Duration", "Qualification_%", "Spam_%", "VoIP_%", "QC_Completion_%"):
+        out[c] = out[c].astype(float).round(1)
+    return out, k
+
+
+def render_total_report(frame, dim, selected_vals, n_groups, qc_col, voip_col, columns):
+    """Totals row directly under the breakdown table (like the 'Totals' line in Ringba): the
+    combined total of the ticked rows, or of everything currently on the page when none are ticked."""
+    if selected_vals:
+        shown = ", ".join(map(str, selected_vals[:8]))
+        if len(selected_vals) > 8:
+            shown += f" and {len(selected_vals) - 8} more"
+        label = f"Totals ({len(selected_vals)} selected)"
+        st.markdown(f"**📊 Total Report – selected {dim}:** {shown}")
+    else:
+        label = f"Totals (all {n_groups:,})"
+        st.markdown(
+            f"**📊 Total Report – all {dim} values currently shown.** "
+            "Nothing is selected; tick rows above to total only those."
+        )
+    out, k = totals_row(frame, dim, label, columns, qc_col, voip_col)
+    st.dataframe(out, width="stretch", hide_index=True, column_config=breakdown_column_config(dim))
+    if k["Calls"] - k["QC Done"]:
+        st.caption(
+            f"{k['Calls'] - k['QC Done']:,} of {k['Calls']:,} calls have no completed AI QC result yet; "
+            "all percentages are a share of total calls."
+        )
 
 
 # ---------------- Previous equivalent period ----------------
@@ -1475,9 +1495,18 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
             width="stretch",
             on_select="rerun",
             selection_mode="multi-row",
+            column_config=breakdown_column_config(selected_dimension),
         )
 
         selected_rows = event.selection.rows if hasattr(event, "selection") else []
+
+        # Total report: the ticked rows, or everything currently on the page when none are ticked
+        selected_vals = summary.iloc[selected_rows][selected_dimension].tolist() if selected_rows else []
+        report_frame = temp_df[temp_df[selected_dimension].isin(selected_vals)] if selected_vals else temp_df
+        render_total_report(
+            report_frame, selected_dimension, selected_vals, len(summary),
+            selected_qc_col, selected_voip_col, summary.columns,
+        )
 
         st.download_button(
             label="📥 Download Breakdown Table as CSV",
@@ -1485,15 +1514,6 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
             file_name=f"breakdown_by_{selected_dimension}.csv".replace(" ", "_").replace("/", "-"),
             mime="text/csv",
             key="dl_breakdown",
-        )
-
-        # Total report: the ticked rows, or everything currently on the page when none are ticked
-        selected_vals = summary.iloc[selected_rows][selected_dimension].tolist() if selected_rows else []
-        report_frame = temp_df[temp_df[selected_dimension].isin(selected_vals)] if selected_vals else temp_df
-        st.markdown("---")
-        render_total_report(
-            report_frame, selected_dimension, selected_vals, len(summary),
-            selected_qc_col, selected_voip_col,
         )
 
         if selected_rows:
