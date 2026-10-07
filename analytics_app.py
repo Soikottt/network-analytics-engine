@@ -2,17 +2,7 @@ import streamlit as st
 import pandas as pd
 import gspread
 from datetime import date, timedelta
-from query_layer import render_query_layer_explorer
-
-render_query_layer_explorer(
-        base_df=compare_base if compare_base is not None else work_df,
-        timeline=timeline,
-        qc_col=selected_qc_col,
-        voip_col=selected_voip_col,
-        date_col=date_col_name if date_cols else None,
-        health_rules=HEALTH_RULES,
-    )
-
+from query_layer import query_calls, get_group_stats, extract_qc_field
 
 # ---------------------------------------------------------------
 # Page config
@@ -1598,4 +1588,3 @@ with st.expander("🛠️ Step 5A Query Layer Interactive Explorer (Multi-Field 
                 key="download_query_layer_csv",
             )
             
-  
