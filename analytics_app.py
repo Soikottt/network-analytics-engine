@@ -128,6 +128,22 @@ def open_spreadsheet(gc, name, ref):
     return matches[0], matches
 
 
+def worksheet_to_frame(worksheet):
+    """One tab -> clean DataFrame (None when it has no data rows). A 'Source Tab' column is added."""
+    rows = worksheet.get_all_values()
+    if not rows or len(rows) < 2:
+        return None
+    headers = [str(h).strip() for h in rows[0]]
+    cleaned_headers = [h if h != "" else f"Unnamed_{i}" for i, h in enumerate(headers)]
+    frame = pd.DataFrame(rows[1:], columns=cleaned_headers)
+    frame = frame[(frame.astype(str).apply(lambda c: c.str.strip()) != "").any(axis=1)]
+    # drop template/placeholder rows such as "[Call:CreatedAt]" / "[tag:Buyer:Name]"
+    is_placeholder = frame.astype(str).apply(lambda c: c.str.strip().str.match(r"^\[[^\]]+\]$")).any(axis=1)
+    frame = frame[~is_placeholder].reset_index(drop=True)
+    frame["Source Tab"] = worksheet.title
+    return frame
+
+
 def get_worksheet(ss, tab):
     sheets = ss.worksheets()
     for ws in sheets:
@@ -260,7 +276,7 @@ def render_period_comparison(base_df, available_columns, qc_col, voip_col):
     st.subheader("⚖ Period Comparison Mode")
     st.caption(
         "Compare any two date ranges (for example last Tuesday vs this Tuesday, or last week vs "
-        "this week) by Publisher, Buyer or any other column. A = earlier period, B = later period. "
+        "this week) by Publisher, Buyer or any other column. Earlier = the older period, Later = the newer period. "
         "This section ignores the sidebar Date Range filter, but still uses Global Search and "
         "the column mapping."
     )
@@ -296,8 +312,8 @@ def render_period_comparison(base_df, available_columns, qc_col, voip_col):
     a_def, b_def = preset_ranges(preset, anchor, weekday_idx)
     suffix = f"{PRESETS.index(preset)}_{weekday_idx}_{anchor}"
     r2 = st.columns(2)
-    pick_a = r2[0].date_input("Period A (earlier):", value=a_def, key=f"cmp_a_{suffix}")
-    pick_b = r2[1].date_input("Period B (later):", value=b_def, key=f"cmp_b_{suffix}")
+    pick_a = r2[0].date_input("Earlier period (older dates):", value=a_def, key=f"cmp_a_{suffix}")
+    pick_b = r2[1].date_input("Later period (newer dates):", value=b_def, key=f"cmp_b_{suffix}")
 
     range_a, range_b = as_range(pick_a), as_range(pick_b)
     if range_a is None or range_b is None:
@@ -327,8 +343,8 @@ def render_period_comparison(base_df, available_columns, qc_col, voip_col):
 
     frame_a, frame_b = slice_period(base, *range_a), slice_period(base, *range_b)
     st.caption(
-        f"**A:** {describe_period(*range_a)}, {len(frame_a):,} calls   |   "
-        f"**B:** {describe_period(*range_b)}, {len(frame_b):,} calls"
+        f"**Earlier:** {describe_period(*range_a)}, {len(frame_a):,} calls   |   "
+        f"**Later:** {describe_period(*range_b)}, {len(frame_b):,} calls"
     )
     if len(frame_a) == 0 and len(frame_b) == 0:
         st.warning("No calls found in either period.")
@@ -339,24 +355,24 @@ def render_period_comparison(base_df, available_columns, qc_col, voip_col):
             "Check the dates (your data starts/ends on a different day)."
         )
 
-    # --- Summary cards: B value, difference vs A ---
+    # --- Summary cards: Later value, difference vs Earlier ---
     kpi_a = period_kpis(frame_a, qc_col, voip_col)
     kpi_b = period_kpis(frame_b, qc_col, voip_col)
     cards = st.columns(5)
     for card, m in zip(cards, ["Calls", "Qualified", "Spam", "VoIP", "Avg Score"]):
         a, b = kpi_a[m], kpi_b[m]
         if pd.isna(b):
-            card.metric(f"{m} (B)", "n/a")
+            card.metric(f"{m} (Later)", "n/a")
         elif pd.isna(a):
-            card.metric(f"{m} (B)", f"{b:.1f}" if m == "Avg Score" else f"{b:,}")
+            card.metric(f"{m} (Later)", f"{b:.1f}" if m == "Avg Score" else f"{b:,}")
         else:
             diff = round(b - a, 1) if m == "Avg Score" else b - a
             value = f"{b:.1f}" if m == "Avg Score" else f"{b:,}"
             delta = (
-                f"{diff:+.1f} vs A ({a:.1f})" if m == "Avg Score" else f"{diff:+,} vs A ({a:,})"
+                f"{diff:+.1f} vs Earlier ({a:.1f})" if m == "Avg Score" else f"{diff:+,} vs Earlier ({a:,})"
             )
             color = "off" if diff == 0 else ("inverse" if m == "Spam" else "normal")
-            card.metric(f"{m} (B)", value, delta=delta, delta_color=color)
+            card.metric(f"{m} (Later)", value, delta=delta, delta_color=color)
 
     # --- Per-group comparison table ---
     stats_a = add_percentages(period_stats(frame_a, group_cols, qc_col, voip_col))
@@ -373,21 +389,21 @@ def render_period_comparison(base_df, available_columns, qc_col, voip_col):
         else:
             a, b = a.round(1), b.round(1)
             diff = (b - a).round(1)
-        res[f"{m} A"], res[f"{m} B"], res[f"{m} Δ"] = a, b, diff
-    res["_total"] = res["Calls A"] + res["Calls B"]
+        res[f"{m} Earlier"], res[f"{m} Later"], res[f"{m} Δ"] = a, b, diff
+    res["_total"] = res["Calls Earlier"] + res["Calls Later"]
     res = res.sort_values("_total", ascending=False).drop(columns="_total").reset_index()
 
-    table_cols = group_cols + [f"{m} {s}" for m in show_metrics for s in ("A", "B", "Δ")]
+    table_cols = group_cols + [f"{m} {s}" for m in show_metrics for s in ("Earlier", "Later", "Δ")]
     table = res[table_cols]
 
-    st.markdown("**Calls per group: A vs B** (top 15)")
+    st.markdown("**Calls per group: Earlier vs Later** (top 15)")
     chart = res.copy()
     chart["Group"] = chart[group_cols].astype(str).apply(" | ".join, axis=1)
-    st.bar_chart(chart.set_index("Group")[["Calls A", "Calls B"]].head(15))
+    st.bar_chart(chart.set_index("Group")[["Calls Earlier", "Calls Later"]].head(15))
 
     st.dataframe(table, width="stretch", hide_index=True)
     st.caption(
-        "Δ = B minus A (for % metrics it is in percentage points). "
+        "Δ = Later minus Earlier (for % metrics it is in percentage points). "
         "Percentages are a share of all calls in that period; a group with no calls in a period shows blank. "
         "Avg Score ignores calls that have no AI QC result yet."
     )
@@ -1110,10 +1126,11 @@ def render_top_issues(ctx, dim):
     )
 
 
-def render_trends_and_insights(timeline, work_df, base_df, dim, qc_col, voip_col, ctx=None):
+def render_trends_and_insights(timeline, work_df, base_df, dim, qc_col, voip_col, ctx=None,
+                               heading=None, labels=("Current", "Comparison"), key_suffix=""):
     """Selected timeline -> previous equivalent period -> trends -> actionable insights."""
     st.markdown("---")
-    st.subheader(f"📉 Trends vs Previous Equivalent Period (by {dim})")
+    st.subheader(heading or f"📉 Trends vs Previous Equivalent Period (by {dim})")
 
     if ctx is None:
         ctx = compute_trend_context(timeline, work_df, base_df, dim, qc_col, voip_col)
@@ -1127,9 +1144,9 @@ def render_trends_and_insights(timeline, work_df, base_df, dim, qc_col, voip_col
 
     info, win, start = ctx["info"], ctx["win"], ctx["start"]
     st.caption(
-        f"**Current ({info['cur_name']}):** {describe_period(start, ctx['end'])}"
+        f"**{labels[0]} ({info['cur_name']}):** {describe_period(start, ctx['end'])}"
         f"{' (so far)' if win['in_progress'] else ''}   |   "
-        f"**Comparison ({info['prev_name']}):** {describe_window(*win['prev'])}"
+        f"**{labels[1]} ({info['prev_name']}):** {describe_window(*win['prev'])}"
         f"{', same elapsed time' if win['trimmed'] else ''}"
     )
     first_call = ctx["first_call"]
@@ -1154,7 +1171,7 @@ def render_trends_and_insights(timeline, work_df, base_df, dim, qc_col, voip_col
         data=table.to_csv(index=False).encode("utf-8"),
         file_name="trends_vs_previous_period.csv",
         mime="text/csv",
-        key="dl_trends",
+        key=f"dl_trends{key_suffix}",
     )
     if ctx["n_hidden"]:
         st.caption(
@@ -1170,7 +1187,7 @@ def render_trends_and_insights(timeline, work_df, base_df, dim, qc_col, voip_col
     )
 
     # ---- Actionable insights (same selected timeline and comparison period) ----
-    st.subheader("💡 Actionable Insights")
+    st.subheader("💡 Actionable Insights" + (" (custom dates)" if key_suffix else ""))
     insights = ctx["insights"]
     if not insights:
         st.info(
@@ -1192,6 +1209,75 @@ def render_trends_and_insights(timeline, work_df, base_df, dim, qc_col, voip_col
         with st.expander(f"Show {len(insights) - 15} more insights"):
             for item in insights[15:]:
                 st.markdown(item["text"])
+
+
+def compute_custom_trend_context(base_df, later_range, earlier_range, dim, qc_col, voip_col):
+    """Same result as compute_trend_context(), but for two dates / date ranges chosen by hand
+    (both ends included). 'Later' plays the role of the current period, 'Earlier' of the comparison."""
+    l_start, l_end = later_range
+    e_start, e_end = earlier_range
+    one_day = pd.Timedelta(days=1)
+    info = {
+        "prev": (e_start, e_end),
+        "cur_name": describe_period(l_start, l_end),
+        "prev_name": describe_period(e_start, e_end),
+    }
+    win = {
+        "cur": (pd.Timestamp(l_start), pd.Timestamp(l_end) + one_day),
+        "prev": (pd.Timestamp(e_start), pd.Timestamp(e_end) + one_day),
+        "trimmed": False, "in_progress": False,
+    }
+    ctx = {"status": "ok", "info": info, "win": win, "start": l_start, "end": l_end,
+           "first_call": base_df["Parsed_Date"].min(), "insights": [], "table": None, "n_hidden": 0}
+    cur_df = normalize_groups(slice_period(base_df, l_start, l_end), [dim])
+    prev_df = normalize_groups(slice_period(base_df, e_start, e_end), [dim])
+    if cur_df.empty:
+        ctx["status"] = "empty_current"
+        return ctx
+    if prev_df.empty:
+        ctx["status"] = "no_previous"
+        return ctx
+    cur_stats = add_percentages(period_stats(cur_df, [dim], qc_col, voip_col))
+    prev_stats = add_percentages(period_stats(prev_df, [dim], qc_col, voip_col))
+    records, order = build_trends(cur_stats, prev_stats)
+    ctx["table"], ctx["n_hidden"] = trend_table(records, order, dim)
+    ctx["insights"] = build_insights(records, info["prev_name"])
+    return ctx
+
+
+def render_custom_insights(base_df, available_columns, default_dim, qc_col, voip_col):
+    """Actionable insights for two dates (or date ranges) picked by hand, for example
+    06 May 2026 vs 17 Aug 2027. The standard insights above are not changed."""
+    st.markdown("---")
+    with st.expander("🗓️ Custom Date Actionable Insights (compare any two dates or date ranges)", expanded=False):
+        st.caption(
+            "Pick the Earlier and the Later date (or date range; click the same day twice for a single day). "
+            "The insights show how the Later period changed compared with the Earlier one. "
+            "This ignores the sidebar Date Range filter but still uses Global Search."
+        )
+        if base_df is None or base_df["Parsed_Date"].notna().sum() == 0:
+            st.info("Custom date insights need a readable date column.")
+            return
+        anchor = base_df["Parsed_Date"].max().date()
+        c1, c2 = st.columns(2)
+        day = timedelta(days=1)
+        pick_e = c1.date_input("Earlier date or range:", value=(anchor - day, anchor - day), key="cust_ins_earlier")
+        pick_l = c2.date_input("Later date or range:", value=(anchor, anchor), key="cust_ins_later")
+        dim_index = available_columns.index(default_dim) if default_dim in available_columns else 0
+        dim = st.selectbox("Group insights by:", available_columns, index=dim_index, key="cust_ins_dim")
+        range_e, range_l = as_range(pick_e), as_range(pick_l)
+        if range_e is None or range_l is None:
+            st.info("Pick both the start and end date for each period (click the same day twice for a single day).")
+            return
+        if range_e[0] > range_l[0]:
+            range_e, range_l = range_l, range_e
+            st.caption("The two selections were swapped so that Earlier is the older one.")
+        ctx = compute_custom_trend_context(base_df, range_l, range_e, dim, qc_col, voip_col)
+        render_trends_and_insights(
+            None, None, base_df, dim, qc_col, voip_col, ctx=ctx,
+            heading=f"📉 Trends: Later vs Earlier (by {dim})",
+            labels=("Later", "Earlier"), key_suffix="_custom",
+        )
 
 
 # ---------------------------------------------------------------
@@ -2410,6 +2496,53 @@ def show_query_result(res, key, file_stub):
     )
 
 
+def group_labels(frame, cols, by):
+    """(one 'a | b' label per row of `frame`, group column names); labels are None when not possible."""
+    g, gcols, missing = _with_group_columns(frame, cols, by)
+    if missing or not len(g):
+        return None, gcols
+    return g[gcols].astype(str).agg(" | ".join, axis=1).values, gcols
+
+
+def table_labels(table, gcols):
+    """The 'a | b' group labels listed in a result table (empty when the table has no such columns)."""
+    if table is None or table.empty or not gcols or not all(c in table.columns for c in gcols):
+        return []
+    return table[gcols].astype(str).agg(" | ".join, axis=1).tolist()
+
+
+def show_matched_calls(frame, sheet_columns, key, row_labels=None, group_options=None, note=None,
+                       extra_cols=None, group_prompt="Show calls only for these groups (leave empty for all):"):
+    """The calls behind a result with EVERY sheet column (Caller ID, summary, call date ...), newest
+    first, an optional group filter and a CSV download."""
+    total = 0 if frame is None else len(frame)
+    with st.expander(f"📞 Matched calls: full report ({total:,})"):
+        if note:
+            st.caption(note)
+        if frame is None or frame.empty:
+            st.info("No matching calls for the selected filters.")
+            return
+        shown = frame
+        options = list(dict.fromkeys(group_options or []))
+        if row_labels is not None and options:
+            chosen = st.multiselect(group_prompt, options, key=f"q_mc_{key}")
+            if chosen:
+                shown = frame[pd.Series(row_labels).isin(chosen).values]
+        if "Parsed_Date" in shown.columns:
+            shown = shown.sort_values("Parsed_Date", ascending=False)
+        lead = [c for c in (extra_cols or []) if c in shown.columns]
+        view = shown[lead + [c for c in shown.columns if c in sheet_columns and c not in lead]]
+        st.caption(f"{len(view):,} calls (showing the first 1,000).")
+        st.dataframe(view.head(1000), width="stretch")
+        st.download_button(
+            label="📥 Download These Calls as CSV",
+            data=view.to_csv(index=False).encode("utf-8"),
+            file_name=f"query_matched_calls_{key}.csv",
+            mime="text/csv",
+            key=f"q_dl_mc_{key}",
+        )
+
+
 def render_query_layer(df, available_columns, overrides, sidebar_timeline):
     """Panel for the Analytics Query Layer: choose timeline, grouping and filters, then read
     statistics, rankings, daily breakdown, period comparison, anomalies and the matching calls."""
@@ -2514,6 +2647,7 @@ def render_query_layer(df, available_columns, overrides, sidebar_timeline):
             st.caption(n)
         calls_df = results["calls"].data
         st.markdown(f"**{len(calls_df):,} calls** match the timeline and filters.")
+        row_labels, gcols_q = group_labels(calls_df, cols, by) if by else (None, [])
 
         t_stats, t_rank, t_daily, t_comp, t_anom, t_calls = st.tabs(
             ["📊 Statistics", "🏆 Rankings", "📅 Daily breakdown", "↔️ Period comparison", "🚨 Anomalies", "📞 Matching calls"]
@@ -2531,6 +2665,11 @@ def render_query_layer(df, available_columns, overrides, sidebar_timeline):
                 m[4].metric("Avg Score", "–" if pd.isna(k["Avg Score"]) else f"{k['Avg Score']:.1f}")
                 m[5].metric("QC Completion", "–" if not n else f"{k['QC Done'] / n * 100:.1f}%")
             show_query_result(stats, "stats", "query_statistics")
+            show_matched_calls(
+                calls_df, df.columns, "stats", row_labels=row_labels,
+                group_options=table_labels(stats.data if stats.available else None, gcols_q),
+                note="All calls behind these statistics, with every sheet column (Caller ID, summary, call date ...).",
+            )
 
         with t_rank:
             how = st.selectbox("Rank by:", ["Current values", "Change vs previous period"], key="q_rank_how")
@@ -2545,6 +2684,11 @@ def render_query_layer(df, available_columns, overrides, sidebar_timeline):
                 order = st.selectbox("Order:", ["Biggest improvement", "Biggest decline"], key="q_rank_corder")
                 res = rank_improvement(results["comparison"], metric, improving=order == "Biggest improvement", n=int(top_n))
             show_query_result(res, "rank", "query_ranking")
+            show_matched_calls(
+                calls_df, df.columns, "rank", row_labels=row_labels,
+                group_options=table_labels(res.data if res.available else None, gcols_q),
+                note="Calls in the selected period. Pick ranked groups to see only their calls.",
+            )
 
         with t_daily:
             freq = st.selectbox("Breakdown:", ["Day", "Week", "Month"], key="q_freq")
@@ -2552,15 +2696,45 @@ def render_query_layer(df, available_columns, overrides, sidebar_timeline):
             show_query_result(ts, "daily", "query_" + freq.lower() + "ly")
             if ts.available and ts.data is not None and not ts.data.empty and not by:
                 st.line_chart(ts.data.set_index("Label")[["Calls"]])
+            bucket_labels, _bc = group_labels(calls_df, cols, [freq.lower()])
+            show_matched_calls(
+                calls_df, df.columns, "daily", row_labels=bucket_labels,
+                group_options=sorted(set(bucket_labels), reverse=True) if bucket_labels is not None else [],
+                group_prompt=f"Show calls only for these {freq.lower()}s (leave empty for all):",
+                note="Calls behind this breakdown. Pick a day / week / month to see only its calls.",
+            )
 
         with t_comp:
             comp = results["comparison"]
             if comp.available:
                 st.caption(f"**Current:** {comp.scalars['Current period']}  |  **Comparison:** {comp.scalars['Comparison period']}")
             show_query_result(comp, "comp", "query_period_comparison")
+            if comp.available and "win" in comp.extra:
+                which = st.radio(
+                    "Calls from:", ["Current period", "Comparison period", "Both"],
+                    horizontal=True, key="q_mc_cmp_which",
+                )
+                w = comp.extra["win"]
+                cur_calls = slice_window(scope.data, *w["cur"]).assign(Period="Current period")
+                prev_calls = slice_window(scope.data, *w["prev"]).assign(Period="Comparison period")
+                pc = {"Current period": cur_calls, "Comparison period": prev_calls,
+                      "Both": pd.concat([cur_calls, prev_calls])}[which]
+                pc_labels = group_labels(pc, cols, by)[0] if by else None
+                show_matched_calls(
+                    pc, df.columns, "comp", extra_cols=["Period"], row_labels=pc_labels,
+                    group_options=table_labels(comp.data, gcols_q) if by else [],
+                    note="Calls in the current and the comparison period (all your filters applied).",
+                )
 
         with t_anom:
             show_query_result(results["anomalies"], "anom", "query_anomalies")
+            an = results["anomalies"]
+            an_options = table_labels(an.data if an.available else None, gcols_q) or \
+                table_labels(stats.data if stats.available else None, gcols_q)
+            show_matched_calls(
+                calls_df, df.columns, "anom", row_labels=row_labels, group_options=an_options,
+                note="Calls in the selected period. Pick the flagged groups to see their calls.",
+            )
 
         with t_calls:
             st.caption(f"{len(calls_df):,} matching calls (showing the first 1,000).")
@@ -2591,6 +2765,11 @@ st.sidebar.header("⚙️ Configuration & Filters")
 
 target_sheet_name = st.sidebar.text_input("Google Sheet Name:", "Ringba to Sheet QC")
 target_tab_name = st.sidebar.text_input("Sheet Tab Name:", "ALL QC from 30 Sept 2026")
+extra_tab_names = st.sidebar.text_input(
+    "Extra Tab(s) to Combine (comma-separated):",
+    "Sheet1",
+    help="Tabs of the same sheet whose rows are added to the main tab. Leave empty to use only the main tab.",
+)
 sheet_ref = st.sidebar.text_input(
     "Sheet URL or ID (optional, overrides the name):",
     "",
@@ -2602,26 +2781,40 @@ if st.sidebar.button("🔄 Connect & Load Fresh Data") or "sheet_loaded" not in 
         with st.spinner("Connecting to Google Sheets & fetching fresh data..."):
             gc = get_client()
             spreadsheet, matches = open_spreadsheet(gc, target_sheet_name, sheet_ref)
-            worksheet = get_worksheet(spreadsheet, target_tab_name)
-            rows = worksheet.get_all_values()
+            tab_names = [target_tab_name.strip()]
+            for t in extra_tab_names.split(","):
+                t = t.strip()
+                if t and t.lower() not in [x.lower() for x in tab_names]:
+                    tab_names.append(t)
+            frames, loaded_titles, load_notes = [], [], []
+            for i, tab in enumerate(tab_names):
+                try:
+                    ws = get_worksheet(spreadsheet, tab)
+                    part = worksheet_to_frame(ws)
+                except Exception as exc:
+                    if i == 0:
+                        raise
+                    load_notes.append(f"Extra tab '{tab}' was skipped: {exc}")
+                    continue
+                if part is None:
+                    load_notes.append(f"Tab '{ws.title}' has no data rows and was skipped.")
+                    continue
+                frames.append(part)
+                loaded_titles.append((ws.title, len(part)))
 
-        if not rows or len(rows) < 2:
+        if not frames:
             st.sidebar.warning("The sheet is empty or contains no data rows.")
             st.session_state["sheet_loaded"] = False
         else:
-            headers = [str(h).strip() for h in rows[0]]
-            cleaned_headers = [h if h != "" else f"Unnamed_{i}" for i, h in enumerate(headers)]
-
-            df = pd.DataFrame(rows[1:], columns=cleaned_headers)
-            df = df[(df.astype(str).apply(lambda c: c.str.strip()) != "").any(axis=1)]
-            # drop template/placeholder rows such as "[Call:CreatedAt]" / "[tag:Buyer:Name]"
-            is_placeholder = df.astype(str).apply(lambda c: c.str.strip().str.match(r"^\[[^\]]+\]$")).any(axis=1)
-            df = df[~is_placeholder].reset_index(drop=True)
+            # Rows of every tab are kept (duplicates included); columns are matched by header name.
+            df = pd.concat(frames, ignore_index=True).fillna("")
 
             st.session_state["df"] = df
             st.session_state["meta"] = {
                 "title": spreadsheet.title,
-                "tab": worksheet.title,
+                "tab": " + ".join(t for t, _ in loaded_titles),
+                "counts": " · ".join(f"{t}: {n:,}" for t, n in loaded_titles),
+                "notes": load_notes,
                 "url": spreadsheet.url,
                 "duplicates": [m.url for m in matches] if len(matches) > 1 else [],
             }
@@ -2649,6 +2842,10 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
     if meta:
         st.sidebar.caption(f"Opened: **{meta['title']}** → tab **{meta['tab']}**")
         st.sidebar.markdown(f"[Open this sheet]({meta['url']})")
+        if len(meta.get("counts", "").split(" · ")) > 1:
+            st.sidebar.caption(f"Rows loaded per tab: {meta['counts']}")
+        for note in meta.get("notes", []):
+            st.sidebar.warning(note)
         if meta["duplicates"]:
             st.sidebar.warning(
                 f"{len(meta['duplicates'])} sheets share this name. Using the first one. "
@@ -2942,6 +3139,9 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
         render_trends_and_insights(
             timeline, work_df, compare_base, selected_dimension, selected_qc_col, selected_voip_col,
             ctx=trend_ctx,
+        )
+        render_custom_insights(
+            compare_base, available_columns, selected_dimension, selected_qc_col, selected_voip_col
         )
 
     render_period_comparison(compare_base, available_columns, selected_qc_col, selected_voip_col)
