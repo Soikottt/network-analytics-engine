@@ -67,6 +67,22 @@ def parse_duration(val):
         return float("nan")
 
 
+def add_numeric_columns(frame, score_col, dur_col):
+    """Quality_Score_Num and Duration_Num, used by the dashboard AND the Query Layer so both
+    always read the sheet the same way. A missing column gives NaN (never 0)."""
+    if score_col:
+        frame["Quality_Score_Num"] = pd.to_numeric(
+            frame[score_col].astype(str).str.extract(r"(-?\d+\.?\d*)")[0], errors="coerce"
+        )
+    else:
+        frame["Quality_Score_Num"] = float("nan")
+    if dur_col:
+        frame["Duration_Num"] = frame[dur_col].apply(parse_duration)
+    else:
+        frame["Duration_Num"] = float("nan")
+    return frame
+
+
 def parse_dates(series):
     """Parse a column with MIXED date formats, row by row.
     Handles '10/05/2026 10:23:18', '9/29/2026 22:38:23' and 'Oct 05 7:32:57 PM' (no year)."""
@@ -404,7 +420,7 @@ DATE_PRESETS = [
 ]
 # Which calendar day counts as "Today". Change to the timezone your call times are in,
 # for example "America/New_York" or "UTC".
-DEFAULT_TIMEZONE = "America/New_York"
+DEFAULT_TIMEZONE = "Asia/Dhaka"
 
 
 def get_today(tz_name):
@@ -1298,34 +1314,35 @@ def parse_qc_text(text):
     return out
 
 
+FAKE_YES_VALUES = {"yes", "y", "true", "1", "fake", "detected", "detected fake", "fake detected", "fake number"}
+FAKE_NO_VALUES = {"no", "n", "false", "0", "not fake", "not a fake"}
+
+
 def prepare_query_frame(df, cols):
     """Add the helper columns every query uses (Parsed_Date, Quality_Score_Num, Duration_Num,
-    Caller_ID_Norm, Fake_Flag, Fake_Known and one 'QC: <field>' column per AI QC field).
+    Caller_ID_Norm, Fake_Value / Fake_Flag / Fake_Known and one 'QC: <field>' column per AI QC field).
     The sheet columns themselves are never changed."""
     q = df.copy()
     if cols.get("date"):
         q["Parsed_Date"] = parse_dates(q[cols["date"]])
     else:
         q["Parsed_Date"] = pd.Series(pd.NaT, index=q.index, dtype="datetime64[ns]")
-    if cols.get("score"):
-        q["Quality_Score_Num"] = pd.to_numeric(
-            q[cols["score"]].astype(str).str.extract(r"(-?\d+\.?\d*)")[0], errors="coerce"
-        )
-    else:
-        q["Quality_Score_Num"] = float("nan")
-    q["Duration_Num"] = q[cols["duration"]].apply(parse_duration) if cols.get("duration") else float("nan")
+    q = add_numeric_columns(q, cols.get("score"), cols.get("duration"))
     if cols.get("caller_id"):
         digits = q[cols["caller_id"]].astype(str).str.strip().str.replace(r"\.0+$", "", regex=True)
         q["Caller_ID_Norm"] = digits.str.replace(r"\D", "", regex=True)
     else:
         q["Caller_ID_Norm"] = ""
+    # Fake Number: only an explicit Yes or No counts. Blank / missing / unreadable = Unknown (never No).
     if cols.get("fake"):
         raw = q[cols["fake"]].astype(str).str.strip().str.lower()
-        q["Fake_Known"] = raw != ""
-        q["Fake_Flag"] = raw.isin(["yes", "true", "y", "1", "fake"])
+        q["Fake_Value"] = "Unknown"
+        q.loc[raw.isin(FAKE_NO_VALUES), "Fake_Value"] = "No"
+        q.loc[raw.isin(FAKE_YES_VALUES), "Fake_Value"] = "Yes"
     else:
-        q["Fake_Known"] = False
-        q["Fake_Flag"] = False
+        q["Fake_Value"] = "Unknown"
+    q["Fake_Known"] = q["Fake_Value"] != "Unknown"
+    q["Fake_Flag"] = q["Fake_Value"] == "Yes"
     if cols.get("qc"):
         parsed = pd.DataFrame([parse_qc_text(t) for t in q[cols["qc"]]], index=q.index)
         for c in parsed.columns:
@@ -1428,6 +1445,20 @@ def _as_list(v):
     return [v]
 
 
+def _qc_sources(frame, words):
+    """'qc:<Field>' sources for every parsed AI QC field whose name contains one of the words, in sheet
+    order. This keeps the Query Layer independent of any single campaign's QC template (a rehab
+    report has 'Insurance' / 'Treatment/Service Interest', another campaign may name its fields
+    differently or not have them at all)."""
+    names = [c[len(QC_PREFIX):] for c in frame.columns if c.startswith(QC_PREFIX)]
+    return ["qc:" + n for n in names if any(w in n.lower() for w in words)]
+
+
+INSURANCE_FIELD_WORDS = ("insurance", "coverage", "payer")
+LOCATION_FIELD_WORDS = ("location", "state", "city", "zip", "area", "region", "address")
+SERVICE_FIELD_WORDS = ("service", "treatment", "interest", "product", "topic", "intent", "why")
+
+
 def _terms_regex(terms, regex=False):
     """Search terms (a list, or one string where a comma means 'any of') as one regex."""
     if isinstance(terms, str):
@@ -1468,65 +1499,135 @@ def search_calls(frame, cols, terms, sources=SEARCH_SOURCES, regex=False, title=
 
 
 # ---------------- Insurance / location / service (meaning-based, explicit terms only) ----------------
-INSURANCE_PATTERNS = {
-    "public": (
-        r"medicaid|medicare|medi[- ]cal\b|public (?:health )?insurance"
+# ---------------------------------------------------------------------------------------------
+# INSURANCE RULES  (owner's STRICT rule - do not loosen or override):
+#   * An insurer NAME alone (Aetna, Cigna, Blue Cross Blue Shield, United Healthcare ...) is NEVER
+#     counted as private insurance. The same name can be a Medicaid / state / marketplace plan.
+#   * A call is PRIVATE only when the call data explicitly says private / commercial insurance.
+#   * The decision is made only after reading ShortSummary, Note and the AI QC Report together.
+#   * Medi-Cal is the same type as Medicaid.
+#   * Nothing is inferred; no explicit term means "Type Not Stated" or "Insurer Named".
+# ---------------------------------------------------------------------------------------------
+INSURANCE_TYPE_PATTERNS = {
+    "medicaid": r"medicaid|medi[- ]cal\b",
+    "medicare": r"medicare",
+    "marketplace": r"marketplace|obamacare|affordable care act|healthcare\.gov|\baca\b",
+    "public_general": (
+        r"public (?:health )?insurance"
         r"|government(?:-| )(?:funded |sponsored |run )?(?:health )?(?:insurance|plan)"
         r"|state(?:-| )(?:funded |run |sponsored )?(?:health )?(?:insurance|plan)"
     ),
-    "private": (
-        r"private (?:health )?insurance|commercial insurance|blue ?cross|blue ?shield|\bbcbs\b|aetna|cigna"
-        r"|united ?health ?care|\buhc\b|anthem|humana|kaiser"
-    ),
+    "private": r"private (?:health )?(?:insurance|plan)|commercial (?:health )?(?:insurance|plan)",
     "none": (
         r"\b(?:no|without) (?:any |health )?insurance\b"
         r"|\b(?:doesn'?t|does not|don'?t|do not) have (?:any |health )?insurance\b|\buninsured\b|\bno coverage\b"
     ),
 }
-# Only inside the dedicated 'Insurance' field, a bare 'public' / 'government' is explicit enough.
+# Named insurers: they say WHO the carrier is, not WHICH kind of plan (so they never mean 'private' by themselves).
+INSURER_NAME_PATTERN = (
+    r"blue ?cross|blue ?shield|\bbcbs\b|aetna|cigna|united ?health ?care|\buhc\b|anthem|humana|kaiser"
+    r"|molina|wellcare|amerigroup|ambetter|health ?net|highmark|premera|regence|oscar health"
+)
+INSURANCE_PUBLIC_TYPES = ("medicaid", "medicare", "marketplace", "public_general")
+# Only inside the dedicated insurance field, a bare 'public' / 'government' is explicit enough.
 INSURANCE_FIELD_PUBLIC = r"\bpublic\b|\bgovernment\b"
 INSURANCE_LABELS = {
-    "public": "Public (Medicaid / Medicare / state / government)",
-    "private": "Private (named commercial insurer)",
+    "public": "Public (Medicaid / Medi-Cal / Medicare / marketplace / state / government)",
+    "private": "Private (explicitly stated private / commercial insurance)",
+    "insurer_named": "Insurer named, plan type not confirmed (not counted as private)",
     "none": "No insurance",
-    "mixed": "Public and private both mentioned",
-    "unspecified": "Insurance mentioned, type not stated",
+    "mixed": "Mixed (more than one explicit insurance type)",
+    "unspecified": "Type Not Stated (insurance mentioned, no explicit type)",
     "unknown": "No insurance information",
 }
+INSURANCE_TYPE_LABELS = {
+    "medicaid": "Medicaid / Medi-Cal", "medicare": "Medicare", "marketplace": "Marketplace (ACA)",
+    "public_general": "Public / Government", "private": "Private insurance (explicitly stated)",
+    "none": "No insurance",
+}
+INSURER_NAMED_LABEL = "Insurer Named - Plan Type Not Confirmed"
 
 
 def classify_insurance(frame, cols):
-    """One row per call: Insurance_Category (public / private / none / mixed / unspecified / unknown)
-    and Insurance_Source. Only explicit terms count: 'Discussed insurance' or just 'state' is
-    'unspecified', never Medicaid / Medicare / public / private. Order searched: the QC
-    'Insurance' field, the whole AI QC Report, ShortSummary, Note."""
+    """One row per call, from EXPLICIT terms only (never inferred), reading the QC insurance field(s),
+    the whole AI QC Report, ShortSummary and Note TOGETHER:
+
+      Insurance_Type       Medicaid / Medi-Cal / Medicare / Marketplace (ACA) / Public / Government /
+                           Private insurance (explicitly stated) / No insurance / Mixed /
+                           Insurer Named - Plan Type Not Confirmed / Type Not Stated
+      Insurance_Category   public / private / insurer_named / none / mixed / unspecified / unknown
+      Insurance_Source     where the first explicit term was found
+      Has_Medicaid / Has_Medicare / Has_Marketplace / Has_Public / Has_Private / Has_None / Has_Insurer_Name
+
+    Rules (owner's strict rule, see INSURANCE RULES above):
+      * 'Aetna', 'Cigna', 'Blue Cross Blue Shield', 'United Healthcare' ... only name a carrier. They are
+        NOT private. With an explicit public program in the call data (Medicaid, Medi-Cal, Medicare,
+        state / public / government insurance, marketplace) the call takes that program; with an explicit
+        'private' / 'commercial' statement it is Private; with neither it stays 'Insurer Named'.
+      * Two different explicit types (Medicaid + Medicare, Medicaid + explicit private ...) are Mixed.
+        A generic 'public insurance' / 'marketplace' mention adds nothing once a more specific program
+        is named. A carrier name never creates 'Mixed'.
+      * 'Discussed insurance' or just 'state' is Type Not Stated. Negated mentions ('no Medicaid') are ignored.
+    Works for any campaign: fields are found by name, and the full text is always searched."""
     idx = frame.index
-    flags = {k: pd.Series(False, index=idx) for k in ("public", "private", "none")}
+    ins_fields = _qc_sources(frame, INSURANCE_FIELD_WORDS)
+    found = {k: pd.Series(False, index=idx) for k in INSURANCE_TYPE_PATTERNS}
+    insurer = pd.Series(False, index=idx)
     source = pd.Series("", index=idx, dtype=object)
-    resolved = pd.Series(False, index=idx)
     has_field_text = pd.Series(False, index=idx)
-    for src in ("qc:Insurance", "qc", "summary", "note"):
+    for src in ins_fields + ["qc", "summary", "note"]:
         texts = _source_text(frame, cols, src)
         if texts is None:
             continue
-        if src == "qc:Insurance":
-            has_field_text = ~texts.map(is_unavailable)
-        for kind, pat in INSURANCE_PATTERNS.items():
-            if src == "qc:Insurance" and kind == "public":
+        is_ins_field = src in ins_fields
+        if is_ins_field:
+            has_field_text |= ~texts.map(is_unavailable).astype(bool)
+        any_hit = pd.Series(False, index=idx)
+        for kind, pat in INSURANCE_TYPE_PATTERNS.items():
+            if is_ins_field and kind == "public_general":
                 pat = pat + "|" + INSURANCE_FIELD_PUBLIC
-            hits = _term_hits(texts, pat, negation=(kind != "none")) & ~resolved
-            flags[kind] |= hits
-        newly = (flags["public"] | flags["private"] | flags["none"]) & ~resolved
-        source[newly] = src
-        resolved |= newly
+            hits = _term_hits(texts, pat, negation=(kind != "none"))
+            found[kind] |= hits
+            any_hit |= hits
+        named = _term_hits(texts, INSURER_NAME_PATTERN)
+        insurer |= named
+        any_hit |= named
+        source[any_hit & (source == "")] = src
+    specific = found["medicaid"] | found["medicare"]
+    found["marketplace"] = found["marketplace"] & ~specific
+    found["public_general"] = found["public_general"] & ~(specific | found["marketplace"])
+    kinds = list(INSURANCE_TYPE_PATTERNS)
+    n_types = sum(found[k].astype(int) for k in kinds)
+    mixed = n_types > 1
     cat = pd.Series("unknown", index=idx, dtype=object)
     cat[has_field_text] = "unspecified"
-    cat[flags["none"]] = "none"
-    cat[flags["private"]] = "private"
-    cat[flags["public"]] = "public"
-    cat[flags["public"] & flags["private"]] = "mixed"
-    cat[flags["none"] & (flags["public"] | flags["private"])] = "mixed"
-    return pd.DataFrame({"Insurance_Category": cat, "Insurance_Source": source}, index=idx)
+    typ = pd.Series("Type Not Stated", index=idx, dtype=object)
+    only_insurer = insurer & (n_types == 0)
+    typ[only_insurer] = INSURER_NAMED_LABEL
+    cat[only_insurer] = "insurer_named"
+    for k in kinds:
+        only = found[k] & (n_types == 1)
+        typ[only] = INSURANCE_TYPE_LABELS[k]
+        cat[only] = "public" if k in INSURANCE_PUBLIC_TYPES else k
+    typ[mixed] = "Mixed"
+    cat[mixed] = "mixed"
+    out = pd.DataFrame({"Insurance_Type": typ, "Insurance_Category": cat, "Insurance_Source": source}, index=idx)
+    out["Has_Medicaid"] = found["medicaid"]
+    out["Has_Medicare"] = found["medicare"]
+    out["Has_Marketplace"] = found["marketplace"]
+    out["Has_Public"] = found["medicaid"] | found["medicare"] | found["marketplace"] | found["public_general"]
+    out["Has_Private"] = found["private"]
+    out["Has_None"] = found["none"]
+    out["Has_Insurer_Name"] = insurer
+    return out
+
+
+def _insurance_term_regex(term):
+    """Pattern for a named insurance term. Medicaid and Medi-Cal are the same type, so either word finds both."""
+    t = _norm_text(term)
+    if t in ("medicaid", "medi-cal", "medi cal", "medicaid / medi-cal"):
+        return INSURANCE_TYPE_PATTERNS["medicaid"]
+    return re.escape(t)
 
 
 US_STATES = {
@@ -1543,24 +1644,26 @@ US_STATES = {
 }
 
 
-def _place_steps(place):
-    """Search steps for a place: the QC 'Location' field first (state abbreviations such as 'CA'
+def _place_steps(place, frame):
+    """Search steps for a place: the QC location-type fields first (state abbreviations such as 'CA'
     count only there, upper-case), then the rest of the AI QC Report, ShortSummary and Note
     (full names only)."""
     p = _norm_text(place)
     name = r"\b" + re.escape(p) + r"\b"
-    steps = [("qc:Location", name, True, True)]
+    fields = _qc_sources(frame, LOCATION_FIELD_WORDS)
+    steps = [(f, name, True, True) for f in fields]
     if p in US_STATES:
-        steps.append(("qc:Location", r"(?<![A-Za-z])" + US_STATES[p] + r"(?![A-Za-z])", False, False))
+        steps += [(f, r"(?<![A-Za-z])" + US_STATES[p] + r"(?![A-Za-z])", False, False) for f in fields]
     steps += [("qc", name, True, True), ("summary", name, True, True), ("note", name, True, True)]
     return steps
 
 
-def _service_steps(terms):
+def _service_steps(terms, frame):
+    """Service / treatment / product interest: the QC fields that describe it (any campaign), then the
+    whole AI QC Report, ShortSummary and Note."""
     pat = _terms_regex(terms)
-    return [("qc:Treatment/Service Interest", pat, True, True), ("qc:Caller Intent", pat, True, True),
-            ("qc:Why They Called", pat, True, True), ("qc", pat, True, True),
-            ("summary", pat, True, True), ("note", pat, True, True)]
+    return ([(f, pat, True, True) for f in _qc_sources(frame, SERVICE_FIELD_WORDS)]
+            + [("qc", pat, True, True), ("summary", pat, True, True), ("note", pat, True, True)])
 
 
 # ---------------- filter_calls ----------------
@@ -1576,15 +1679,47 @@ def _isin_ci(series, values):
     return s.isin({str(v).strip().lower() for v in values})
 
 
+def describe_query(spec, matched=None, before=None):
+    """One plain-language line for the user: which filters were applied, which period, how many calls matched.
+    Built only from the spec, so it always matches what was actually filtered."""
+    spec = spec or {}
+    tl = spec.get("timeline")
+    if not tl:
+        period = "all calls in the data (no period filter)"
+    elif tl.get("start") is None:
+        period = "All time (no comparison period exists)"
+    else:
+        period = f"{tl.get('preset', 'Period')}: {pd.Timestamp(tl['start']).strftime('%b %d, %Y')} to {pd.Timestamp(tl['end']).strftime('%b %d, %Y')}"
+    labels = {"buyer": "Buyer", "publisher": "Publisher", "campaign": "Campaign", "hangup": "Hangup By",
+              "line_type": "Line Type", "phone_company": "Phone Company", "fake_number": "Fake Number",
+              "caller_id": "Caller ID contains", "recording": "Recording", "call_type": "Call type",
+              "qc_text": "AI QC Report contains", "summary_text": "ShortSummary contains", "note_text": "Note contains",
+              "any_text": "Anywhere contains", "insurance": "Insurance", "location": "Location", "service": "Service / treatment",
+              "duration_min": "Duration >= (sec)", "duration_max": "Duration <= (sec)",
+              "score_min": "Quality Score >=", "score_max": "Quality Score <="}
+    parts = []
+    for k, lab in labels.items():
+        v = spec.get(k)
+        if v is None or v == "" or v == []:
+            continue
+        v = ", ".join(map(str, v)) if isinstance(v, (list, tuple, set)) else v
+        parts.append(f"{lab} = {v}")
+    out = f"Period: {period}. Filters: " + ("; ".join(parts) if parts else "none") + "."
+    if matched is not None:
+        out += f" Matched {matched:,}" + (f" of {before:,} calls in the data." if before is not None else " calls.")
+    return out
+
+
 def filter_calls(frame, cols, spec=None, title="Matching calls"):
     """Filter calls by any combination of these spec keys (all optional, all combined with AND):
 
       timeline            dict from make_timeline()
       buyer, publisher, campaign, hangup, line_type, phone_company     value or list of values
       caller_id           digits (or part of them)
+      recording           True (has a recording link) / False (no link) / text contained in the link
       duration_min / duration_max      seconds
       score_min / score_max            quality score
-      fake_number         True (Yes) / False (explicit No)
+      fake_number         True (explicit Yes) / False (explicit No) / 'unknown' (blank or unreadable)
       call_type           qualified | non-qualified | spam | wrong number | silent | information only | other
       qc_text, summary_text, note_text   text contained in that column (comma = any of)
       any_text            text found in the AI QC Report, ShortSummary or Note
@@ -1616,11 +1751,32 @@ def filter_calls(frame, cols, spec=None, title="Matching calls"):
     if spec.get("fake_number") is not None:
         if need("fake"):
             return _unavailable(title, "column 'Fake Number' not found")
-        if spec["fake_number"]:
+        want = spec["fake_number"]
+        want = want.strip().lower() if isinstance(want, str) else want
+        if want is True or want in ("yes", "true"):
             f = f[f["Fake_Flag"]]
-        else:
+        elif want is False or want in ("no", "false"):
             f = f[f["Fake_Known"] & ~f["Fake_Flag"]]
-            notes.append("'Fake Number = No' counts only calls where the Fake Number column says No.")
+            notes.append("'Fake Number = No' counts only calls where the column explicitly says No; "
+                         "blank or unreadable values are Unknown and are not included.")
+        elif want in ("unknown", "blank", "not checked"):
+            f = f[~f["Fake_Known"]]
+            notes.append("'Fake Number = Unknown' means the column is blank or not readable (not the same as No).")
+        else:
+            return _unavailable(title, f"unknown Fake Number value '{spec['fake_number']}'", INSUFFICIENT_MSG)
+
+    rec = spec.get("recording")
+    if rec is not None and rec != "":
+        if need("recording"):
+            return _unavailable(title, "column 'Recording' not found")
+        rec_txt = f[cols["recording"]].fillna("").astype(str).str.strip()
+        has_rec = rec_txt.ne("") & ~rec_txt.str.lower().isin(["nan", "none", "n/a", "-"])
+        if rec is True or str(rec).strip().lower() in ("yes", "has", "with"):
+            f = f[has_rec]
+        elif rec is False or str(rec).strip().lower() in ("no", "none", "without", "missing"):
+            f = f[~has_rec]
+        else:
+            f = f[has_rec & rec_txt.str.contains(str(rec).strip(), case=False, regex=False)]
 
     cid = str(spec.get("caller_id") or "").strip()
     if cid:
@@ -1687,34 +1843,35 @@ def filter_calls(frame, cols, spec=None, title="Matching calls"):
                 f"Insurance information exists for {int(known.sum()):,} of {len(f):,} calls; the other "
                 f"{int((~known).sum()):,} are left out of this insurance filter."
             )
-            if key in ("public", "private", "none"):
-                match = cls["Insurance_Category"].isin([key, "mixed"]) if key != "none" else cls["Insurance_Category"].isin(["none", "mixed"])
+            if key in ("public", "private", "none"):   # includes Mixed calls that explicitly have that type
+                match = cls[{"public": "Has_Public", "private": "Has_Private", "none": "Has_None"}[key]]
             else:
                 match = cls["Insurance_Category"] == key
             f = f[match]
         else:
-            hit, _, info = _first_hits(f, cols, [("qc:Insurance", re.escape(_norm_text(ins)), True, True),
-                                                 ("qc", re.escape(_norm_text(ins)), True, True),
-                                                 ("summary", re.escape(_norm_text(ins)), True, True),
-                                                 ("note", re.escape(_norm_text(ins)), True, True)])
+            pat = _insurance_term_regex(ins)
+            steps = [(x, pat, True, True) for x in _qc_sources(f, INSURANCE_FIELD_WORDS) + ["qc", "summary", "note"]]
+            hit, _, info = _first_hits(f, cols, steps)
             if not info.any():
                 return _unavailable(title, "no insurance information in these calls")
+            notes.append("A named insurer is only searched as text; it is not classified as private or public.")
             f = f[hit]
     loc = str(spec.get("location") or "").strip()
     if loc:
-        hit, _, info = _first_hits(f, cols, _place_steps(loc))
+        hit, _, info = _first_hits(f, cols, _place_steps(loc, f))
         if not info.any():
             return _unavailable(title, "no location information in these calls")
         notes.append(f"{int(info.sum()):,} of {len(f):,} calls have text in the searched sources (AI QC Report, ShortSummary, Note).")
         f = f[hit]
     svc = _terms_regex(spec.get("service"))
     if svc:
-        hit, _, info = _first_hits(f, cols, _service_steps(spec.get("service")))
+        hit, _, info = _first_hits(f, cols, _service_steps(spec.get("service"), f))
         if not info.any():
             return _unavailable(title, "no treatment / service information in these calls")
         f = f[hit]
 
     scalars["Matching calls"] = len(f)
+    notes.insert(0, describe_query(spec, len(f), len(frame)))
     res = QueryResult(title=title, data=f, scalars=scalars, notes=notes)
     if f.empty:
         res.notes.append("No calls match these filters.")
@@ -1724,7 +1881,7 @@ def filter_calls(frame, cols, spec=None, title="Matching calls"):
 # ---------------- Grouping and standard statistics ----------------
 STAT_COLUMNS = [
     "Calls", "Qualified", "Non-Qualified", "Spam", "VoIP", "Wrong Number", "Silent", "Fake Numbers",
-    "Avg Score", "Avg Duration (sec)", "Qualification %", "Spam %", "VoIP %", "Fake %",
+    "Fake Unknown", "Avg Score", "Avg Duration (sec)", "Qualification %", "Spam %", "VoIP %", "Fake %",
     "QC Completion %", "QC Done",
 ]
 RANK_METRICS = [
@@ -1756,6 +1913,8 @@ def _with_group_columns(frame, cols, by):
                 missing.append(QUERY_LABELS[low])
                 continue
             name = "Caller_ID_Norm" if low == "caller_id" else cols[low]
+            if low == "fake":
+                f[name] = f["Fake_Value"]   # Yes / No / Unknown, never blank-as-No
         elif key in f.columns:
             name = key
         else:
@@ -1790,10 +1949,12 @@ def _stats_indexed(frame, cols, gcols):
     if cols.get("fake"):
         stats["Fake Numbers"] = extra["_fk"]
         stats["Fake Checked"] = extra["_fc"]
+        stats["Fake Unknown"] = stats["Calls"] - stats["Fake Checked"]   # blank / unreadable: neither Yes nor No
         stats["Fake %"] = safe_pct(stats["Fake Numbers"], stats["Fake Checked"].where(stats["Fake Checked"] > 0))
     else:
         stats["Fake Numbers"] = float("nan")
         stats["Fake Checked"] = float("nan")
+        stats["Fake Unknown"] = float("nan")
         stats["Fake %"] = float("nan")
     return stats
 
@@ -1809,7 +1970,8 @@ def _round(df):
 def get_group_stats(frame, cols, by=None, health=True, title="Statistics"):
     """The standard metrics for the network (by=None) or ANY grouping: ['buyer'], ['publisher',
     'campaign'], ['phone_company'], ['hangup'], 'day' ... Same engine for every dimension.
-    Percentages are a share of TOTAL calls (Fake % is a share of calls with a Fake Number value)."""
+    Percentages are a share of TOTAL calls. Fake % is a share of calls with an explicit Yes / No Fake Number;
+    blank or unreadable values are 'Fake Unknown' and are never counted as No."""
     f, gcols, missing = _with_group_columns(frame, cols, by)
     if missing:
         return _unavailable(title, "column not found: " + ", ".join(missing))
@@ -1825,6 +1987,11 @@ def get_group_stats(frame, cols, by=None, health=True, title="Statistics"):
     out = _round(out[keep])
     res = QueryResult(title=title, data=out, scalars=period_kpis(f, cols.get("qc") or "None", cols.get("line_type") or "None"))
     n_qc = res.scalars["QC Done"]
+    if cols.get("fake") and "Fake_Known" in f.columns and (~f["Fake_Known"]).any():
+        res.notes.append(
+            f"Fake Number is blank or unreadable for {int((~f['Fake_Known']).sum()):,} of {len(f):,} calls: "
+            "that is Unknown, not No. Fake % is a share of the calls where it is Yes or No."
+        )
     if cols.get("qc") and n_qc < len(f):
         res.notes.append(
             f"Qualified / Non-Qualified / Spam / Wrong Number / Silent are known only for calls with a "
@@ -2049,7 +2216,9 @@ ANOMALY_LABELS = {
     "Fake %": "Sudden increase in fake numbers",
 }
 ANOMALY_BAD_DIRECTION = {"Spam %": 1, "VoIP %": 1, "Qualification %": -1, "Avg Score": -1}  # +1 = a rise is bad
-ANOMALY_FAKE = {"pp": 5.0, "min_events": 3}  # fake-number share up by 5 points, at least 3 fake numbers now
+# fake-number share up by 5 points, at least 3 fake numbers now, and at least TREND_MIN_CALLS calls with an
+# explicit Yes / No in BOTH periods (blank = Unknown is never treated as a legitimate No)
+ANOMALY_FAKE = {"pp": 5.0, "min_events": 3, "min_checked": TREND_MIN_CALLS}
 
 
 def anomaly_rules_text():
@@ -2060,7 +2229,8 @@ def anomaly_rules_text():
         f"Avg score down ≥ {t['Avg Score'][1]:.0f} · VoIP % up ≥ {t['VoIP %'][1]:.0f} points · "
         f"Calls change ≥ {CALLS_RULE['rel'][1]:.0%} and ≥ {CALLS_RULE['abs'][1]} calls · "
         f"Avg duration change ≥ {DURATION_RULE['rel'][1]:.0%} and ≥ {DURATION_RULE['abs'][1]}s · "
-        f"Fake-number share up ≥ {ANOMALY_FAKE['pp']:.0f} points with ≥ {ANOMALY_FAKE['min_events']} fake numbers. "
+        f"Fake-number share up ≥ {ANOMALY_FAKE['pp']:.0f} points with ≥ {ANOMALY_FAKE['min_events']} fake numbers "
+        f"(needs ≥ {ANOMALY_FAKE['min_checked']} calls with an explicit Yes / No in both periods; blank is Unknown, not No). "
         f"Only groups with ≥ {TREND_MIN_CALLS} calls in both periods are checked (volume needs ≥ {TREND_MIN_VOLUME})."
     )
 
@@ -2101,7 +2271,8 @@ def detect_anomalies(frame, cols, by=None, timeline=None, title="Anomalies"):
             skipped += 1
             continue
         c, p = core["cur_stats"].loc[g], core["prev_stats"].loc[g]
-        if min(c["Calls"], p["Calls"]) < TREND_MIN_CALLS or pd.isna(c["Fake %"]) or pd.isna(p["Fake %"]):
+        if (min(c["Calls"], p["Calls"]) < TREND_MIN_CALLS or pd.isna(c["Fake %"]) or pd.isna(p["Fake %"])
+                or min(c["Fake Checked"], p["Fake Checked"]) < ANOMALY_FAKE["min_checked"]):
             skipped += 1
             continue
         diff = c["Fake %"] - p["Fake %"]
@@ -2140,13 +2311,24 @@ def insurance_breakdown(frame, cols, title="Insurance breakdown"):
         return _unavailable(title, "no insurance information in these calls")
     rows = [{"Category": INSURANCE_LABELS[k], "Calls": int(counts.get(k, 0)),
              "% of calls with insurance info": (counts.get(k, 0) / known * 100) if k != "unknown" else float("nan")}
-            for k in ("public", "private", "none", "mixed", "unspecified", "unknown")]
+            for k in ("public", "private", "insurer_named", "none", "mixed", "unspecified", "unknown")]
     res = QueryResult(title=title, data=_round(pd.DataFrame(rows)),
                       scalars={"Calls": len(frame), "Calls with insurance info": known})
-    res.notes.append("Only explicit terms are classified. 'Discussed insurance', 'state' alone or an unlisted "
-                     "insurer stay 'type not stated'; calls with no insurance information are not counted.")
-    if "QC: Insurance" in frame.columns:
-        vals = frame["QC: Insurance"].map(_norm_text)
+    res.notes.append("Only explicit terms are classified. An insurer name (Aetna, Cigna, Blue Cross Blue Shield, "
+                     "United Healthcare ...) is NOT counted as private: it stays 'insurer named' unless the call data "
+                     "also states Medicaid / state / marketplace (public) or private / commercial. 'Discussed "
+                     "insurance' or 'state' alone stay 'type not stated'. Calls with no insurance information are not counted.")
+    type_rows = [{"Insurance type": INSURANCE_TYPE_LABELS[k], "Calls": int((cls["Insurance_Type"] == INSURANCE_TYPE_LABELS[k]).sum())}
+                 for k in ("medicaid", "medicare", "marketplace", "public_general", "private", "none")]
+    type_rows += [{"Insurance type": "Mixed", "Calls": int((cls["Insurance_Type"] == "Mixed").sum())},
+                  {"Insurance type": INSURER_NAMED_LABEL, "Calls": int((cls["Insurance_Category"] == "insurer_named").sum())},
+                  {"Insurance type": "Type Not Stated", "Calls": int((cls["Insurance_Category"] == "unspecified").sum())},
+                  {"Insurance type": "No insurance information (left out of insurance filters)",
+                   "Calls": int((cls["Insurance_Category"] == "unknown").sum())}]
+    res.extra["types"] = pd.DataFrame(type_rows)
+    ins_cols = [c for c in frame.columns if c.startswith(QC_PREFIX) and any(w in c.lower() for w in INSURANCE_FIELD_WORDS)]
+    if ins_cols:
+        vals = frame[ins_cols[0]].map(_norm_text)
         vals = vals[~vals.map(is_unavailable)].value_counts().reset_index()
         vals.columns = ["Insurance value in the QC report", "Calls"]
         res.extra["values"] = vals
@@ -2277,9 +2459,11 @@ def render_query_layer(df, available_columns, overrides, sidebar_timeline):
                 if chosen:
                     spec[key] = chosen
         cs = st.columns(3)
-        fake = cs[0].selectbox("Fake Number:", ["Any", "Yes", "No"], key="q_fake")
+        fake = cs[0].selectbox(
+            "Fake Number (blank = Unknown, not No):", ["Any", "Yes", "No", "Unknown (blank / not checked)"], key="q_fake"
+        )
         if fake != "Any":
-            spec["fake_number"] = fake == "Yes"
+            spec["fake_number"] = True if fake == "Yes" else False if fake == "No" else "unknown"
         ctype = cs[1].selectbox(
             "Call type:", ["Any", "Qualified", "Non-qualified", "Spam", "Wrong number", "Silent",
                            "Information only", "Other", "VoIP line"], key="q_ctype")
@@ -2288,6 +2472,9 @@ def render_query_layer(df, available_columns, overrides, sidebar_timeline):
         cid = cs[2].text_input("Caller ID contains:", "", key="q_cid").strip()
         if cid:
             spec["caller_id"] = cid
+        recs = st.selectbox("Recording:", ["Any", "Has a recording link", "No recording link"], key="q_rec")
+        if recs != "Any":
+            spec["recording"] = recs.startswith("Has")
         cs = st.columns(4)
         for col_ui, (lab, key, step) in zip(cs, (("Min duration (sec, 0 = off)", "duration_min", 10),
                                                  ("Max duration (sec, 0 = off)", "duration_max", 10),
@@ -2313,7 +2500,7 @@ def render_query_layer(df, available_columns, overrides, sidebar_timeline):
         v = cs[2].text_input("Location (state, city …):", "", key="q_loc").strip()
         if v:
             spec["location"] = v
-        v = cs[3].text_input("Treatment / service (e.g. inpatient):", "", key="q_svc").strip()
+        v = cs[3].text_input("Service / treatment / interest (any campaign):", "", key="q_svc").strip()
         if v:
             spec["service"] = v
 
@@ -2391,6 +2578,8 @@ def render_query_layer(df, available_columns, overrides, sidebar_timeline):
             st.markdown("**Insurance breakdown** (explicit terms only)")
             ib = insurance_breakdown(calls_df, cols)
             show_query_result(ib, "ins", "query_insurance")
+            if ib.available and "types" in ib.extra:
+                st.dataframe(ib.extra["types"], width="stretch", hide_index=True)
             if ib.available and "values" in ib.extra:
                 st.dataframe(ib.extra["values"], width="stretch", hide_index=True)
 
@@ -2472,19 +2661,8 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
 
     # --- Numeric pre-processing ---
     score_col_name = find_col(available_columns, ["Quality Score"], ["score"])
-    if score_col_name:
-        work_df["Quality_Score_Num"] = pd.to_numeric(
-            work_df[score_col_name].astype(str).str.extract(r"(-?\d+\.?\d*)")[0],
-            errors="coerce",
-        )
-    else:
-        work_df["Quality_Score_Num"] = float("nan")
-
     dur_col_name = find_col(available_columns, ["Duration"], ["duration"])
-    if dur_col_name:
-        work_df["Duration_Num"] = work_df[dur_col_name].apply(parse_duration)
-    else:
-        work_df["Duration_Num"] = float("nan")
+    work_df = add_numeric_columns(work_df, score_col_name, dur_col_name)
 
     # --- Column mapping ---
     st.sidebar.markdown("---")
