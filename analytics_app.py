@@ -1,4 +1,8 @@
 import re
+import json
+import difflib
+import urllib.request
+import urllib.error
 from dataclasses import dataclass, field
 
 import streamlit as st
@@ -2370,7 +2374,7 @@ def detect_anomalies(frame, cols, by=None, timeline=None, title="Anomalies"):
         rec.update({
             "Anomaly": ANOMALY_LABELS[key], "Severity": "🔴 High", "Metric": key,
             "Previous": fmt_trend_value(key, pv), "Current": fmt_trend_value(key, cv),
-            "Change": _fmt_change(key, diff, pv), "Calls (now)": int(c["Calls"]), "Calls (before)": int(p["Calls"]),
+            "Change": _fmt_change(key, diff, pv), "Calls (now)": 0 if c is None else int(c["Calls"]), "Calls (before)": 0 if p is None else int(p["Calls"]),
             "Details": f"{ANOMALY_LABELS[key]}: {fmt_trend_value(key, pv)} → {fmt_trend_value(key, cv)} "
                        f"({_fmt_change(key, diff, pv)}) compared with {info['prev_name']}.",
         })
@@ -2543,11 +2547,1512 @@ def show_matched_calls(frame, sheet_columns, key, row_labels=None, group_options
         )
 
 
+# ---------------------------------------------------------------
+# Step 5B: Natural Language Query Assistant (thin wrapper on Step 5A)
+#
+#   System 1  parse_nl_question()  -> NLQuery (structured spec; never calculates anything)
+#             run_nl_deterministic() -> NLOutcome   (every number comes from the Step 5A functions)
+#   System 2  run_ai_system()      -> independent answer from an AI API (keys in Streamlit Secrets only)
+#   Compare   compare_systems()    -> agree / disagree status
+#   UI        render_query_assistant()
+# Step 5A stays the source of truth. The AI result is shown for comparison and learning only.
+# ---------------------------------------------------------------
+NL_ENTITY_FIELDS = {
+    "publisher": ("publisher", "publishers"),
+    "buyer": ("buyer", "buyers"),
+    "campaign": ("campaign", "campaigns"),
+    "phone_company": ("phone company", "phone companies", "carrier", "carriers"),
+    "line_type": ("line type", "line types"),
+}
+NL_DIM_WORDS = {
+    "caller_id": ("caller ids", "caller id", "callerid", "callers", "caller", "phone numbers", "phone number"),
+    "publisher": NL_ENTITY_FIELDS["publisher"],
+    "buyer": NL_ENTITY_FIELDS["buyer"],
+    "campaign": NL_ENTITY_FIELDS["campaign"],
+    "phone_company": NL_ENTITY_FIELDS["phone_company"],
+    "line_type": NL_ENTITY_FIELDS["line_type"],
+    "hangup": ("hangup by", "hangup", "hang up"),
+}
+NL_DIM_LABEL = {"caller_id": "Caller ID", "publisher": "Publisher", "buyer": "Buyer", "campaign": "Campaign",
+                "phone_company": "Phone Company", "line_type": "Line Type", "hangup": "Hangup By"}
+NL_METRIC_PATTERNS = [
+    (r"qualification (?:rate|%|percent\w*)|qualified (?:rate|%|percent\w*)|(?:rate|percent\w*) of qualified|qualification", "Qualification %"),
+    (r"spam (?:rate|%|percent\w*)|(?:rate|percent\w*) of spam", "Spam %"),
+    (r"voip (?:rate|%|percent\w*)", "VoIP %"),
+    (r"fake (?:rate|%|percent\w*)", "Fake %"),
+    (r"(?:avg|average|mean) (?:quality )?score|quality score", "Avg Score"),
+    (r"(?:avg|average|mean) (?:call )?duration|call duration", "Avg Duration (sec)"),
+    (r"qc completion|completion rate|qc completed", "QC Completion %"),
+    (r"\bhealth\b", "Health"),
+]
+NL_CALL_TYPES = [   # (regex, filter_calls call_type, ranking count metric)
+    (r"non[- ]?qualified|not qualified|unqualified", "non-qualified", "Non-Qualified"),
+    (r"wrong[- ]numbers?", "wrong number", "Wrong Number"),
+    (r"\bsilent\b|no response", "silent", "Silent"),
+    (r"information[- ]only|info[- ]only", "information only", None),
+    (r"\bvoip\b", "voip", "VoIP"),
+    (r"\bspam(?:my)?\b|\brobo\w*", "spam", "Spam"),
+    (r"\bqualified\b", "qualified", "Qualified"),
+]
+NL_INSURANCE = [    # (regex, filter_calls insurance value)
+    (r"medi[- ]?cal\b|medicaid", "medicaid"),
+    (r"medicare", "medicare"),
+    (r"public (?:health )?insurance|public plan|government|state insurance|state[- ]funded", "public"),
+    (r"private (?:health )?insurance|private plan|commercial insurance|\bprivate\b", "private"),
+    (r"no insurance|uninsured|without insurance", "none"),
+    (r"vague insurance|insurance type not stated|unspecified insurance", "unspecified"),
+    (r"unknown insurance|no insurance information|insurance unknown", "unknown"),
+    (r"blue ?cross|blue ?shield|\bbcbs\b", "blue cross"),
+    (r"united ?health ?care|united ?health|\buhc\b", "united"),
+    (r"aetna", "aetna"), (r"cigna", "cigna"), (r"humana", "humana"), (r"kaiser", "kaiser"),
+    (r"anthem", "anthem"), (r"molina", "molina"),
+]
+NL_DISCUSSED_INSURANCE = r"discussed insurance|insurance (?:was |were )?(?:discussed|mentioned)|mentioned insurance"
+NL_SERVICES = ("detox", "inpatient", "outpatient", "residential", "rehab", "alcohol", "opioid", "heroin",
+               "fentanyl", "methadone", "suboxone", "iop", "php", "counseling", "therapy")
+NL_LOWER_IS_BETTER = {"Spam %", "VoIP %", "Fake %", "Spam", "VoIP", "Wrong Number", "Silent", "Non-Qualified", "Fake Numbers"}
+NL_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+_MON = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+NL_STOP = set("""a an the this that these those of for from by on in at to with and or vs versus compare against how many much
+call calls did do does we our us get got had have has received receive show me list which what who were was is are be been there
+total number count all any today yesterday week month year last previous past days day this current now so far most least best worst
+highest lowest top bottom improved improve improvement declined decline share percentage percent rate distribution breakdown
+qualified spam voip wrong silent caller id ids publisher publishers buyer buyers campaign campaigns carrier phone company line type
+fake insurance named called as it its their his her than over under between each every per across overall ever average avg score
+duration health compared comparison give pull find display unique""".split())
+
+
+def _nl_norm(s):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(s).lower())).strip()
+
+
+@dataclass
+class NLQuery:
+    question: str = ""
+    intent: str = "count"          # count | metric | compare_periods | compare_entities | compare_previous | rank | improvement | calls | anomalies
+    timelines: list = field(default_factory=list)   # [(label, timeline dict)]
+    spec: dict = field(default_factory=dict)        # filter_calls spec (without timeline)
+    entities: dict = field(default_factory=dict)    # field key -> [sheet values]
+    dim: str = None
+    share_by: str = None
+    metric: str = None
+    ascending: bool = False
+    improving: bool = True
+    top_n: int = 10
+    discussed_insurance: bool = False
+    ambiguities: list = field(default_factory=list)
+    unavailable: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+    inherited: bool = False
+
+
+def _tl_text(label, tl):
+    if not tl or tl.get("start") is None:
+        return "All time"
+    return f"{label} ({describe_period(tl['start'], tl['end'])})"
+
+
+# ---------------- timelines ----------------
+def _nl_timelines(ql, today, nlq):
+    """All time expressions in the question, in order: [(label, timeline)]."""
+    tokens = []   # (pos, end, kind, payload)
+    for m in re.finditer(r"(\d{4})-(\d{2})-(\d{2})", ql):
+        try:
+            tokens.append((m.start(), m.end(), "date", date(int(m.group(1)), int(m.group(2)), int(m.group(3)))))
+        except ValueError:
+            nlq.ambiguities.append(f"'{m.group(0)}' is not a valid date.")
+    for m in re.finditer(r"(\d{1,2})(?:st|nd|rd|th)?\s+" + _MON + r"\s*,?\s*(\d{4})", ql):
+        tokens.append((m.start(), m.end(), "date", date(int(m.group(4)), NL_MONTHS[m.group(3)], int(m.group(1)))))
+    for m in re.finditer(_MON + r"\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(\d{4})", ql):
+        tokens.append((m.start(), m.end(), "date", date(int(m.group(3)), NL_MONTHS[m.group(1)], int(m.group(2)))))
+    taken = [(a, b) for a, b, _, _ in tokens]
+    if not tokens and re.search(r"\b" + _MON + r"\s+\d{1,2}\b|\b\d{1,2}\s+" + _MON + r"\b", ql):
+        nlq.ambiguities.append("Which year do you mean? Please include the year in the date (for example 2026-05-06).")
+    for m in re.finditer(r"\b(?:last|past|previous)\s+(\d+)\s+days?\b", ql):
+        tokens.append((m.start(), m.end(), "lastn", int(m.group(1))))
+    named = {
+        r"\btoday\b": "Today", r"\byesterday\b": "Yesterday", r"\bthis week\b": "This week",
+        r"\b(?:last|previous) week\b": "Last week", r"\bpast week\b": "Last 7 days",
+        r"\bthis month\b": "This month", r"\b(?:last|previous) month\b": "Last month",
+        r"\bthis year\b": "This year", r"\b(?:last|previous) year\b": "Last year",
+        r"\blast 6 months\b": "Last 6 months", r"\ball[- ]time\b|\boverall\b|\bever\b": "All time",
+    }
+    for pat, name in named.items():
+        for m in re.finditer(pat, ql):
+            if not any(a <= m.start() < b for a, b, _, _ in tokens):
+                tokens.append((m.start(), m.end(), "named", name))
+    tokens.sort(key=lambda t: t[0])
+    out, i = [], 0
+    while i < len(tokens):
+        pos, end, kind, val = tokens[i]
+        if kind == "date":
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+            between = ql[end:nxt[0]] if nxt and nxt[2] == "date" else None
+            if nxt and nxt[2] == "date" and re.fullmatch(r"\s*(?:to|through|thru|until|till|-|and)\s*", between or "") \
+                    and not re.search(r"\b(compare|versus|vs)\b", ql):
+                a, b = sorted([val, nxt[3]])
+                out.append((f"{a:%Y-%m-%d} to {b:%Y-%m-%d}", make_timeline("Custom date range", start=a, end=b)))
+                i += 2
+                continue
+            out.append((f"{val:%Y-%m-%d}", make_timeline("Custom date range", start=val, end=val)))
+        elif kind == "lastn":
+            n = max(1, val)
+            if n == 7:
+                out.append(("Last 7 days", make_timeline("Last 7 days", today=today)))
+            elif n == 30:
+                out.append(("Last 30 days", make_timeline("Last 30 days", today=today)))
+            else:
+                out.append((f"Last {n} days", make_timeline("Custom date range", start=today - timedelta(days=n - 1), end=today)))
+        else:
+            if val == "All time":
+                out.append(("All time", {"preset": "All time"}))
+            else:
+                out.append((val, make_timeline(val, today=today)))
+        i += 1
+    return out
+
+
+# ---------------- entities ----------------
+def _nl_values(qf, cols, key):
+    col = cols.get(key)
+    if not col or col not in qf.columns:
+        return []
+    s = qf[col].astype(str).str.strip()
+    return [v for v in s[s != ""].unique() if v.lower() not in ("nan", "none")]
+
+
+def _nl_tokens_after(text):
+    toks = []
+    for t in text.split():
+        if t in NL_STOP or t.isdigit() and len(t) < 3:
+            break
+        toks.append(t)
+        if len(toks) == 3:
+            break
+    return " ".join(toks)
+
+
+NL_CUES = {"which", "what", "each", "per", "every", "by", "across", "top", "best", "worst", "rank", "highest",
+           "lowest", "most", "least", "share", "breakdown", "distribution", "of", "all", "improved", "declined"}
+
+
+def _nl_entities(qn, qf, cols, nlq, focus, previous):
+    values = {k: _nl_values(qf, cols, k) for k in NL_ENTITY_FIELDS}
+    norm = {k: {} for k in NL_ENTITY_FIELDS}
+    for k, vals in values.items():
+        for raw in vals:
+            nv = _nl_norm(raw)
+            if len(nv) >= 2 and nv not in NL_STOP and not (nv.isdigit() and len(nv) < 3):
+                norm[k].setdefault(nv, []).append(raw)
+    hits = []   # (field, nv, start, end)
+    for k, d in norm.items():
+        for nv in d:
+            for m in re.finditer(r"(?<![a-z0-9])" + re.escape(nv) + r"(?![a-z0-9])", qn):
+                hits.append((k, nv, m.start(), m.end()))
+    # the longest match wins over a shorter one inside it
+    hits = [h for h in hits if not any(o is not h and o[2] <= h[2] and h[3] <= o[3] and (o[3] - o[2]) > (h[3] - h[2]) for o in hits)]
+    by_span = {}
+    for h in hits:
+        by_span.setdefault((h[1], h[2]), []).append(h)
+    chosen = {}
+    for (nv, start), group in by_span.items():
+        fields = [g[0] for g in group]
+        if len(set(fields)) > 1:
+            pre = [f for f in set(fields) if any(re.search(r"\b" + re.escape(w) + r"\s+(?:named |called )?$", qn[:start]) for w in NL_ENTITY_FIELDS[f])]
+            if len(pre) == 1:
+                fields = pre
+            else:
+                nlq.ambiguities.append(
+                    f"'{norm[fields[0]][nv][0]}' exists as " + " and ".join(NL_DIM_LABEL[f] for f in sorted(set(fields)))
+                    + ". Which one do you mean? Please say, for example, 'publisher " + norm[fields[0]][nv][0] + "'.")
+                continue
+        for f in set(fields):
+            chosen.setdefault(f, [])
+            for raw in norm[f][nv]:
+                if raw not in chosen[f]:
+                    chosen[f].append(raw)
+    nlq.entities.update(chosen)
+
+    # a field word followed by a name that is not an exact value (partial match, then not found)
+    refs, named_tokens = [], set()
+    for k, words in NL_ENTITY_FIELDS.items():
+        for w in words:
+            for m in re.finditer(r"\b" + re.escape(w) + r"\b(?=\s*(?:named |called |is |= )?([a-z0-9 ]*))", qn):
+                plural = w.endswith("s") and w not in ("campaigns",) or w.endswith("ies")
+                singular = not (w.endswith("s") or w.endswith("ies"))
+                name = _nl_tokens_after(m.group(1))
+                before = qn[:m.start()].split()[-3:]
+                if name:
+                    named_tokens.update(name.split())
+                    if k in nlq.entities and any(_nl_norm(v) == name or name in _nl_norm(v) for v in nlq.entities[k]):
+                        continue
+                    cands = sorted({raw for nv, raws in norm[k].items() if name in nv for raw in raws})
+                    exact = [r for r in cands if _nl_norm(r) == name]
+                    cands = exact or cands
+                    if len(cands) == 1:
+                        nlq.entities.setdefault(k, [])
+                        if cands[0] not in nlq.entities[k]:
+                            nlq.entities[k].append(cands[0])
+                        nlq.notes.append(f"{NL_DIM_LABEL[k]} '{name}' was matched to '{cands[0]}' (partial match).")
+                    elif len(cands) > 1:
+                        nlq.ambiguities.append(f"{NL_DIM_LABEL[k]} '{name}' matches several values: {', '.join(cands[:8])}. Which one do you mean?")
+                    else:
+                        close = difflib.get_close_matches(name, list(norm[k]), n=3, cutoff=0.6)
+                        nlq.unavailable.append(
+                            f"Data unavailable: {NL_DIM_LABEL[k]} '{name}' was not found in the loaded data."
+                            + (f" Did you mean: {', '.join(norm[k][c][0] for c in close)}?" if close else ""))
+                elif singular and not (set(before) & NL_CUES):
+                    refs.append(k)      # "this publisher" / "the publisher" with no name
+    for k in dict.fromkeys(refs):
+        if k in nlq.entities:
+            continue
+        if focus.get(k) and len(focus[k]) == 1:
+            nlq.entities[k] = list(focus[k])
+            nlq.notes.append(f"'{NL_DIM_LABEL[k]}' taken from the Query Layer filter: {focus[k][0]}.")
+        elif previous and previous.entities.get(k) and len(previous.entities[k]) == 1:
+            nlq.entities[k] = list(previous.entities[k])
+            nlq.notes.append(f"'{NL_DIM_LABEL[k]}' taken from your previous question: {previous.entities[k][0]}.")
+        else:
+            nlq.ambiguities.append(f"Which {NL_DIM_LABEL[k].lower()} do you mean? Please specify (for example '{NL_DIM_LABEL[k].lower()} <name>').")
+
+    # a bare name that matches nothing else: after from / did / by, and in a comparison after compare / with / vs / and
+    compare_cue = bool(re.search(r"\b(?:compare|compared|versus|vs|against)\b", qn))
+    if compare_cue or (not nlq.entities and not nlq.ambiguities and not nlq.unavailable):
+        known = set(NL_STOP) | set(NL_SERVICES)
+        known |= {s.split()[0] for s in US_STATES} | {p.split()[0] for p in ("aetna", "cigna", "humana", "kaiser", "anthem", "molina", "medicaid", "medicare", "medi", "blue", "united", "uhc", "bcbs")}
+        explained = {t for vals in nlq.entities.values() for v in vals for t in _nl_norm(v).split()} | named_tokens
+        preps = r"compare|compared|with|vs|versus|against|and" if compare_cue else r"from|did|by"
+        for m in re.finditer(r"\b(?:" + preps + r")\s+(?:(?:publisher|buyer|campaign)\s+)?([a-z][a-z0-9]{1,})\b", qn):
+            tok = m.group(1)
+            if tok in known or tok in NL_MONTHS or tok in explained:
+                continue
+            found = [(k, raw) for k in ("publisher", "buyer", "campaign") for nv, raws in norm[k].items() if tok in nv for raw in raws]
+            if len(found) == 1:
+                nlq.entities.setdefault(found[0][0], []).append(found[0][1])
+                nlq.notes.append(f"'{tok}' was matched to {NL_DIM_LABEL[found[0][0]]} '{found[0][1]}' (partial match).")
+            elif len(found) > 1:
+                nlq.ambiguities.append(f"'{tok}' matches several values: " + ", ".join(f"{NL_DIM_LABEL[k]} {r}" for k, r in found[:8]) + ". Which one do you mean?")
+            else:
+                nlq.unavailable.append(f"Data unavailable: '{tok}' was not found as a Publisher, Buyer or Campaign in the loaded data.")
+            if not compare_cue:
+                break
+
+
+# ---------------- main parser ----------------
+# "how many of those were qualified?"  (but NOT "share of those caller IDs", which points inside the same question)
+_FOLLOW_OF_THOSE = re.compile(r"\b(?:of|among|out of|from) (?:those|them|these)\b(?!\s+(?:caller|publisher|buyer|campaign|phone|line|hangup))"
+                              r"|\b(?:those|these) (?:were|are|had|have|came|calls)\b")
+# "what about last week?"
+_FOLLOW_WHAT_ABOUT = re.compile(r"^\s*(?:and\s+)?(?:(?:what|how) about|same for|same in)\b|^\s*and (?:for|in)\b")
+
+
+def parse_nl_question(question, qf, cols, today, focus=None, previous=None):
+    """Question -> NLQuery. Only reads the text and the list of real sheet values; it never calculates."""
+    focus = focus or {}
+    nlq = NLQuery(question=str(question or "").strip())
+    ql = nlq.question.lower()
+    qn = _nl_norm(nlq.question)
+    if not qn:
+        nlq.ambiguities.append("Please type a question.")
+        return nlq
+    nlq.timelines = _nl_timelines(ql, today, nlq)
+    spec = nlq.spec
+
+    # --- semantic filters ---
+    hits = [val for pat, val in NL_INSURANCE if re.search(pat, ql)]
+    if re.search(NL_DISCUSSED_INSURANCE, ql):
+        nlq.discussed_insurance = True
+    if len(set(hits)) > 1:
+        nlq.ambiguities.append("Several insurance types were mentioned (" + ", ".join(dict.fromkeys(hits)) + "). Please ask about one at a time.")
+    elif hits:
+        spec["insurance"] = hits[0]
+    states = [s for s in US_STATES if re.search(r"(?<![a-z])" + s + r"(?![a-z])", ql)]
+    if len(states) == 1:
+        spec["location"] = states[0].title()
+    elif len(states) > 1:
+        nlq.ambiguities.append("Several locations were mentioned (" + ", ".join(states) + "). Please ask about one at a time.")
+    svc = [s for s in NL_SERVICES if re.search(r"\b" + s + r"\b", ql)]
+    if len(svc) == 1:
+        spec["service"] = svc[0]
+    elif len(svc) > 1:
+        nlq.ambiguities.append("Several services were mentioned (" + ", ".join(svc) + "). Please ask about one at a time.")
+    if re.search(r"fake numbers?", ql):
+        spec["fake_number"] = False if re.search(r"not fake|no fake|real numbers?", ql) else True
+    m = re.search(r"(?<!\d)(?:\+?1[\s.-]?)?\(?(\d{3})\)?[\s.-]?(\d{3})[\s.-]?(\d{4})(?!\d)", nlq.question)
+    if m:
+        spec["caller_id"] = "".join(m.groups())
+    for pat, key in ((r"(?:longer|more|over|above|greater) than (\d+) ?(?:sec|seconds|s)\b", "duration_min"),
+                     (r"(?:shorter|less|under|below) than (\d+) ?(?:sec|seconds|s)\b", "duration_max"),
+                     (r"score (?:above|over|at least|greater than|>=?) ?(\d+)", "score_min"),
+                     (r"score (?:below|under|less than|at most|<=?) ?(\d+)", "score_max")):
+        m = re.search(pat, ql)
+        if m:
+            spec[key] = int(m.group(1))
+
+    # --- call type, metric ---
+    work, found_types = ql, []
+    for pat, ctype, rank_metric in NL_CALL_TYPES:
+        if re.search(pat, work):
+            found_types.append((ctype, rank_metric))
+            work = re.sub(pat, " ", work)
+    metric = next((name for pat, name in NL_METRIC_PATTERNS if re.search(pat, ql)), None)
+    if len(found_types) > 1 and not metric:
+        nlq.ambiguities.append("Several call types were mentioned (" + ", ".join(t for t, _ in found_types) + "). Please ask about one call type at a time.")
+    ctype = found_types[0][0] if len(found_types) == 1 else None
+    count_metric = found_types[0][1] if len(found_types) == 1 else None
+    if metric in ("Qualification %", "Spam %", "VoIP %") and ctype in ("qualified", "spam", "voip"):
+        ctype = None   # the call type only names the rate (spam rate), it is not a filter
+
+    # --- entities: resolved against the real sheet values BEFORE the intent is chosen ---
+    _nl_entities(qn, qf, cols, nlq, focus, previous)
+
+    # --- dimension / share / intent ---
+    cue_words = r"(?:which|what|each|per|every|by|across|top \d+|top|best|worst|rank)"
+    dim = None
+    for key, words in NL_DIM_WORDS.items():
+        for w in sorted(words, key=len, reverse=True):
+            if re.search(cue_words + r"\s+(?:of\s+)?(?:the\s+)?(?:\w+\s+)?" + re.escape(w) + r"\b", ql):
+                dim = dim or key
+    share = None
+    for key, words in NL_DIM_WORDS.items():
+        for w in sorted(words, key=len, reverse=True):
+            if re.search(r"(?:share|shares|breakdown|distribution|split|proportion|percentage|percent)\s+(?:of|by|for)?\s*(?:those|these|the|all|matching|matched|each)?\s*(?:those|these|the)?\s*" + re.escape(w) + r"\b", ql) \
+                    or re.search(r"\b(?:by|per)\s+" + re.escape(w) + r"\b", ql):
+                share = share or key
+    if re.search(r"(?:share|breakdown|distribution|split|proportion|percentage|percent)\s+(?:of|by)\s+(?:the\s+)?insurance", ql):
+        nlq.ambiguities.append("Insurance breakdowns are not supported in this assistant yet. Use the Insurance filter, or ask for a count with a named insurance type.")
+
+    improve = re.search(r"\b(improv\w+|declin\w+|worsen\w*|deteriorat\w+)\b", ql)
+    compare = re.search(r"\b(compare|compared|comparison|versus|vs|against)\b", ql)
+    rank_cue = re.search(r"\b(highest|lowest|best|worst|most|least|top|bottom|biggest|largest|smallest)\b", ql)
+    show = re.match(r"\s*(show|list|display|find|give me|pull)\b", ql) and re.search(r"\bcalls?\b", ql)
+    n_entities = {k: v for k, v in nlq.entities.items() if len(v) >= 2}
+
+    if re.search(r"\banomal\w*|unusual|\bspikes?\b|suspicious", ql):
+        nlq.intent = "anomalies"
+    elif improve:
+        nlq.intent, nlq.improving = "improvement", not re.search(r"declin|worsen|deteriorat", ql)
+        nlq.dim = dim
+    elif compare:
+        n_vals = sum(len(v) for v in nlq.entities.values())
+        if n_entities and len(nlq.timelines) >= 2:
+            nlq.ambiguities.append("Please compare either two periods or two values in one question, not both. For example "
+                                   "'ABC vs XYZ this week' or 'ABC this week vs last week'.")
+        elif len(n_entities) > 1:
+            nlq.ambiguities.append("More than one field has two or more values (" + ", ".join(NL_DIM_LABEL[k] for k in n_entities)
+                                   + "). Please compare one type at a time.")
+        elif len(nlq.timelines) >= 2:
+            nlq.intent = "compare_periods"
+        elif n_entities:
+            nlq.intent = "compare_entities"
+        elif n_vals >= 2:
+            nlq.ambiguities.append("The values you named are different types (" + ", ".join(NL_DIM_LABEL[k] for k in nlq.entities)
+                                   + "). I can compare two values of the same type, for example 'publisher A vs publisher B'.")
+        elif len(nlq.timelines) == 1:
+            nlq.intent = "compare_previous"
+        elif not nlq.ambiguities and not nlq.unavailable:
+            nlq.ambiguities.append("What should be compared? Name two periods (for example 'this week vs last week') or two values (for example 'publisher A vs publisher B').")
+    elif rank_cue and re.search(r"\b(which|who)\b", ql) and n_entities and not dim:
+        nlq.intent, nlq.dim = "rank", next(iter(n_entities))   # "which of ABC and XYZ had the highest ..."
+    elif rank_cue and dim:
+        nlq.intent, nlq.dim = "rank", dim
+    elif show:
+        nlq.intent = "calls"
+    elif metric:
+        nlq.intent = "metric"
+    else:
+        nlq.intent = "count"
+    nlq.share_by = share if nlq.intent in ("count", "calls") else None
+    if share and nlq.intent not in ("count", "calls"):
+        nlq.share_by = None
+
+    # --- metric / call type roles ---
+    if nlq.intent in ("rank", "improvement"):
+        nlq.metric = metric or count_metric or ("Calls" if re.search(r"\bcalls?\b|volume|busiest", ql) else None)
+        if nlq.intent == "improvement" and not nlq.metric:
+            nlq.metric = "Qualification %"
+            nlq.notes.append("No metric was named, so 'improved' is measured on Qualification %. Say 'spam rate', 'VoIP rate' or 'average score' to change it.")
+        if nlq.intent == "rank" and not nlq.metric:
+            nlq.ambiguities.append("Rank by which metric? For example 'highest spam rate', 'best qualification rate' or 'most calls'.")
+        if nlq.metric == "Health":
+            nlq.ambiguities.append("Ranking by health status is not supported. Rank by a rate such as spam rate or qualification rate.")
+        if nlq.intent == "improvement" and nlq.metric and nlq.metric not in CHANGE_COLUMN:
+            nlq.ambiguities.append("Improvement can be measured on: " + ", ".join(CHANGE_COLUMN) + ". Which one do you mean?")
+        if nlq.intent == "rank" and nlq.metric:
+            low = re.search(r"\b(lowest|least|smallest|bottom|fewest)\b", ql)
+            high = re.search(r"\b(highest|most|largest|biggest|top)\b", ql)
+            best = re.search(r"\bbest\b", ql)
+            worst = re.search(r"\bworst\b", ql)
+            if low:
+                nlq.ascending = True
+            elif high:
+                nlq.ascending = False
+            elif best:
+                nlq.ascending = nlq.metric in NL_LOWER_IS_BETTER
+            elif worst:
+                nlq.ascending = nlq.metric not in NL_LOWER_IS_BETTER
+        ctype = None
+        m = re.search(r"\btop (\d+)\b", ql)
+        if m:
+            nlq.top_n = max(1, min(50, int(m.group(1))))
+        if nlq.intent in ("rank", "improvement") and not nlq.dim:
+            nlq.ambiguities.append("Which field should I rank? For example publisher, buyer, campaign, phone company or caller ID.")
+    elif nlq.intent == "metric":
+        nlq.metric = metric
+        ctype = None
+    if ctype:
+        spec["call_type"] = ctype
+    if nlq.intent == "compare_entities" and ctype is None and metric:
+        nlq.metric = metric
+
+    # --- follow-ups: only an explicit cue ("of those", "what about ...") uses the previous question ---
+    pron, what = _FOLLOW_OF_THOSE.search(ql), _FOLLOW_WHAT_ABOUT.match(ql)
+    if pron or what:
+        cue = "'those'" if pron else "'what about'"
+        if previous is None:
+            nlq.ambiguities.append(f"{cue} refers to an earlier question, but no earlier question was answered. "
+                                   "Please state the period and the filters in full, for example 'this week for publisher ABC'.")
+        elif previous.intent not in ("count", "metric", "calls", "rank", "improvement") or (pron and previous.intent not in ("count", "metric", "calls")):
+            nlq.ambiguities.append(f"{cue} is unclear after a '{previous.intent.replace('_', ' ')}' question. Please state the full question.")
+        elif what and not (nlq.timelines or nlq.entities or nlq.spec or nlq.discussed_insurance) and nlq.intent == "count":
+            nlq.ambiguities.append("What should change from the previous question: the period, the publisher / buyer / campaign, the insurance or the call type?")
+        else:
+            if not nlq.timelines:                       # a new period REPLACES the previous one
+                nlq.timelines = previous.timelines
+            for k, v in previous.entities.items():      # a new publisher / buyer / campaign REPLACES the previous one
+                nlq.entities.setdefault(k, list(v))
+            for k, v in previous.spec.items():          # a new insurance / call type / ... REPLACES the previous one
+                if k not in NL_ENTITY_FIELDS:
+                    nlq.spec.setdefault(k, v)
+            nlq.discussed_insurance = nlq.discussed_insurance or previous.discussed_insurance
+            if what and nlq.intent == "count" and previous.intent in ("metric", "rank", "improvement"):
+                nlq.intent, nlq.metric, nlq.dim = previous.intent, previous.metric, previous.dim
+                nlq.ascending, nlq.improving, nlq.top_n = previous.ascending, previous.improving, previous.top_n
+            if what and nlq.share_by is None:
+                nlq.share_by = previous.share_by if nlq.intent == "count" else None
+            nlq.inherited = True
+            nlq.notes.append("Follow-up: the previous question's filters are kept; anything you named now (period, publisher, insurance, call type ...) replaces the old value.")
+
+    for k, v in nlq.entities.items():
+        nlq.spec[k] = v[0] if len(v) == 1 and nlq.intent != "compare_entities" else v
+    if nlq.intent == "compare_entities" and not any(len(v) >= 2 for v in nlq.entities.values()):
+        nlq.ambiguities.append("I need two values of the same field to compare (for example 'publisher A vs publisher B').")
+    if nlq.intent in ("compare_periods",) and len(nlq.timelines) < 2:
+        nlq.ambiguities.append("I need two periods to compare (for example 'this week vs last week').")
+    if nlq.intent in ("compare_previous", "improvement", "anomalies") and (not nlq.timelines or nlq.timelines[0][1].get("start") is None):
+        nlq.unavailable.append(f"Data unavailable: {'All time' if nlq.timelines else 'no period was given'} has no comparison period. "
+                               "Please name a period such as 'this week' or 'last 7 days'.")
+    if not nlq.timelines and nlq.intent not in ("compare_periods",):
+        nlq.notes.append("No time period was stated, so ALL TIME is used.")
+    return nlq
+
+
+def describe_nl(nlq):
+    """The interpreted query in one auditable line."""
+    parts = []
+    if nlq.timelines:
+        parts.append("Timeline: " + " vs ".join(_tl_text(l, t) for l, t in nlq.timelines))
+    else:
+        parts.append("Timeline: All time")
+    for k, v in nlq.entities.items():
+        parts.append(f"{NL_DIM_LABEL[k]}: " + (", ".join(v)))
+    ct = nlq.spec.get("call_type")
+    if ct:
+        parts.append(f"Call Type: {'VoIP' if ct == 'voip' else ct.title()}")
+    for k, lab in (("insurance", "Insurance"), ("location", "Location"), ("service", "Service"), ("caller_id", "Caller ID contains"),
+                   ("fake_number", "Fake Number"), ("duration_min", "Duration >= sec"), ("duration_max", "Duration <= sec"),
+                   ("score_min", "Score >="), ("score_max", "Score <=")):
+        if nlq.spec.get(k) is not None:
+            parts.append(f"{lab}: {nlq.spec[k]}")
+    if nlq.discussed_insurance:
+        parts.append("Insurance: discussed (any insurance information)")
+    parts.append("Intent: " + nlq.intent.replace("_", " "))
+    if nlq.metric:
+        parts.append(f"Metric: {nlq.metric}")
+    if nlq.dim:
+        parts.append(f"Group by: {NL_DIM_LABEL[nlq.dim]}" + (f" ({'lowest' if nlq.ascending else 'highest'} first)" if nlq.intent == "rank" else ""))
+    if nlq.share_by:
+        parts.append(f"Breakdown: {NL_DIM_LABEL[nlq.share_by]} share")
+    return " | ".join(parts)
+
+
+# ---------------- System 1: run through Step 5A ----------------
+@dataclass
+class NLOutcome:
+    ok: bool = True
+    message: str = None
+    kind: str = "count"
+    headline: str = ""
+    value: object = None
+    table: pd.DataFrame = None
+    calls: pd.DataFrame = None
+    notes: list = field(default_factory=list)
+    compare: dict = field(default_factory=dict)    # label -> number, used by the agreement check
+    top_label: str = None
+
+
+def _subject(nlq):
+    bits = []
+    ct = nlq.spec.get("call_type")
+    bits.append(f"{ct} calls" if ct else "calls")
+    for k in ("publisher", "buyer", "campaign", "phone_company", "line_type"):
+        if nlq.entities.get(k):
+            bits.append(f"for {NL_DIM_LABEL[k].lower()} " + "/".join(nlq.entities[k]))
+    if nlq.spec.get("insurance"):
+        bits.append(f"with insurance '{nlq.spec['insurance']}'")
+    return " ".join(bits)
+
+
+def _nl_filter(base, cols, spec, tl):
+    return filter_calls(base, cols, {**spec, **({"timeline": tl} if tl and tl.get("start") is not None else {})})
+
+
+def _nl_norm_label(x):
+    s = str(x)
+    d = re.sub(r"\D", "", s)
+    return d[-10:] if len(d) >= 10 else _nl_norm(s)
+
+
+def run_nl_deterministic(nlq, qf, cols):
+    """Run the parsed question through Step 5A. Every number comes from Step 5A functions."""
+    if nlq.ambiguities:
+        return NLOutcome(ok=False, kind="ambiguous", message=" ".join(nlq.ambiguities))
+    if nlq.unavailable:
+        return NLOutcome(ok=False, kind="unavailable", message=" ".join(nlq.unavailable))
+    base = qf
+    if nlq.discussed_insurance:
+        cls = classify_insurance(qf, cols)
+        base = qf[(cls["Insurance_Category"] != "unknown").reindex(qf.index, fill_value=False)]
+    tl = nlq.timelines[0][1] if nlq.timelines else None
+    tl_label = nlq.timelines[0][0] if nlq.timelines else "All time"
+    when = _tl_text(tl_label, tl)
+    spec = dict(nlq.spec)
+    intent = nlq.intent
+
+    def fail(res):
+        return NLOutcome(ok=False, kind="unavailable", message=res.message)
+
+    if intent in ("count", "metric", "calls"):
+        scope = _nl_filter(base, cols, spec, tl)
+        if not scope.available:
+            return fail(scope)
+        calls = scope.data
+        n = len(calls)
+        out = NLOutcome(kind="count", value=n, calls=calls, notes=list(scope.notes))
+        if intent == "metric":
+            stats = get_group_stats(calls, cols, None, health=True)
+            if not stats.available:
+                return fail(stats)
+            if n == 0:
+                return NLOutcome(ok=False, kind="unavailable", message=f"{INSUFFICIENT_MSG} No calls in scope ({when}).")
+            row = stats.data.iloc[0]
+            v = row.get(nlq.metric)
+            out.kind = "metric"
+            out.value = v
+            out.headline = (f"{nlq.metric}: {v}" + (f" ({row.get('Health_Reason', '')})" if nlq.metric == "Health" else "")
+                            + f" over {n:,} {_subject(nlq)} — {when}")
+            out.notes += stats.notes
+            return out
+        out.headline = f"{n:,} {_subject(nlq)} — {when}"
+        if intent == "calls":
+            out.kind = "calls"
+        if nlq.share_by:
+            g = get_group_stats(calls, cols, [nlq.share_by], health=False)
+            if not g.available:
+                return fail(g)
+            if n:
+                gcol = g.data.columns[0]
+                t = g.data[[gcol, "Calls"]].copy()
+                t["Share %"] = (t["Calls"] / n * 100).round(1)
+                t = t.rename(columns={gcol: NL_DIM_LABEL[nlq.share_by], "Calls": "Calls"}).reset_index(drop=True)
+                out.table, out.kind = t, "breakdown"
+                out.compare = {_nl_norm_label(r.iloc[0]): int(r["Calls"]) for _, r in t.iterrows()}
+                out.headline += f" — {len(t):,} distinct {NL_DIM_LABEL[nlq.share_by]} values"
+        return out
+
+    if intent in ("compare_periods",):
+        tls = sorted(nlq.timelines[:2], key=lambda x: x[1].get("start") or date.min)
+        metrics = ["Calls", "Qualified", "Spam", "VoIP", "Qualification %", "Spam %", "VoIP %", "Avg Score", "Avg Duration (sec)", "QC Completion %"]
+        rows, vals = {}, []
+        for label, t in tls:
+            sc = _nl_filter(base, cols, spec, t)
+            if not sc.available:
+                return fail(sc)
+            if sc.data.empty:
+                vals.append({m: (0 if m in ("Calls", "Qualified", "Spam", "VoIP") else float("nan")) for m in metrics})
+            else:
+                vals.append(get_group_stats(sc.data, cols, None, health=False).data.iloc[0][metrics].to_dict())
+        e, l = vals
+        table = pd.DataFrame({
+            "Metric": metrics,
+            f"Earlier: {_tl_text(*tls[0])}": [e[m] for m in metrics],
+            f"Later: {_tl_text(*tls[1])}": [l[m] for m in metrics],
+            "Change (Later − Earlier)": [round(l[m] - e[m], 1) if pd.notna(l[m]) and pd.notna(e[m]) else float("nan") for m in metrics],
+        })
+        out = NLOutcome(kind="compare", table=table, value=int(l["Calls"]),
+                        headline=f"Calls: {int(e['Calls']):,} (earlier) → {int(l['Calls']):,} (later) — {_subject(nlq)}",
+                        compare={"earlier": int(e["Calls"]), "later": int(l["Calls"])})
+        if e["Calls"] == 0 or l["Calls"] == 0:
+            out.notes.append("One of the two periods has no calls, so the comparison is one-sided.")
+        return out
+
+    if intent == "compare_entities":
+        key = next(k for k, v in nlq.entities.items() if len(v) >= 2)
+        sc = _nl_filter(base, cols, {**spec, key: nlq.entities[key]}, tl)
+        if not sc.available:
+            return fail(sc)
+        stats = get_group_stats(sc.data, cols, [key], health=True)
+        if not stats.available:
+            return fail(stats)
+        gcol = stats.data.columns[0]
+        t = stats.data.copy()
+        out = NLOutcome(kind="compare_entities", table=t, calls=sc.data, value=len(sc.data),
+                        headline=f"{NL_DIM_LABEL[key]} comparison — {when}",
+                        compare={_nl_norm_label(r[gcol]): int(r["Calls"]) for _, r in t.iterrows()}, notes=list(stats.notes))
+        missing = [v for v in nlq.entities[key] if _nl_norm(v) not in {_nl_norm(x) for x in t[gcol]}]
+        if missing:
+            out.notes.append("No calls in this period for: " + ", ".join(missing))
+        return out
+
+    if intent == "compare_previous":
+        sc = _nl_filter(base, cols, spec, None)
+        comp = compare_group_periods(sc.data, cols, None, tl)
+        if not comp.available:
+            return fail(comp)
+        out = NLOutcome(kind="compare", table=comp.data.T.reset_index().rename(columns={"index": "Metric", 0: "Value"}),
+                        headline=f"{comp.scalars['Current period']} vs {comp.scalars['Comparison period']}",
+                        value=comp.scalars["Calls (now)"], compare={"later": comp.scalars["Calls (now)"], "earlier": comp.scalars["Calls (before)"]},
+                        notes=list(comp.notes))
+        return out
+
+    if intent == "rank":
+        sc = _nl_filter(base, cols, spec, tl)
+        if not sc.available:
+            return fail(sc)
+        stats = get_group_stats(sc.data, cols, [nlq.dim], health=False)
+        if not stats.available:
+            return fail(stats)
+        res = rank_groups(stats.data, nlq.metric, n=nlq.top_n, ascending=nlq.ascending)
+        if not res.available:
+            return fail(res)
+        gcol = stats.data.columns[0]
+        top = res.data.iloc[0]
+        return NLOutcome(kind="rank", table=res.data, calls=sc.data, value=top[nlq.metric], top_label=str(top[gcol]),
+                         headline=f"{'Lowest' if nlq.ascending else 'Highest'} {nlq.metric}: {top[gcol]} ({top[nlq.metric]}) — {when}",
+                         compare={_nl_norm_label(r[gcol]): float(r[nlq.metric]) for _, r in res.data.iterrows()}, notes=list(res.notes))
+
+    if intent == "improvement":
+        sc = _nl_filter(base, cols, spec, None)
+        comp = compare_group_periods(sc.data, cols, [nlq.dim], tl)
+        if not comp.available:
+            return fail(comp)
+        res = rank_improvement(comp, nlq.metric, improving=nlq.improving, n=nlq.top_n)
+        if not res.available:
+            return fail(res)
+        gcol = comp.data.columns[0]
+        top = res.data.iloc[0]
+        word = "improvement" if nlq.improving else "decline"
+        return NLOutcome(kind="rank", table=res.data, value=top[CHANGE_COLUMN[nlq.metric]], top_label=str(top[gcol]),
+                         headline=f"Biggest {word} in {nlq.metric}: {top[gcol]} ({top[CHANGE_COLUMN[nlq.metric]]:+}) — {comp.scalars['Current period']}",
+                         compare={_nl_norm_label(r[gcol]): float(r[CHANGE_COLUMN[nlq.metric]]) for _, r in res.data.iterrows()},
+                         notes=list(comp.notes) + list(res.notes))
+
+    if intent == "anomalies":
+        sc = _nl_filter(base, cols, spec, None)
+        det = detect_anomalies(sc.data, cols, [nlq.dim] if nlq.dim else None, tl)
+        if not det.available:
+            return fail(det)
+        n = 0 if det.data is None else len(det.data)
+        return NLOutcome(kind="anomalies", table=det.data, value=n, headline=f"{n} anomaly row(s) — {when}", notes=list(det.notes))
+    return NLOutcome(ok=False, kind="unavailable", message=INSUFFICIENT_MSG)
+
+
+# ---------------- System 2: AI API ----------------
+AI_PROVIDERS = {
+    "Groq": {"secrets": ("GROQ_API_KEY", "GROQ_SECONDARY_API_KEY", "GROQ_API_KEY_3", "GROQ_API_KEY_4"),
+             "model": "llama-3.3-70b-versatile"},
+    "Gemini": {"secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "model": "gemini-2.0-flash"},
+}
+
+
+def _secret_keys(provider):
+    keys = []
+    for name in AI_PROVIDERS[provider]["secrets"]:
+        try:
+            v = st.secrets.get(name, "")
+        except Exception:
+            v = ""
+        if v and str(v).strip() and str(v).strip() not in keys:
+            keys.append(str(v).strip())
+    return keys
+
+
+def _http_post_json(url, payload, headers, timeout=60):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", **headers}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def call_ai_provider(provider, api_key, model, system_prompt, user_prompt):
+    """Raw text answer of the chosen provider. The key goes only into a request header."""
+    if provider == "Groq":
+        data = _http_post_json(
+            "https://api.groq.com/openai/v1/chat/completions",
+            {"model": model, "temperature": 0, "response_format": {"type": "json_object"},
+             "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]},
+            {"Authorization": f"Bearer {api_key}"})
+        return data["choices"][0]["message"]["content"]
+    data = _http_post_json(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        {"systemInstruction": {"parts": [{"text": system_prompt}]},
+         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+         "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}},
+        {"x-goog-api-key": api_key})
+    return data["candidates"][0]["content"]["parts"][0].get("text", "")
+
+
+AI_COMPARISON_ENABLED = True   # False hides the whole AI column; the deterministic engine never needs it
+AI_SYSTEM_PROMPT = (
+    "You re-check calculations on anonymised call rows. The rows are ALREADY filtered to the records the question is about: "
+    "never filter them again and never use outside knowledge. Do exactly the task you are given, count exactly, and reply with "
+    'ONE JSON object only: {"interpretation": string, "count": integer or null, "value": number or null, '
+    '"breakdown": [{"label": string, "count": integer, "share_pct": number}], "top_label": string or null, '
+    '"answer": string, "explanation": string, "needs_clarification": string or null}. '
+    "Copy labels exactly from the rows. Percentages have one decimal."
+)
+AI_METRICS = {   # metric: (columns the AI needs, plain rule). Same definitions as Step 5A.
+    "Calls": ([], "the number of rows"),
+    "Qualified": (["call_type"], "the number of rows whose call_type starts with QUAL"),
+    "Non-Qualified": (["call_type"], "the number of rows whose call_type starts with NON"),
+    "Wrong Number": (["call_type"], "the number of rows whose call_type starts with WRONG"),
+    "Silent": (["call_type"], "the number of rows whose call_type starts with SILENT"),
+    "Spam": (["call_type", "spam_robot"], "the number of rows whose call_type starts with SPAM or whose spam_robot is YES"),
+    "VoIP": (["line_type"], "the number of rows whose line_type contains VOIP"),
+    "Qualification %": (["call_type"], "100 x (rows whose call_type starts with QUAL) / (all rows)"),
+    "Spam %": (["call_type", "spam_robot"], "100 x (rows whose call_type starts with SPAM or whose spam_robot is YES) / (all rows)"),
+    "VoIP %": (["line_type"], "100 x (rows whose line_type contains VOIP) / (all rows)"),
+    "Avg Score": (["score"], "the mean of score, ignoring blank scores"),
+    "Avg Duration (sec)": (["duration"], "the mean of duration in seconds, ignoring blanks"),
+}
+
+
+def ai_plan(nlq, out):
+    """What may go to the AI for this question: EXACTLY the Step 5A matched records, a few anonymised columns and a
+    neutral task (the question text itself is never sent). {'error': why} when that cannot be guaranteed."""
+    if nlq.intent not in ("count", "calls", "compare_entities", "metric", "rank"):
+        return {"error": f"AI comparison is not available for '{nlq.intent.replace('_', ' ')}' questions yet: the exact records cannot be matched."}
+    if not out.ok or out.calls is None:
+        return {"error": "There are no matched records to compare."}
+    if nlq.intent in ("count", "calls"):
+        if out.kind == "breakdown":
+            return {"columns": [], "group": nlq.share_by, "task":
+                    "Put the number of rows in count. Then give, for each distinct value of 'group', its number of rows and its share of all rows in breakdown, most frequent first."}
+        return {"columns": ["call_type"], "group": None, "task": "Put the number of rows in count."}
+    if nlq.intent == "compare_entities":
+        key = next(k for k, v in nlq.entities.items() if len(v) >= 2)
+        return {"columns": [], "group": key, "task": "Put the number of rows in count. Then give, for each distinct value of 'group', its number of rows in breakdown."}
+    if nlq.intent in ("metric", "rank"):
+        if nlq.metric not in AI_METRICS:
+            return {"error": f"AI comparison is not available for '{nlq.metric}' yet; its exact definition cannot be given to the AI."}
+        need, rule = AI_METRICS[nlq.metric]
+        if nlq.intent == "metric":
+            return {"columns": need, "group": None, "task": f"Calculate {rule}. Put it in value, and the number of rows in count."}
+        min_rows = TREND_MIN_CALLS if nlq.metric in RATE_METRICS else 1
+        return {"columns": need, "group": nlq.dim, "task":
+                f"For each distinct value of 'group' calculate {rule}. Ignore groups with fewer than {min_rows} rows. "
+                f"Return the group with the {'lowest' if nlq.ascending else 'highest'} value as top_label and that value in value "
+                "(ties: the group with more rows). List the first 5 groups in breakdown with count = rows in that group."}
+    return {"error": "AI comparison is not available for this question."}
+
+
+def build_ai_rows(calls, cols, plan):
+    """The minimal anonymised rows. Caller IDs and publisher / buyer / campaign names become aliases
+    (caller_001, publisher_002 ...); returns (DataFrame, alias -> original map)."""
+    data, rev = {}, {}
+
+    def col(name, default=""):
+        return calls[name].astype(str) if name in calls.columns else pd.Series([default] * len(calls), index=calls.index)
+
+    for name in plan["columns"]:
+        if name == "call_type":
+            data[name] = col(QC_PREFIX + "Call Type").str.strip().str.upper()
+        elif name == "spam_robot":
+            data[name] = col(QC_PREFIX + "Spam/Robot").str.strip().str.upper()
+        elif name == "line_type":
+            data[name] = col(cols["line_type"]) if cols.get("line_type") else pd.Series([""] * len(calls), index=calls.index)
+        elif name == "score":
+            data[name] = calls["Quality_Score_Num"]
+        elif name == "duration":
+            data[name] = calls["Duration_Num"]
+    if plan.get("group"):
+        g, gcols, missing = _with_group_columns(calls, cols, [plan["group"]])
+        if missing or not len(g):
+            return None, {}
+        vals = g[gcols[0]].astype(str).tolist()
+        alias = {}
+        for v in vals:
+            alias.setdefault(v, f"{plan['group']}_{len(alias) + 1:03d}")
+        rev = {a: v for v, a in alias.items()}
+        data["group"] = pd.Series([alias[v] for v in vals], index=calls.index)
+    return pd.DataFrame(data, index=calls.index), rev
+
+
+def run_ai_system(nlq, out, cols, provider, model, max_rows):
+    """System 2 (optional, opt-in). Never raises. Nothing is sent when the records are too many or the question
+    type is not supported: a truncated sample is never presented as the full data."""
+    plan = ai_plan(nlq, out)
+    if plan.get("error"):
+        return {"ok": False, "error": plan["error"], "rows_sent": 0, "rows_total": 0}
+    n = len(out.calls)
+    if n == 0:
+        return {"ok": False, "error": "No matching calls, so nothing was sent to the AI.", "rows_sent": 0, "rows_total": 0}
+    if n > max_rows:
+        return {"ok": False, "error": f"AI comparison skipped: {n:,} matched calls is more than the {max_rows:,}-row limit, "
+                                      "so NOTHING was sent (a partial sample would not be a fair comparison). Raise the limit or narrow the question.",
+                "rows_sent": 0, "rows_total": n}
+    if "call_type" in plan["columns"] and QC_PREFIX + "Call Type" not in out.calls.columns:
+        return {"ok": False, "error": "The call type could not be read from the AI QC Report, so the AI comparison was skipped.", "rows_sent": 0, "rows_total": n}
+    keys = _secret_keys(provider)
+    if not keys:
+        return {"ok": False, "error": f"No {provider} API key found in Streamlit Secrets ({' / '.join(AI_PROVIDERS[provider]['secrets'])}).",
+                "rows_sent": 0, "rows_total": n}
+    rows, rev = build_ai_rows(out.calls, cols, plan)
+    if rows is None:
+        return {"ok": False, "error": "The grouping column is not available, so the AI comparison was skipped.", "rows_sent": 0, "rows_total": n}
+    user = (f"Task: {plan['task']}\nColumns: {list(rows.columns)}\n"
+            f"Rows ({len(rows)} rows, CSV, already filtered):\n" + rows.to_csv(index=False))
+    last_err = "unknown error"
+    for key in keys:
+        try:
+            raw = call_ai_provider(provider, key, model, AI_SYSTEM_PROMPT, user)
+            text = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+            data = json.loads(text)
+            for b in data.get("breakdown") or []:       # aliases back to the real names (locally)
+                if isinstance(b, dict):
+                    b["label"] = rev.get(str(b.get("label")), b.get("label"))
+            if data.get("top_label") is not None:
+                data["top_label"] = rev.get(str(data["top_label"]), data["top_label"])
+            return {"ok": True, "data": data, "rows_sent": len(rows), "rows_total": n,
+                    "sent": {"task": plan["task"], "columns": list(rows.columns), "preview": rows.head(5)}}
+        except urllib.error.HTTPError as exc:
+            last_err = f"HTTP {exc.code}"
+            if exc.code not in (401, 403, 429):
+                break
+        except Exception as exc:
+            last_err = str(exc).replace(key, "***")[:200]
+            break
+    return {"ok": False, "error": f"AI request failed ({last_err}).", "rows_sent": len(rows), "rows_total": n}
+
+
+# ---------------- agreement ----------------
+def compare_systems(nlq, out, ai):
+    """(status text, detail lines). The deterministic result is the reference; the AI is only compared."""
+    if ai is None:
+        return "⚪ AI comparison off", []
+    if not ai.get("ok"):
+        return "⚪ AI result not available", [ai.get("error", "")]
+    d = ai["data"]
+    if not out.ok:
+        if d.get("needs_clarification"):
+            return "✅ Results agree: both systems need clarification", []
+        return "⚠️ Results disagree", ["The deterministic engine needs clarification, but the AI gave an answer anyway."]
+    if d.get("needs_clarification"):
+        return "⚠️ Results disagree", [f"The AI asked for clarification: {d['needs_clarification']}"]
+    details = []
+    limited = ai["rows_sent"] < ai["rows_total"]
+    if limited:
+        details.append(f"The AI received only {ai['rows_sent']:,} of {ai['rows_total']:,} rows for this period, so its numbers may be incomplete.")
+
+    def close(a, b, tol=0.5):
+        try:
+            return abs(float(a) - float(b)) <= tol
+        except (TypeError, ValueError):
+            return False
+
+    ok = None
+    ai_number = {"count": d.get("count"), "calls": d.get("count"), "breakdown": d.get("count"), "metric": d.get("value"),
+                 "rank": d.get("top_label")}.get(out.kind, "n/a")
+    if ai_number is None:
+        return "⚪ AI gave no comparable number", details + ["The AI answer has no number to compare; read its text on the right."]
+    if out.kind in ("count", "calls"):
+        ok = int(d["count"]) == int(out.value)
+        details.append(f"Count: deterministic {out.value:,} vs AI {d.get('count')}")
+    elif out.kind == "metric":
+        if nlq.metric == "Health":
+            ok = str(out.value).split()[-1].lower() in (str(d.get("value", "")) + " " + str(d.get("answer", ""))).lower()
+        else:
+            ok = close(out.value, d.get("value"), 0.5)
+        details.append(f"{nlq.metric}: deterministic {out.value} vs AI {d.get('value')}")
+    elif out.kind == "breakdown":
+        ai_map = {_nl_norm_label(b.get("label")): b.get("count") for b in d.get("breakdown") or [] if isinstance(b, dict)}
+        top = list(out.compare.items())[:5]
+        bad = [(k, v, ai_map.get(k)) for k, v in top if ai_map.get(k) is None or int(ai_map[k]) != v]
+        ok = d.get("count") is not None and int(d["count"]) == int(out.value) and not bad
+        details.append(f"Total: deterministic {out.value:,} vs AI {d.get('count')}")
+        for k, v, a in bad:
+            details.append(f"{k}: deterministic {v} vs AI {a}")
+    elif out.kind == "rank":
+        ok = d.get("top_label") is not None and _nl_norm_label(d["top_label"]) == _nl_norm_label(out.top_label)
+        details.append(f"Top: deterministic {out.top_label} vs AI {d.get('top_label')}")
+    elif out.kind == "compare":
+        e, l = out.compare.get("earlier"), out.compare.get("later")
+        lab = {_nl_norm(str(b.get("label"))): b.get("count") for b in d.get("breakdown") or [] if isinstance(b, dict)}
+        ai_e = next((v for k, v in lab.items() if "earlier" in k or "before" in k), None)
+        ai_l = next((v for k, v in lab.items() if "later" in k or "now" in k or "current" in k), None)
+        if ai_e is None or ai_l is None:
+            return "⚪ Could not compare automatically", details + ["The AI did not label the two periods as earlier / later; compare the two results by eye."]
+        ok = int(ai_e) == int(e) and int(ai_l) == int(l)
+        details.append(f"Calls earlier/later: deterministic {e}/{l} vs AI {ai_e}/{ai_l}")
+    elif out.kind == "compare_entities":
+        ai_map = {_nl_norm_label(b.get("label")): b.get("count") for b in d.get("breakdown") or [] if isinstance(b, dict)}
+        bad = [(k, v, ai_map.get(k)) for k, v in out.compare.items() if ai_map.get(k) is None or int(ai_map[k]) != v]
+        ok = not bad
+        details += [f"{k}: deterministic {v} vs AI {a}" for k, v, a in bad] or ["Calls per value match."]
+    elif out.kind == "anomalies":
+        return "⚪ Could not compare automatically", details + ["Anomaly lists are shown side by side without an automatic check."]
+    if ok is None:
+        return "⚪ Could not compare automatically", details
+    if ok and limited:
+        return "✅ Results agree (AI saw only part of the rows)", details
+    return ("✅ Results agree" if ok else "⚠️ Results disagree"), details
+
+
+# ---------------- UI ----------------
+def render_query_assistant(qf, cols, df):
+    st.markdown("### 🤖 Query Assistant (ask in plain English)")
+    st.caption(
+        "**Deterministic analytics** reads your question into filters and runs them through the Step 5A query engine; it is the "
+        "source of truth and works without any AI service. An optional external **AI check** (off by default) can re-calculate "
+        "the same matched records for comparison. Nothing is guessed: unclear questions get a clarification message."
+    )
+    with st.form("nl_form", clear_on_submit=False):
+        question = st.text_input(
+            "Ask a question:", key="nl_question",
+            placeholder="Last 2 days how many wrong number calls from publisher ABC, and share of those caller IDs",
+        )
+        ask = st.form_submit_button("Ask")
+    use_ai, provider, model, max_rows = False, "Groq", "", 300
+    if AI_COMPARISON_ENABLED:
+        use_ai = st.checkbox(
+            "Also check with an external AI (optional, sends anonymised data)", value=False, key="nl_use_ai",
+            help="Off by default. Only the calls that matched your question are sent, reduced to a few columns, with Caller IDs and "
+                 "publisher / buyer / campaign names replaced by aliases.",
+        )
+        if use_ai:
+            o = st.columns(3)
+            provider = o[0].selectbox("AI provider:", list(AI_PROVIDERS), key="nl_provider")
+            model = o[1].text_input("Model:", AI_PROVIDERS[provider]["model"], key=f"nl_model_{provider}")
+            max_rows = o[2].number_input("Max matched calls to send:", min_value=20, max_value=2000, value=300, step=50, key="nl_rows")
+            st.caption(
+                f"🔒 Sent to {provider}: only the calls that matched your question, a few columns (for example the call type) and a neutral "
+                "task. Caller IDs and publisher / buyer / campaign names are replaced by aliases such as publisher_001. Your question text, "
+                "dates, phone numbers, recordings, notes and summaries are never sent. If more calls match than the limit, nothing is sent."
+            )
+            if not _secret_keys(provider):
+                st.caption(f"ℹ️ No {provider} key in Streamlit Secrets ({' / '.join(AI_PROVIDERS[provider]['secrets'])}); the AI column will be skipped.")
+
+    if ask and question.strip():
+        today, _ = get_today(st.session_state.get("date_tz", DEFAULT_TIMEZONE))
+        focus = {k: st.session_state.get(f"q_f_{k}") or [] for k in NL_ENTITY_FIELDS}
+        previous = st.session_state.get("nl_previous")
+        nlq = parse_nl_question(question, qf, cols, today, focus=focus, previous=previous)
+        out = run_nl_deterministic(nlq, qf, cols)
+        ai = None
+        if use_ai and out.ok:
+            with st.spinner("Asking the AI ..."):
+                ai = run_ai_system(nlq, out, cols, provider, model, int(max_rows))
+        # a failed / unclear question must not become the context of the next follow-up
+        st.session_state["nl_previous"] = nlq if out.ok else None
+        if not use_ai:
+            status = ("⚪ AI check is off (default). The deterministic result is complete.", [])
+        elif not out.ok:
+            status = ("⚪ AI not called (the question needs clarification first)", [])
+        else:
+            status = compare_systems(nlq, out, ai)
+        st.session_state["nl_result"] = (nlq, out, ai, status, use_ai)
+    res = st.session_state.get("nl_result")
+    if not res:
+        return
+    nlq, out, ai, (status, details), used_ai = res
+    st.markdown("**Interpreted query (for audit):** " + describe_nl(nlq))
+    for n in nlq.notes:
+        st.caption("• " + n)
+    if status.startswith("✅"):
+        st.success(status)
+    elif status.startswith("⚠️"):
+        st.warning(status)
+    else:
+        st.info(status)
+    for dline in details:
+        st.caption(dline)
+
+    def show_deterministic():
+        st.markdown("#### 🧮 Deterministic analytics (source of truth)")
+        if not out.ok:
+            st.warning(out.message)
+        else:
+            st.markdown(f"**{out.headline}**")
+            if out.table is not None and not out.table.empty:
+                st.dataframe(out.table, width="stretch", hide_index=True)
+            for n in out.notes[:6]:
+                st.caption(n)
+
+    if not used_ai:
+        show_deterministic()
+    else:
+        left, right = st.columns(2)
+        with left:
+            show_deterministic()
+        with right:
+            st.markdown("#### 🤖 AI check (comparison only; never changes the answer)")
+            if ai is None:
+                st.info("The AI was not asked.")
+            elif not ai.get("ok"):
+                st.warning(ai.get("error", "AI result not available."))
+            else:
+                d = ai["data"]
+                st.markdown("**AI interpretation:** " + str(d.get("interpretation", "–")))
+                if d.get("needs_clarification"):
+                    st.warning(str(d["needs_clarification"]))
+                else:
+                    st.markdown("**AI result:** " + str(d.get("answer", "–")))
+                    if d.get("breakdown"):
+                        st.dataframe(pd.DataFrame([b for b in d["breakdown"] if isinstance(b, dict)]), width="stretch", hide_index=True)
+                st.caption("**Explanation:** " + str(d.get("explanation", "–")))
+                st.caption(f"The AI received all {ai['rows_sent']:,} matched calls (no sampling).")
+                if ai.get("sent"):
+                    with st.expander("What was sent to the AI"):
+                        st.caption("Task: " + ai["sent"]["task"])
+                        st.caption("Columns: " + ", ".join(ai["sent"]["columns"]))
+                        st.dataframe(ai["sent"]["preview"], width="stretch", hide_index=True)
+    if out.ok and out.calls is not None:
+        show_matched_calls(out.calls, df.columns, "nl", note="Source records from Step 5A that the deterministic result is based on.")
+
+
+# ---------------------------------------------------------------
+# Step 6: Network Intelligence and Decision Layer (advisory only)
+#
+#   1. build_health_briefing()  health buckets for publishers / buyers / campaigns + anomalies (Step 5A)
+#   2. explain_anomaly()        WHY an anomaly happened: the change is split across segments (line type, campaign,
+#                               call duration ...) so the pieces add up EXACTLY to the Step 5A change
+#   3. build_recommendations()  fixed rules -> suggestions for a human to review
+#
+# Pure threshold / arithmetic rules: no AI, nothing is estimated. Every number comes from Step 5A
+# (get_group_stats, detect_anomalies, filter_calls, slice_window). SAFEGUARD: nothing here routes, blocks,
+# pauses or changes anything; it only reads the loaded sheet and shows advice.
+# ---------------------------------------------------------------
+STEP6_ADVISORY_TEXT = ("Advisory only: rule-based suggestions for a person to review. This dashboard never routes, blocks, "
+                       "pauses or changes anything.")
+HEALTH_BUCKETS = [("🔴 HIGH RISK", "High Risk"), ("🟡 WATCH", "Watch"), ("🟢 HEALTHY", "Healthy"), ("⚪ INSUFFICIENT DATA", "Insufficient Data")]
+BRIEFING_ENTITIES = ("publisher", "buyer", "campaign")
+RC_MIN_EXPLAINED = 0.40                    # a segment is named as a driver when it explains at least 40% of the change ...
+RC_MIN_SEGMENT_CALLS = TREND_MIN_VOLUME    # ... and has at least this many calls in one of the two periods
+RC_MAX_DRIVERS = 3
+RC_MAX_ANOMALIES = 8                       # root causes are worked out for the largest anomalies only
+RC_DIMS = [("Line Type", "line_type"), ("Campaign", "campaign"), ("Buyer", "buyer"), ("Publisher", "publisher"),
+           ("Phone Company", "phone_company"), ("Hangup By", "hangup"), ("Fake Number", "fake"),
+           ("Call Duration", "Call Duration"), ("Insurance Type", "Insurance Type")]
+RC_SKIP = {"VoIP %": {"line_type"}, "Fake %": {"fake"}}     # these dimensions would only restate the metric itself
+RC_METRICS = {   # metric: (kind, Step 5A column, scale)
+    "Spam %": ("count", "Spam", 100), "Qualification %": ("count", "Qualified", 100), "VoIP %": ("count", "VoIP", 100),
+    "Fake %": ("fake", "Fake Numbers", 100), "Avg Score": ("mean", "Quality_Score_Num", 1),
+    "Avg Duration (sec)": ("mean", "Duration_Num", 1), "Calls": ("calls", "Calls", 1),
+}
+RC_INSURANCE_SHORT = {"public": "Public (Medicaid / Medicare / state)", "private": "Private", "insurer_named": "Insurer named only",
+                      "none": "No insurance", "mixed": "Mixed", "unspecified": "Type not stated", "unknown": "No insurance info"}
+
+
+def get_query_frame(df, cols, copy=False):
+    """prepare_query_frame() once per loaded sheet, reused by the briefing and the Query Layer."""
+    key = tuple(sorted((k, str(v)) for k, v in cols.items()))
+    c = st.session_state.get("qf_cache")
+    if not (c and c["df"] is df and c["key"] == key):
+        c = {"df": df, "key": key, "qf": prepare_query_frame(df, cols)}
+        st.session_state["qf_cache"] = c
+    return c["qf"].copy() if copy else c["qf"]
+
+
+def briefing_timeline(timeline, tz_name=DEFAULT_TIMEZONE):
+    """(timeline, note). The sidebar period when it has dates; otherwise the last 7 days (All time has no comparison)."""
+    if timeline and timeline.get("start") is not None and timeline.get("end") is not None:
+        return timeline, None
+    today, _ = get_today(tz_name)
+    return make_timeline("Last 7 days", today=today), (
+        "The sidebar period has no start / end date (All time), so the briefing uses the last 7 days compared with the 7 days before.")
+
+
+# ---------------- 1. health briefing ----------------
+def build_health_briefing(frame, cols, timeline):
+    """Health buckets and anomalies for the period, straight from Step 5A."""
+    scope = filter_calls(frame, cols, {"timeline": timeline}, title="Briefing period")
+    if not scope.available:
+        return {"ok": False, "message": scope.message}
+    calls = scope.data
+    out = {"ok": True, "timeline": timeline, "n_calls": len(calls), "network": None, "entities": {}, "anomalies": {}, "notes": []}
+    if calls.empty:
+        out["ok"], out["message"] = False, "No calls in the briefing period."
+        return out
+    net = get_group_stats(calls, cols, None, health=True)
+    if net.available and len(net.data):
+        out["network"] = net.data.iloc[0].to_dict()
+    for key in BRIEFING_ENTITIES:
+        if not cols.get(key):
+            out["notes"].append(f"{QUERY_LABELS[key]} column not found: skipped.")
+            continue
+        stats = get_group_stats(calls, cols, [key], health=True)
+        if not stats.available or "Health" not in stats.data.columns:
+            continue
+        t = stats.data
+        out["entities"][key] = {"table": t, "gcol": t.columns[0],
+                                "counts": {label: int(t["Health"].eq(full).sum()) for full, label in HEALTH_BUCKETS}}
+        out["anomalies"][key] = detect_anomalies(frame, cols, [key], timeline)
+    return out
+
+
+# ---------------- 2. root-cause breakdown ----------------
+def _add_driver_columns(frame, cols):
+    """Call-level helper columns used as extra segments (the sheet columns are never changed)."""
+    f = frame.copy()
+    d = f["Duration_Num"] if "Duration_Num" in f.columns else pd.Series(float("nan"), index=f.index)
+    band = pd.cut(d, bins=[-1, 14, 59, 179, float("inf")], labels=["under 15s", "15-59s", "60-179s", "180s or longer"])
+    f["Call Duration"] = band.astype(object).where(d.notna(), "Unknown")
+    if cols.get("qc"):
+        cat = classify_insurance(f, cols)["Insurance_Category"].reindex(f.index)
+        f["Insurance Type"] = cat.map(RC_INSURANCE_SHORT).fillna("No insurance info")
+    return f
+
+
+def _seg_parts(f, cols, seg, metric):
+    """Per segment: n (calls), w (weight behind the metric), e (events or sum). All from Step 5A frames / stats."""
+    kind, col, _ = RC_METRICS[metric]
+    empty = pd.DataFrame(columns=["n", "w", "e"], dtype=float)
+    if f.empty:
+        return empty
+    if kind in ("count", "fake", "calls"):
+        r = get_group_stats(f, cols, [seg], health=False)
+        if not r.available or r.data.empty:
+            return empty
+        t = r.data.set_index(r.data.columns[0])
+        w = t["Calls"] - t["Fake Unknown"] if kind == "fake" else t["Calls"]
+        return pd.DataFrame({"n": t["Calls"].astype(float), "w": w.astype(float), "e": t[col].astype(float)})
+    g, gcols, missing = _with_group_columns(f, cols, [seg])
+    if missing:
+        return empty
+    num = pd.to_numeric(g[col], errors="coerce")
+    grp = num.groupby(g[gcols[0]]).agg(["sum", "count", "size"])
+    return pd.DataFrame({"n": grp["size"].astype(float), "w": grp["count"].astype(float), "e": grp["sum"].astype(float)})
+
+
+def _segment_table(cur, prev, cols, seg, metric):
+    """Contribution of every segment to the change of `metric` between two call sets. The contributions add up
+    EXACTLY to (current value - previous value). mix = the segment's share of calls changed; rate = its own rate changed."""
+    kind, _, scale = RC_METRICS[metric]
+    a, b = _seg_parts(cur, cols, seg, metric), _seg_parts(prev, cols, seg, metric)
+    idx = a.index.union(b.index)
+    a, b = a.reindex(idx, fill_value=0.0), b.reindex(idx, fill_value=0.0)
+    Wc, Wp = a["w"].sum(), b["w"].sum()
+    if Wc == 0 or Wp == 0:
+        return None
+    t = pd.DataFrame(index=idx)
+    t["n_p"], t["n_c"] = b["n"], a["n"]
+    t["share_p"], t["share_c"] = b["w"] / Wp * 100, a["w"] / Wc * 100
+    rp = (b["e"] / b["w"].where(b["w"] > 0) * scale)
+    rc = (a["e"] / a["w"].where(a["w"] > 0) * scale)
+    t["rate_p"], t["rate_c"] = rp, rc
+    if kind == "calls":
+        t["contribution"] = a["e"] - b["e"]
+        t["mix"], t["rate"] = t["contribution"], 0.0
+        t["effect"] = "volume"
+    else:
+        t["contribution"] = scale * (a["e"] / Wc - b["e"] / Wp)
+        rp_eff, rc_eff = rp.fillna(rc).fillna(0.0), rc.fillna(rp).fillna(0.0)
+        sh_p, sh_c = b["w"] / Wp, a["w"] / Wc
+        t["mix"] = (sh_c - sh_p) * rp_eff
+        t["rate"] = sh_c * (rc_eff - rp_eff)
+        t["effect"] = (t["mix"].abs() >= t["rate"].abs()).map({True: "mix", False: "rate"})
+    delta = t["contribution"].sum()
+    t["explained"] = t["contribution"] / delta * 100 if delta else float("nan")
+    return t
+
+
+def _driver_text(dim_label, seg, r, metric):
+    ex = f"{r['explained']:.0f}%"
+    chg = _fmt_change(metric, r["contribution"], 0)
+    if metric == "Calls":
+        return f"{dim_label} '{seg}': {int(r['n_p'])} → {int(r['n_c'])} calls ({chg}), {ex} of the volume change."
+    shares = f"{r['share_p']:.0f}% → {r['share_c']:.0f}% of calls"
+    if r["n_p"] == 0:
+        return f"{dim_label} '{seg}' is new this period ({r['share_c']:.0f}% of calls, {metric} {fmt_trend_value(metric, r['rate_c'])}): {chg}, {ex} of the change."
+    if r["n_c"] == 0:
+        return f"{dim_label} '{seg}' disappeared (was {r['share_p']:.0f}% of calls, {metric} {fmt_trend_value(metric, r['rate_p'])}): {chg}, {ex} of the change."
+    if r["effect"] == "mix":
+        return (f"{dim_label} '{seg}' changed from {shares} (its {metric} is about {fmt_trend_value(metric, r['rate_c'])}): "
+                f"{chg}, {ex} of the change.")
+    return (f"{dim_label} '{seg}': its own {metric} moved {fmt_trend_value(metric, r['rate_p'])} → {fmt_trend_value(metric, r['rate_c'])} "
+            f"({shares}): {chg}, {ex} of the change.")
+
+
+def explain_anomaly(frame, cols, win, entity_key, entity_name, metric):
+    """Why did `metric` move for one entity? Looks at the entity's own calls in the two periods of the anomaly
+    (win = the windows Step 5A used) and ranks the segments that explain the change. None when it cannot be worked out."""
+    if metric not in RC_METRICS:
+        return None
+    parts = []
+    for w in (win["cur"], win["prev"]):
+        f = slice_window(frame, *w)
+        g, gcols, missing = _with_group_columns(f, cols, [entity_key])
+        if missing or g.empty:
+            return None
+        parts.append(_add_driver_columns(f[(g[gcols[0]].astype(str) == str(entity_name)).values], cols))   # only this entity's calls
+    cur, prev = parts
+    if cur.empty or prev.empty:
+        return None
+    tables, cands, delta = {}, [], None
+    for label, seg in RC_DIMS:
+        if seg == entity_key or seg in RC_SKIP.get(metric, ()):
+            continue
+        if seg in cols and not cols[seg]:
+            continue
+        if seg not in cols and seg not in cur.columns:
+            continue
+        t = _segment_table(cur, prev, cols, seg, metric)
+        if t is None or len(t) < 2:     # one segment only would trivially "explain" everything
+            continue
+        tables[label] = t
+        delta = t["contribution"].sum()
+        if not delta:
+            continue
+        best = None
+        for name, r in t.iterrows():
+            if max(r["n_p"], r["n_c"]) < RC_MIN_SEGMENT_CALLS or r["contribution"] * delta <= 0:
+                continue
+            if r["explained"] / 100 >= RC_MIN_EXPLAINED and (best is None or r["explained"] > best[1]["explained"]):
+                best = (name, r)
+        if best:
+            cands.append({"dimension": label, "segment": best[0], "explained": float(best[1]["explained"]),
+                          "contribution": float(best[1]["contribution"]), "effect": best[1]["effect"],
+                          "text": _driver_text(label, best[0], best[1], metric)})
+    if delta is None:
+        return None
+    cands.sort(key=lambda d: -d["explained"])
+    drivers = cands[:RC_MAX_DRIVERS]
+    if drivers:
+        summary = "Likely drivers: " + " ".join(d["text"] for d in drivers)
+    else:
+        top = max((t["explained"].abs().max() for t in tables.values() if t["explained"].notna().any()), default=float("nan"))
+        summary = ("No single segment explains this change" + ("" if pd.isna(top) else f" (the largest explains {top:.0f}%)")
+                   + ": it is spread across the calls.")
+    return {"metric": metric, "delta": float(delta), "drivers": drivers, "tables": tables, "summary": summary,
+            "calls_now": len(cur), "calls_before": len(prev)}
+
+
+# ---------------- 3. rule-based recommendations ----------------
+REC_ORDER = {"High": 0, "Medium": 1, "Low": 2}
+ANOMALY_ACTIONS = {   # metric -> (priority, suggestion)
+    "Spam %": ("High", "Review recent calls of {label} '{name}' (spam rose {chg})."),
+    "VoIP %": ("High", "Audit the traffic source of {label} '{name}' (VoIP share rose {chg}); consider a compliance check."),
+    "Qualification %": ("High", "Review lead targeting and buyer fit for {label} '{name}' (qualification fell {chg})."),
+    "Fake %": ("High", "Verify the phone-number validation for {label} '{name}' (fake-number share rose {chg})."),
+    "Avg Score": ("Medium", "Sample call recordings of {label} '{name}' to see what changed (score {chg})."),
+    "Avg Duration (sec)": ("Medium", "Sample calls of {label} '{name}' to see why durations changed ({chg})."),
+    "Calls": ("Medium", "Ask the partner whether caps, budgets or traffic sources changed for {label} '{name}' (volume {chg})."),
+}
+
+
+def build_recommendations(briefing):
+    """Fixed rules over the briefing numbers. Every item names the rule that produced it and the numbers behind it."""
+    R, recs = HEALTH_RULES, []
+
+    def add(prio, etype, name, action, why, rule, calls=0):
+        recs.append({"Priority": prio, "Type": etype, "Name": name, "Suggestion": action, "Why": why, "Rule": rule,
+                     "Calls": int(calls), "Automated": False})
+
+    net = briefing.get("network")
+    if net and net.get("Health") == "🔴 HIGH RISK":
+        add("High", "Network", "All calls", "Start with the high-risk entities listed here; the network as a whole is High Risk.",
+            str(net.get("Health_Reason", "")), "N-HIGH", net.get("Calls", 0))
+    for key, info in briefing["entities"].items():
+        t, gcol, label = info["table"], info["gcol"], QUERY_LABELS[key]
+        for _, r in t.iterrows():
+            name, calls, status = r[gcol], int(r["Calls"]), r["Health"]
+            if status in ("🔴 HIGH RISK", "🟡 WATCH"):
+                for metric, rule, level, high_msg, watch_msg, val_txt in (
+                    ("Spam %", "S-SPAM", R["spam"], "Flag {label} '{name}' for a manual traffic-quality review.",
+                     "Keep {label} '{name}' on watch and sample its spam calls.", lambda v: f"{v:.1f}%"),
+                    ("VoIP %", "S-VOIP", R["voip"], "Flag {label} '{name}' for a manual source / compliance review.",
+                     "Keep {label} '{name}' on watch and check where its VoIP calls come from.", lambda v: f"{v:.1f}%"),
+                ):
+                    v = r[metric]
+                    if pd.notna(v) and v >= level[1]:
+                        add("High", label, name, high_msg.format(label=label.lower(), name=name), f"{metric} {val_txt(v)} over {calls} calls (serious level {level[1]:.0f}%).", rule + "-HIGH", calls)
+                    elif pd.notna(v) and v >= level[0]:
+                        add("Medium", label, name, watch_msg.format(label=label.lower(), name=name), f"{metric} {val_txt(v)} over {calls} calls (watch level {level[0]:.0f}%).", rule + "-WATCH", calls)
+                q, sc = r["Qualification %"], r["Avg Score"]
+                if pd.notna(q) and q < R["qualification"][1]:
+                    add("High", label, name, f"Review lead targeting and buyer fit for {label.lower()} '{name}'.", f"Qualification {q:.1f}% over {calls} calls (serious level below {R['qualification'][1]:.0f}%).", "S-QUAL-HIGH", calls)
+                elif pd.notna(q) and q < R["qualification"][0]:
+                    add("Medium", label, name, f"Review lead targeting for {label.lower()} '{name}'.", f"Qualification {q:.1f}% over {calls} calls (watch level below {R['qualification'][0]:.0f}%).", "S-QUAL-WATCH", calls)
+                if pd.notna(sc) and sc < R["score"][1]:
+                    add("High", label, name, f"Sample call recordings of {label.lower()} '{name}'.", f"Average quality score {sc:.1f} (serious level below {R['score'][1]:.0f}).", "S-SCORE-HIGH", calls)
+                elif pd.notna(sc) and sc < R["score"][0]:
+                    add("Medium", label, name, f"Sample a few calls of {label.lower()} '{name}'.", f"Average quality score {sc:.1f} (watch level below {R['score'][0]:.0f}).", "S-SCORE-WATCH", calls)
+            elif status == "⚪ INSUFFICIENT DATA" and calls >= R["min_calls"]:
+                add("Low", label, name, f"Complete the AI QC for {label.lower()} '{name}' before judging it.",
+                    str(r["Health_Reason"]), "S-QC-GAP", calls)
+    for item in briefing.get("rc", []):
+        prio, tmpl = ANOMALY_ACTIONS.get(item["metric"], ("Medium", "Review {label} '{name}' ({chg})."))
+        label = QUERY_LABELS[item["entity_type"]]
+        ex = item["explain"]
+        chg = item["change"]
+        action = tmpl.format(label=label.lower(), name=item["entity"], chg=chg)
+        if ex and ex["drivers"]:
+            d = ex["drivers"][0]
+            action += f" Start with {d['dimension'].lower()} '{d['segment']}'."
+        add(prio, label, item["entity"], action, item["details"] + (" " + ex["drivers"][0]["text"] if ex and ex["drivers"] else ""),
+            "A-" + item["metric"].split()[0].upper(), item["calls_now"])
+    seen, out = set(), []
+    for r in sorted(recs, key=lambda r: (REC_ORDER[r["Priority"]], -r["Calls"])):
+        k = (r["Type"], r["Name"], r["Rule"])
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
+    return out
+
+
+def compute_step6(frame, cols, timeline):
+    """Briefing + anomaly root causes + recommendations for one period."""
+    b = build_health_briefing(frame, cols, timeline)
+    if not b["ok"]:
+        return b
+    found = []
+    for key, det in b["anomalies"].items():
+        if det.available and det.data is not None and not det.data.empty:
+            for _, row in det.data.iterrows():
+                found.append((key, det, row))
+    b["n_anomalies"] = len(found)
+    found.sort(key=lambda x: -int(x[2]["Calls (now)"]))
+    b["rc"] = []
+    for key, det, row in found[:RC_MAX_ANOMALIES]:
+        gcol = det.extra["gcols"][0]
+        b["rc"].append({"entity_type": key, "entity": row[gcol], "metric": row["Metric"], "anomaly": row["Anomaly"],
+                        "change": row["Change"], "details": row["Details"], "calls_now": int(row["Calls (now)"]), "calls_before": int(row["Calls (before)"]),
+                        "explain": explain_anomaly(frame, cols, det.extra["win"], key, row[gcol], row["Metric"])})
+    b["recs"] = build_recommendations(b)
+    return b
+
+
+# ---------------- UI ----------------
+def render_network_briefing(df, available_columns, overrides, timeline):
+    """Top-of-dashboard briefing: health buckets, anomalies with likely causes, advisory suggestions."""
+    cols = resolve_query_columns(available_columns, overrides)
+    st.markdown("### 🧭 Network Intelligence Briefing")
+    if not cols.get("date"):
+        st.info("The briefing needs a readable Call Date column.")
+        return
+    tl, note = briefing_timeline(timeline, st.session_state.get("date_tz", DEFAULT_TIMEZONE))
+    key = (tuple(sorted((k, str(v)) for k, v in HEALTH_RULES.items())), tl.get("preset"), str(tl.get("start")), str(tl.get("end")),
+           tuple(sorted((k, str(v)) for k, v in cols.items())))
+    c = st.session_state.get("s6_cache")
+    if c and c["df"] is df and c["key"] == key:
+        b = c["b"]
+    else:
+        with st.spinner("Preparing the briefing ..."):
+            b = compute_step6(get_query_frame(df, cols), cols, tl)
+        st.session_state["s6_cache"] = {"df": df, "key": key, "b": b}
+    st.caption(f"Period: {_tl_text(tl.get('preset', 'Period'), tl)}, compared with the previous equivalent period. "
+               "Fixed rules, no AI. " + STEP6_ADVISORY_TEXT)
+    if note:
+        st.caption("ℹ️ " + note)
+    if not b["ok"]:
+        st.info(b.get("message", INSUFFICIENT_MSG))
+        return
+    for n in b["notes"]:
+        st.caption(n)
+
+    counts = {k: v["counts"] for k, v in b["entities"].items()}
+    n_high = sum(c_["High Risk"] for c_ in counts.values())
+    n_watch = sum(c_["Watch"] for c_ in counts.values())
+    attention = []
+    for k, info in b["entities"].items():
+        t = info["table"]
+        for _, r in t[t["Health"].isin(["🔴 HIGH RISK", "🟡 WATCH"])].iterrows():
+            attention.append({"Type": QUERY_LABELS[k], "Name": r[info["gcol"]], "Status": r["Health"], "Calls": int(r["Calls"]), "Why": r["Health_Reason"]})
+    attention.sort(key=lambda a: (a["Status"] != "🔴 HIGH RISK", -a["Calls"]))
+    net = b["network"]
+    head = f"Network: {net['Health']} ({b['n_calls']:,} calls)" if net else f"{b['n_calls']:,} calls"
+    top = "; ".join(f"{a['Type']} '{a['Name']}' ({a['Why'].split(' and ')[0].split(',')[0]})" for a in attention if a["Status"] == "🔴 HIGH RISK")[:260]
+    summary = f"{head}: {n_high} high-risk, {n_watch} on watch, {b['n_anomalies']} anomal{'y' if b['n_anomalies'] == 1 else 'ies'}."
+    if n_high or b["n_anomalies"]:
+        st.error("🚨 " + summary + (f" Needs attention: {top}." if top else ""))
+    elif n_watch:
+        st.warning("🟡 " + summary)
+    else:
+        st.success("🟢 " + summary + " Nothing needs attention.")
+
+    rows = [{"Type": QUERY_LABELS[k], "🔴 High Risk": c_["High Risk"], "🟡 Watch": c_["Watch"], "🟢 Healthy": c_["Healthy"],
+             "⚪ Insufficient Data": c_["Insufficient Data"], "Active": sum(c_.values())} for k, c_ in counts.items()]
+    if rows:
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    with st.expander(f"⚠️ Needs attention: High Risk and Watch ({len(attention)})", expanded=bool(n_high)):
+        if attention:
+            st.dataframe(pd.DataFrame(attention), width="stretch", hide_index=True)
+        else:
+            st.caption("No publisher, buyer or campaign is High Risk or on Watch.")
+        st.caption("Status rules (adjustable in the sidebar Health thresholds): " + "; ".join(health_rules_markdown().split("\n")[0:1]))
+    with st.expander(f"🔎 Anomalies and likely causes ({b['n_anomalies']})", expanded=bool(b["n_anomalies"])):
+        if not b["rc"]:
+            st.caption("No anomalies: no significant change, or not enough data in both periods. Rules: " + anomaly_rules_text())
+        for item in b["rc"]:
+            st.markdown(f"**{QUERY_LABELS[item['entity_type']]} '{item['entity']}': {item['anomaly']}**  \n{item['details']}")
+            ex = item["explain"]
+            if ex is None and item["calls_before"] == 0:
+                st.caption(f"New this period: no calls in the previous period, so the cause is simply that it started sending {item['calls_now']:,} calls.")
+            elif ex is None and item["calls_now"] == 0:
+                st.caption(f"No calls this period (it had {item['calls_before']:,} before): it stopped sending traffic.")
+            elif ex is None:
+                st.caption("A cause breakdown is not available for this anomaly.")
+            elif ex["drivers"]:
+                for d in ex["drivers"]:
+                    st.markdown("- " + d["text"])
+                st.caption("Each line is a separate view of the same change (they overlap, so they do not add up).")
+            else:
+                st.caption(ex["summary"])
+        if b["n_anomalies"] > len(b["rc"]):
+            st.caption(f"Causes are shown for the {len(b['rc'])} largest of {b['n_anomalies']} anomalies; the rest are listed in the Query Layer → Anomalies.")
+        picks = [i for i in b["rc"] if i["explain"]]
+        if picks:
+            names = [f"{QUERY_LABELS[i['entity_type']]} '{i['entity']}': {i['metric']}" for i in picks]
+            sel = st.selectbox("Segment breakdown for:", names, key="s6_pick")
+            ex = picks[names.index(sel)]["explain"]
+            st.caption(f"{ex['calls_before']:,} calls before, {ex['calls_now']:,} now. Contribution = how much of the change each segment explains; the contributions of one dimension add up to the total change.")
+            for label, t in ex["tables"].items():
+                show = t.reindex(t["contribution"].abs().sort_values(ascending=False).index).head(6).reset_index()
+                show.columns = [label] + list(show.columns[1:])
+                show = show.rename(columns={"n_p": "Calls before", "n_c": "Calls now", "share_p": "Share before %", "share_c": "Share now %",
+                                            "rate_p": "Rate before", "rate_c": "Rate now", "contribution": "Contribution",
+                                            "explained": "Explained %", "effect": "Main effect"})
+                st.markdown(f"**By {label.lower()}**")
+                st.dataframe(show[[label, "Calls before", "Calls now", "Share before %", "Share now %", "Rate before", "Rate now", "Contribution", "Explained %", "Main effect"]].round(1),
+                             width="stretch", hide_index=True)
+    with st.expander(f"✅ Recommended actions: advisory only ({len(b['recs'])})", expanded=bool(b["recs"])):
+        st.warning(STEP6_ADVISORY_TEXT)
+        if b["recs"]:
+            rec_df = pd.DataFrame(b["recs"])[["Priority", "Type", "Name", "Suggestion", "Why", "Rule", "Calls"]]
+            st.dataframe(rec_df, width="stretch", hide_index=True)
+            st.download_button("📥 Download Suggestions as CSV", rec_df.to_csv(index=False).encode("utf-8"),
+                               file_name="advisory_suggestions.csv", mime="text/csv", key="dl_s6_recs")
+        else:
+            st.caption("No suggestions: nothing crosses a rule.")
+        st.caption("Rules: spam / VoIP / qualification / score levels come from the Health thresholds; anomaly suggestions come from the anomaly rules; "
+                   "entities with too little data or QC are never judged. Nothing is applied automatically.")
+
+
 def render_query_layer(df, available_columns, overrides, sidebar_timeline):
     """Panel for the Analytics Query Layer: choose timeline, grouping and filters, then read
     statistics, rankings, daily breakdown, period comparison, anomalies and the matching calls."""
     cols = resolve_query_columns(available_columns, overrides)
-    qf = prepare_query_frame(df, cols)
+    qf = get_query_frame(df, cols, copy=True)   # same result as prepare_query_frame(), reused from the briefing
     st.markdown("---")
     with st.expander("🔎 Analytics Query Layer (any field, any combination)"):
         st.caption(
@@ -2558,6 +4063,9 @@ def render_query_layer(df, available_columns, overrides, sidebar_timeline):
         missing = [QUERY_LABELS[k] for k, v in cols.items() if v is None]
         if missing:
             st.info("Columns not found in the sheet: " + ", ".join(missing) + ". Queries that need them report that the information is not available.")
+
+        render_query_assistant(qf, cols, df)
+        st.markdown("---")
 
         # ---- timeline (same date logic as the sidebar) ----
         choice = st.selectbox("Timeline:", ["Same as sidebar"] + DATE_PRESETS, key="q_timeline")
@@ -2976,6 +4484,12 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
     # ---------------------------------------------------------------
     # KPI metrics: counts with their percentage of total calls (selected timeline)
     # ---------------------------------------------------------------
+    # Step 6: Network Intelligence briefing (advisory only; reads the loaded sheet through Step 5A)
+    render_network_briefing(
+        df, available_columns,
+        {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
+        timeline,
+    )
     top_issues_slot = st.container()  # filled further down, once the group-by choice is known
     st.markdown("### 📈 Network Overview & Key Metrics")
     if len(work_df) == 0:
