@@ -3280,8 +3280,8 @@ def run_nl_deterministic(nlq, qf, cols):
 # ---------------- System 2: AI API ----------------
 AI_PROVIDERS = {
     "Groq": {"secrets": ("GROQ_API_KEY", "GROQ_SECONDARY_API_KEY", "GROQ_API_KEY_3", "GROQ_API_KEY_4"),
-             "model": "llama-3.3-70b-versatile"},
-    "Gemini": {"secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "model": "gemini-2.5-flash"},
+             "model": "openai/gpt-oss-20b"},
+    "Gemini": {"secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "model": "gemini-1.5-flash"},
 }
 
 
