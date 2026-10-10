@@ -139,6 +139,32 @@ def open_spreadsheet(gc, name, ref):
     return matches[0], matches
 
 
+# Some tabs (for example the live Ringba feed tab "Sheet1") name a column differently. Rows of every tab are combined by header name,
+# so without this a differently named column leaves the canonical column blank for that tab's rows (shown as "Unknown").
+HEADER_ALIASES = {"Campaign": ["get_campaign_category", "campaign category", "campaign name", "campaign_name", "campaign"]}
+
+
+def unify_header_aliases(frame):
+    """Rename / merge alias headers into the canonical header. Blank canonical cells are filled from the alias column; nothing else changes."""
+    frame = frame.copy()
+    for canon, aliases in HEADER_ALIASES.items():
+        low = {str(c).strip().lower(): c for c in frame.columns}
+        have = low.get(canon.lower())
+        for al in aliases:
+            col = low.get(al.lower())
+            if col is None or col == have:
+                continue
+            if have is None:
+                frame = frame.rename(columns={col: canon})
+                have = canon
+            else:
+                blank = frame[have].astype(str).str.strip() == ""
+                frame.loc[blank, have] = frame.loc[blank, col]
+                frame = frame.drop(columns=[col])
+            low = {str(c).strip().lower(): c for c in frame.columns}
+    return frame
+
+
 def worksheet_to_frame(worksheet):
     """One tab -> clean DataFrame (None when it has no data rows). A 'Source Tab' column is added."""
     rows = worksheet.get_all_values()
@@ -151,6 +177,7 @@ def worksheet_to_frame(worksheet):
     # drop template/placeholder rows such as "[Call:CreatedAt]" / "[tag:Buyer:Name]"
     is_placeholder = frame.astype(str).apply(lambda c: c.str.strip().str.match(r"^\[[^\]]+\]$")).any(axis=1)
     frame = frame[~is_placeholder].reset_index(drop=True)
+    frame = unify_header_aliases(frame)
     frame["Source Tab"] = worksheet.title
     return frame
 
@@ -669,9 +696,14 @@ def health_widget_key(rule, idx):
     return f"health_{rule}_{idx}"
 
 
+HEALTH_ALL_CALLS_KEY, HEALTH_NO_QC_GATE_KEY = "health_all_calls", "health_no_qc_gate"
+
+
 def reset_health_settings():
     for rule, idx, *_ in HEALTH_WIDGETS:
         st.session_state.pop(health_widget_key(rule, idx), None)
+    st.session_state[HEALTH_ALL_CALLS_KEY] = False
+    st.session_state[HEALTH_NO_QC_GATE_KEY] = False
 
 
 def apply_health_settings():
@@ -680,7 +712,11 @@ def apply_health_settings():
     milder than the watch level) fall back to the defaults, with a warning."""
     values = {}
     with st.sidebar.expander("🩺 Health Status Thresholds"):
-        st.caption("Change when a publisher / buyer / campaign counts as WATCH or HIGH RISK.")
+        st.caption("Change when a publisher / buyer / campaign counts as WATCH or HIGH RISK. Use Reset to defaults at any time.")
+        all_calls = st.checkbox("Rate ALL calls: volume does not matter (a status is shown even for 1 call)", key=HEALTH_ALL_CALLS_KEY,
+                                help="Sets 'minimum calls for a status', 'minimum calls for HIGH RISK' and 'minimum QC-completed calls' to 1 while ticked.")
+        no_gate = st.checkbox("Also rate groups whose AI QC is incomplete", key=HEALTH_NO_QC_GATE_KEY,
+                              help="Sets the minimum QC completion to 0%. Qualification and spam are shares of ALL calls, so groups with missing QC can look worse than they are.")
         for rule, idx, label, lo, hi, step, kind in HEALTH_WIDGETS:
             default = HEALTH_DEFAULTS[rule] if idx is None else HEALTH_DEFAULTS[rule][idx]
             values[(rule, idx)] = st.number_input(
@@ -711,6 +747,12 @@ def apply_health_settings():
             "be stricter than the watch level, and HIGH RISK needs at least as many calls as a status). "
             "The default values are used for those."
         )
+    if all_calls:
+        new_rules.update(min_calls=1, min_calls_high_risk=1, min_qc_calls=1)
+        st.sidebar.caption("🩺 Rating ALL calls: volume minimums are overridden (1 call is enough).")
+    if no_gate:
+        new_rules["min_qc_completion"] = 0.0
+        st.sidebar.caption("🩺 Groups with incomplete AI QC are rated too (their qualification / spam % may look worse than reality).")
     HEALTH_RULES.update(new_rules)
     changed = [k for k in HEALTH_DEFAULTS if HEALTH_RULES[k] != HEALTH_DEFAULTS[k]]
     if changed:
@@ -3281,7 +3323,7 @@ def run_nl_deterministic(nlq, qf, cols):
 AI_PROVIDERS = {
     "Groq": {"secrets": ("GROQ_API_KEY", "GROQ_SECONDARY_API_KEY", "GROQ_API_KEY_3", "GROQ_API_KEY_4"),
              "model": "openai/gpt-oss-20b"},
-    "Gemini": {"secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "model": "gemini-1.5-flash"},
+    "Gemini": {"secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "model": "gemini-flash-latest"},
 }
 
 
@@ -3366,7 +3408,7 @@ AI_LOG = logging.getLogger("ringba.ai")
 PROVIDER_LABELS = {"local": "Local AI route", "groq": "Groq", "gemini": "Gemini"}
 _CLOUD_NAME = {"groq": "Groq", "gemini": "Gemini"}
 AI_MAX_PROMPT_CHARS = 60000
-_AI_STATE = {"health": {}, "cool": {}, "bad": {}}      # shared, non-sensitive: provider -> (ok, kind, until)
+_AI_STATE = {"health": {}, "cool": {}, "bad": {}, "gmodel": {}}      # shared, non-sensitive: provider -> (ok, kind, until)
 
 
 def _ai_now():
@@ -3475,7 +3517,24 @@ def ai_provider_order():
 def _ai_model(name):
     if name == "local":
         return (ai_local_route()[0] or {}).get("model") or ""
-    return _cfg(name.upper() + "_MODEL") or AI_PROVIDERS[_CLOUD_NAME[name]]["model"]
+    return _cfg(name.upper() + "_MODEL") or (_AI_STATE["gmodel"].get("m") if name == "gemini" else None) or AI_PROVIDERS[_CLOUD_NAME[name]]["model"]
+
+
+def _gemini_discover(key):
+    """Newest Gemini 'flash' text model this key may use (Google retires models for new keys, so a fixed name can 404)."""
+    data = _http_get_json("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", {"x-goog-api-key": key}, 8)
+    best, best_score = None, None
+    for m in data.get("models", []) if isinstance(data, dict) else []:
+        nm = str(m.get("name", "")).replace("models/", "")
+        if "generateContent" not in (m.get("supportedGenerationMethods") or []) or not nm.startswith("gemini-") or "flash" not in nm:
+            continue
+        if re.search(r"tts|image|embed|live|audio|robot|computer|vision|learnlm|exp", nm):
+            continue
+        ver = re.search(r"gemini-(\d+(?:\.\d+)?)", nm)
+        score = (float(ver.group(1)) if ver else 0.0, "preview" not in nm, "lite" not in nm, "latest" not in nm)
+        if best_score is None or score > best_score:
+            best, best_score = nm, score
+    return best
 
 
 def ai_health(name, force=False):
@@ -3548,7 +3607,17 @@ def _ai_cloud_call(name, system_prompt, user_prompt, json_mode, timeout):
     last = None
     for key in keys:
         try:
-            return call_ai_provider(provider, key, _ai_model(name), system_prompt, user_prompt, json_mode=json_mode, timeout=timeout)
+            try:
+                return call_ai_provider(provider, key, _ai_model(name), system_prompt, user_prompt, json_mode=json_mode, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                if not (name == "gemini" and exc.code == 404 and not _cfg("GEMINI_MODEL") and not _AI_STATE["gmodel"].get("tried")):
+                    raise
+                _AI_STATE["gmodel"]["tried"] = True                  # model retired for this key: find one it can use, once
+                found = _gemini_discover(key)
+                if not found or found == _ai_model(name):
+                    raise
+                _AI_STATE["gmodel"]["m"] = found
+                return call_ai_provider(provider, key, found, system_prompt, user_prompt, json_mode=json_mode, timeout=timeout)
         except Exception as exc:
             last = exc
             if classify_ai_error(exc) in ("auth", "rate_limit"):
@@ -6617,7 +6686,7 @@ if st.sidebar.button("🔄 Connect & Load Fresh Data") or "sheet_loaded" not in 
             st.session_state["sheet_loaded"] = False
         else:
             # Rows of every tab are kept (duplicates included); columns are matched by header name.
-            df = pd.concat(frames, ignore_index=True).fillna("")
+            df = unify_header_aliases(pd.concat(frames, ignore_index=True).fillna(""))
 
             st.session_state["df"] = df
             st.session_state["meta"] = {
@@ -6663,6 +6732,17 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
             )
             for u in meta["duplicates"]:
                 st.sidebar.write(u)
+
+    _camp_col = find_col(available_columns, ["Campaign"], ["campaign"])
+    if _camp_col:
+        _blank = int((df[_camp_col].astype(str).str.strip() == "").sum())
+        if _blank:
+            _where = ""
+            if "Source Tab" in df.columns:
+                _by_tab = df.loc[df[_camp_col].astype(str).str.strip() == "", "Source Tab"].value_counts()
+                _where = " (" + ", ".join(f"{t}: {n:,}" for t, n in _by_tab.items()) + ")"
+            st.sidebar.warning(f"{_blank:,} row(s) have no value in the '{_camp_col}' column{_where}; they show as 'Unknown'. "
+                               "Check that column's header / cells in that tab.")
 
     work_df = df.copy()
 
