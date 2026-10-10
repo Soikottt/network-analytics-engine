@@ -2099,14 +2099,16 @@ CHANGE_COLUMN = {
 TREND_LABELS = {"improving": "↑ Improving", "declining": "↓ Declining", "stable": "→ Stable", "n/a": "n/a"}
 
 
-def _compare_core(frame, cols, by, timeline):
-    """Shared by compare_group_periods() and detect_anomalies()."""
+def _compare_core(frame, cols, by, timeline, reference=None):
+    """Shared by compare_group_periods() and detect_anomalies().
+    reference = the WHOLE (unfiltered) frame. When `frame` is a filtered subset (one publisher), the "same elapsed time"
+    cut-off must still come from the whole sheet, otherwise a publisher that stopped sending shows "0 before"."""
     if not timeline or timeline.get("start") is None or timeline.get("end") is None:
         return None, _unavailable("Period comparison", "All time has no comparison period")
     info = equivalent_previous(timeline["preset"], timeline["start"], timeline["end"])
     if info is None:
         return None, _unavailable("Period comparison", "no comparison period for this timeline")
-    win = trend_windows(info, timeline["start"], timeline["end"], frame)
+    win = trend_windows(info, timeline["start"], timeline["end"], frame if reference is None else reference)
     cur = slice_window(frame, *win["cur"])
     prev = slice_window(frame, *win["prev"])
     cur_f, gcols, missing = _with_group_columns(cur, cols, by)
@@ -2134,11 +2136,11 @@ def _pp(cur, prev):
     return float("nan") if pd.isna(cur) or pd.isna(prev) else cur - prev
 
 
-def compare_group_periods(frame, cols, by=None, timeline=None, title="Period comparison"):
+def compare_group_periods(frame, cols, by=None, timeline=None, title="Period comparison", reference=None):
     """Selected period vs its previous equivalent period for the network or ANY grouping.
     Columns: now / before / change for volume, qualification, spam, VoIP, score, duration, fake,
     plus a trend arrow per metric (same rules and minimum-data guards as the dashboard trends)."""
-    core, err = _compare_core(frame, cols, by, timeline)
+    core, err = _compare_core(frame, cols, by, timeline, reference)
     if err:
         err.title = title
         return err
@@ -2182,7 +2184,7 @@ def compare_group_periods(frame, cols, by=None, timeline=None, title="Period com
     }
     if core["cur_n"] == 0 or core["prev_n"] == 0:
         res.notes.append("One of the two periods has no calls, so trends are not available.")
-    first = frame["Parsed_Date"].min()
+    first = (frame if reference is None else reference)["Parsed_Date"].min()
     if pd.notna(first) and first > win["prev"][0]:
         res.notes.append(f"The comparison period starts before the first call in the sheet ({first:%b %d, %Y}); it may be incomplete.")
     return res
@@ -2336,11 +2338,11 @@ def _fmt_change(key, diff, prev):
     return f"{diff:+.0f}s"
 
 
-def detect_anomalies(frame, cols, by=None, timeline=None, title="Anomalies"):
+def detect_anomalies(frame, cols, by=None, timeline=None, title="Anomalies", reference=None):
     """Compare the selected period with the previous equivalent period and flag only SIGNIFICANT
     moves (the same 'significant' thresholds as the dashboard trends). Pure threshold rules; groups
     with too little data are skipped, never guessed. Works for the network or any grouping."""
-    core, err = _compare_core(frame, cols, by, timeline)
+    core, err = _compare_core(frame, cols, by, timeline, reference)
     if err:
         err.title = title
         return err
@@ -3801,6 +3803,9 @@ def explain_anomaly(frame, cols, win, entity_key, entity_name, metric):
     parts = []
     for w in (win["cur"], win["prev"]):
         f = slice_window(frame, *w)
+        if entity_key is None:          # Step 7: the whole network (or the already-filtered frame)
+            parts.append(_add_driver_columns(f, cols))
+            continue
         g, gcols, missing = _with_group_columns(f, cols, [entity_key])
         if missing or g.empty:
             return None
@@ -4046,6 +4051,951 @@ def render_network_briefing(df, available_columns, overrides, timeline):
             st.caption("No suggestions: nothing crosses a rule.")
         st.caption("Rules: spam / VoIP / qualification / score levels come from the Health thresholds; anomaly suggestions come from the anomaly rules; "
                    "entities with too little data or QC are never judged. Nothing is applied automatically.")
+
+
+# ---------------------------------------------------------------
+# Step 7: AI Network Operations Assistant
+#
+# A conversational layer on top of Steps 5A, 5B and 6. It only ROUTES a question to the existing engines and
+# arranges what they return as  Answer / Evidence / Interpretation / Recommended next step:
+#   * numbers, rankings, comparisons ........ Step 5A (get_group_stats, compare_group_periods, filter_calls, ...)
+#   * supported plain questions ............. Step 5B (parse_nl_question + run_nl_deterministic)
+#   * health, anomalies, causes, advice ..... Step 6 (compute_step6, explain_anomaly, build_recommendations)
+# Nothing is calculated by an AI. The optional AI step only REWORDS the already-verified findings in plain English;
+# its text is rejected unless every number and name in it appears in those findings.
+# The assistant is advisory: it never routes, blocks, pauses or changes anything.
+# ---------------------------------------------------------------
+OPS_ADVISORY = "Advisory only: this assistant explains your data. It never routes, blocks, pauses or changes anything."
+OPS_EXAMPLES = [
+    "How is my network performing this week?",
+    "Which publishers are performing poorly?",
+    "Why did qualification drop this week?",
+    "Which campaigns contributed most to that drop?",
+    "Is publisher <name> improving or declining?",
+    "What changed compared with last week?",
+    "Which campaigns should I investigate first?",
+]
+# words that are part of THIS assistant's vocabulary (so they are never mistaken for a publisher / buyer / campaign name);
+# added to Step 5B's NL_STOP only while the assistant parses a question (Step 5B itself is unchanged)
+OPS_STOP = set("""should i we you do does did would could can will shall am is are was were has have had be been being my our your me us
+    qualification qualified qualify spam spammy robo robocalls voip fake score scores duration volume rate rates calls call traffic first most least
+    why drop dropped decrease decreased decreasing increase increased fall fell rise rose jump change changed
+improving declining trend trending performing performance poorly poor network operations recommend recommendation
+explain simpler terms contributed contribute contribution drove driver conclusion supporting investigate next anything
+risk risky attention health briefing issue issues problem problems""".split())
+OPS_METRIC_WORDS = [   # (regex, Step 5A metric)
+    (r"qualif\w*", "Qualification %"), (r"\bspam\w*|robo\w*", "Spam %"), (r"\bvoip\b", "VoIP %"), (r"\bfake\b", "Fake %"),
+    (r"quality score|\bscore\b", "Avg Score"), (r"duration|call length", "Avg Duration (sec)"),
+    (r"volume|call count|number of calls|\bcalls\b|traffic", "Calls"),
+]
+OPS_COLS = {   # metric -> (label used in compare_group_periods, change column)
+    "Calls": ("Calls", "Volume change"), "Qualification %": ("Qualification %", "Qualification % change"),
+    "Spam %": ("Spam %", "Spam % change"), "VoIP %": ("VoIP %", "VoIP % change"), "Fake %": ("Fake %", "Fake % change"),
+    "Avg Score": ("Avg Score", "Avg Score change"), "Avg Duration (sec)": ("Avg Duration", "Avg Duration change"),
+}
+OPS_TYPE_METRIC = {"qualified": "Qualification %", "spam": "Spam %", "voip": "VoIP %"}
+OPS_DOWN = r"drop\w*|decreas\w*|declin\w*|fell|fall\w*|lower|down|worse|worsen\w*|dip\w*|slump\w*|reduc\w*|less"
+OPS_UP = r"increas\w*|rose|rise\w*|jump\w*|spik\w*|higher|up|better|improv\w*|grew|grow\w*|more"
+OPS_INTENTS = [   # checked in this order
+    ("unsupported", r"\b(revenue|payouts?|profit\w*|margins?|roi|spend|earn\w*|commissions?|rpc|conversion rate|ltv)\b"
+                   r"|\b(forecast\w*|predict\w*|projection\w*|will (?:we|it|they|the) )"
+                   r"|^\s*(?:please )?(?:block|pause|suspend|disable|reroute|route|cap|shut|ban|terminate)\b"
+                   r"|\b(?:run|execute) (?:python|sql|code|a script|a command)\b|\bsql\b|\bpython\b"),
+    ("simplify", r"\b(simpler|simple terms|plain (?:english|language)|layman|eli5|in other words|dumb (?:it )?down|explain (?:that|it|this) (?:again|better|simply))\b"),
+    ("calls", r"\b(supporting|behind|evidence)\b.*\b(calls?|records?)\b|\b(calls?|records?)\b.*\b(supporting|behind|evidence|conclusion)\b"),
+    ("compare_prev", r"\bcompare\w* (?:that|this|it|those)\b|\b(?:that|this|it|those)\b.*\bcompared? (?:with|to|against)\b"),
+    ("contributors", r"\bcontribut\w*|\bdrove\b|\bdrivers?\b|responsible for|\bbehind (?:that|the|this) (?:drop|change|decrease|increase|rise|spike)"),
+    ("why", r"\bwhy\b|\bwhat caused\b|\bwhat (?:happened|is going on|went wrong)\b"),
+    ("recs", r"\brecommend\w*|\bwhat (?:should|would|could) (?:i|we) do\b|\bwhat next\b|\bnext steps?\b|\binvestigate first\b|\bshould i (?:investigate|look|check|review|start)\b"
+            r"|\bprioriti[sz]e\b|\bwhere (?:should|do) (?:i|we) start\b"),
+    ("trend", r"\b(?:improving|declining|getting (?:better|worse)|trending|deteriorating)\b"),
+    ("changes", r"\bwhat (?:has |have )?(?:changed|moved)\b|\bwhat.s different\b|\bwhat is different\b"),
+    ("poor", r"\b(?:poor\w*|badly|worst performing|underperform\w*|problem\w*|at risk|risky|high[- ]risk|needs? attention|struggling|unhealthy|suspicious|fraud\w*)\b"),
+    ("overview", r"\bhow (?:is|are) (?:my |the |our )?(?:network|traffic|business|we|things|everything)\b|\bnetwork (?:performance|health|status|overview)\b"
+                 r"|\boverall (?:performance|health)\b|\bhealth (?:check|briefing|summary)\b|\bhow (?:am|are) (?:i|we) doing\b"),
+]
+_OPS_FOLLOW_CUE = re.compile(r"\b(?:that|those|it|them|this|these)\b|^\s*(?:and\s+)?(?:what|how) about\b|^\s*and (?:for|in)\b|\bsame\b")
+
+
+@dataclass
+class OpsAnswer:
+    """One assistant reply. `facts` are the verified statements the AI wording step may reuse (nothing else)."""
+    status: str = "ok"                 # ok | clarify | unavailable | unsupported
+    kind: str = ""
+    answer: str = ""
+    simple: str = ""
+    scope: str = ""                    # active filters, period and basis (always shown)
+    evidence: list = field(default_factory=list)       # [(title, DataFrame | list of text lines)]
+    observed: list = field(default_factory=list)       # facts from Step 5A / 6
+    possible: list = field(default_factory=list)       # hypotheses, never presented as proven
+    steps: list = field(default_factory=list)          # advisory next steps
+    caveats: list = field(default_factory=list)
+    clarify: list = field(default_factory=list)
+    calls: pd.DataFrame = None
+    calls_desc: str = ""
+    sources: list = field(default_factory=list)        # existing functions that produced the numbers
+    request: dict = None               # what to re-run for follow-ups
+    names: list = field(default_factory=list)          # entity / segment names in the text (aliased before any AI call)
+    ai_text: str = None                # optional, validated AI wording
+    ai_note: str = None
+
+    @property
+    def facts(self):
+        return [self.answer] + list(self.observed) + ["Possible explanation (not proven): " + p for p in self.possible] + list(self.steps)
+
+
+def _ops_scope_text(entity, tl, extra=None, compare=None):
+    bits = [f"{QUERY_LABELS[entity[0]]}: {entity[1]}" if entity else "Whole network"]
+    bits.append("Period: " + (_tl_text(*tl) if tl else "All time"))
+    if compare:
+        bits.append("Compared with: " + compare)
+    bits += [b for b in (extra or []) if b]
+    return " · ".join(bits)
+
+
+def _ops_period(tl_pair, sidebar_tl, today):
+    """(label, timeline, note). A period from the question / context when it has dates, else the sidebar period,
+    else the last 7 days (All time has no comparison period)."""
+    if tl_pair and tl_pair[1].get("start") is not None:
+        return tl_pair[0], tl_pair[1], None
+    if sidebar_tl and sidebar_tl.get("start") is not None and sidebar_tl.get("end") is not None:
+        return sidebar_tl.get("preset", "Period"), sidebar_tl, "No period with dates was given, so the sidebar period is used."
+    tl = make_timeline("Last 7 days", today=today)
+    return "Last 7 days", tl, "No period with dates was given, so the last 7 days is used (All time has no comparison period)."
+
+
+def _ops_light_parse(question, qf, cols, today, focus, previous):
+    """Entities and periods of a question with the Step 5B helpers (no intent logic)."""
+    nlq = NLQuery(question=str(question or "").strip())
+    ql, qn = nlq.question.lower(), _nl_norm(nlq.question)
+    nlq.timelines = _nl_timelines(ql, today, nlq)
+    added = OPS_STOP - NL_STOP
+    NL_STOP.update(added)
+    try:
+        _nl_entities(qn, qf, cols, nlq, focus or {}, previous)
+    finally:
+        NL_STOP.difference_update(added)
+    return nlq
+
+
+def _ops_metric(ql):
+    return next((m for pat, m in OPS_METRIC_WORDS if re.search(pat, ql)), None)
+
+
+def _ops_nl_metric(nlq):
+    """The metric an earlier Step 5B question was about (for 'why did it decrease?')."""
+    if nlq is None:
+        return None, None
+    if nlq.metric in OPS_COLS:
+        return nlq.metric, None
+    ct = nlq.spec.get("call_type")
+    if ct in OPS_TYPE_METRIC:
+        return OPS_TYPE_METRIC[ct], f"'{ct} calls' is analysed as {OPS_TYPE_METRIC[ct]} (the share of all calls), which separates a real change from a change in volume."
+    if nlq.intent in ("count", "calls", "metric") and not ct:
+        return "Calls", None
+    return None, None
+
+
+_OPS_S6_KEY = "ops_s6_cache"
+
+
+def _ops_step6(qf, cols, tl):
+    """Step 6 briefing for a period (cached for the session; the dashboard briefing computes the same thing)."""
+    key = (id(qf), tl.get("preset"), str(tl.get("start")), str(tl.get("end")),
+           tuple(sorted((k, str(v)) for k, v in HEALTH_RULES.items())), tuple(sorted((k, str(v)) for k, v in cols.items())))
+    c = st.session_state.get(_OPS_S6_KEY)
+    if c and c["key"] == key:
+        return c["b"]
+    b = compute_step6(qf, cols, tl)
+    st.session_state[_OPS_S6_KEY] = {"key": key, "b": b}
+    return b
+
+
+def _ops_qc_caveat(core, metric):
+    """Warn when the AI QC is mostly missing in a period: QC-based metrics are then understated, not real."""
+    if metric not in ("Qualification %", "Spam %"):
+        return None
+    msgs = []
+    for tag, k in (("previous", "prev_stats"), ("current", "cur_stats")):
+        t = core.get(k)
+        if t is not None and len(t) and "QC Done" in t.columns and float(t["Calls"].sum()):
+            done = float(t["QC Done"].sum()) / float(t["Calls"].sum()) * 100
+            if done < 80:
+                msgs.append(f"AI QC is complete for only {done:.0f}% of the {tag} period's calls")
+    if msgs:
+        return "; ".join(msgs) + f", so the change in {metric} may reflect missing QC rather than real performance."
+    return None
+
+
+def ops_change_analysis(qf, cols, entity, tl, metric=None):
+    """How one scope (a publisher / buyer / campaign, or the whole network) changed between `tl` and its previous
+    equivalent period: the Step 5A comparison, the Step 5A anomaly flag and, for a metric, the Step 6 segment
+    breakdown. {'error': text} when it cannot be worked out (never a guessed number)."""
+    spec = {entity[0]: entity[1]} if entity else {}
+    scope = filter_calls(qf, cols, spec, title="Scope")
+    if not scope.available:
+        return {"error": scope.message}
+    comp = compare_group_periods(scope.data, cols, None, tl, reference=qf)
+    if not comp.available:
+        return {"error": comp.message}
+    if comp.data is None or comp.data.empty:
+        return {"error": f"{INSUFFICIENT_MSG} No calls in either period."}
+    row = comp.data.iloc[0]
+    n_now, n_before = int(row["Calls (now)"]), int(row["Calls (before)"])
+    det = detect_anomalies(scope.data, cols, None, tl, reference=qf)
+    an = {"comp": comp, "row": row, "n_now": n_now, "n_before": n_before, "det": det, "win": comp.extra["win"], "info": comp.extra["info"],
+          "scope": scope.data, "spec": spec, "metric": metric, "ex": None, "flagged": False, "enough": True,
+          "now": None, "before": None, "chg": None, "qc_caveat": _ops_qc_caveat(comp.extra, metric)}
+    if metric:
+        lab, chg_col = OPS_COLS[metric]
+        an["now"], an["before"], an["chg"] = row[f"{lab} (now)"], row[f"{lab} (before)"], row[chg_col]
+        an["enough"] = (max(n_now, n_before) >= TREND_MIN_VOLUME) if metric == "Calls" else (min(n_now, n_before) >= TREND_MIN_CALLS)
+        an["flagged"] = bool(det.available and det.data is not None and not det.data.empty and (det.data["Metric"] == metric).any())
+        if an["enough"] and pd.notna(an["now"]) and pd.notna(an["before"]):
+            an["ex"] = explain_anomaly(qf, cols, an["win"], entity[0] if entity else None, entity[1] if entity else None, metric)
+    return an
+
+
+def _ops_metric_table(an):
+    """Before / now / change for every standard metric, straight from the Step 5A comparison row."""
+    r, rows = an["row"], []
+    tl = {k: label for k, label, _ in TREND_METRICS}
+    for m, (lab, chg_col) in OPS_COLS.items():
+        ch = r[chg_col]
+        rows.append({"Metric": m, "Before": fmt_trend_value(m, r[f"{lab} (before)"]), "Now": fmt_trend_value(m, r[f"{lab} (now)"]),
+                     "Change": "–" if pd.isna(ch) else _fmt_change(m, ch, r[f"{lab} (before)"]),
+                     "Trend (Step 5A)": r.get(f"Trend: {tl[m]}", "–") if m in tl else "–"})
+    return pd.DataFrame(rows)
+
+
+def _ops_segment_calls(frame, cols, dim_label, segment):
+    """The calls of one segment (a driver named by Step 6) from an already period-sliced frame."""
+    f = _add_driver_columns(frame, cols)
+    key = dict(RC_DIMS).get(dim_label)
+    if dim_label in f.columns:
+        return f[f[dim_label].astype(str) == str(segment)]
+    if key:
+        g, gcols, missing = _with_group_columns(f, cols, [key])
+        if not missing and len(g):
+            return f[(g[gcols[0]].astype(str) == str(segment)).values]
+    return f
+
+
+# ---------------- supporting records (masked) ----------------
+OPS_MAX_CALLS = 200
+
+
+def ops_mask_calls(calls, cols, limit=OPS_MAX_CALLS):
+    """Supporting records for display: the Caller ID is shortened to its last 4 digits; recordings, notes and summaries are left out."""
+    if calls is None or not len(calls):
+        return pd.DataFrame()
+    out = pd.DataFrame(index=calls.index)
+    for key, name in (("date", "Call Date"), ("buyer", "Buyer"), ("publisher", "Publisher"), ("campaign", "Campaign"), ("duration", "Duration"),
+                      ("score", "Quality Score"), ("line_type", "Line Type"), ("hangup", "Hangup By")):
+        c = cols.get(key)
+        if c and c in calls.columns:
+            out[name] = calls[c].astype(str)
+    if QC_PREFIX + "Call Type" in calls.columns:
+        out["Call Type (AI QC)"] = calls[QC_PREFIX + "Call Type"].astype(str)
+    c = cols.get("caller_id")
+    if c and c in calls.columns:
+        out["Caller ID (last 4)"] = "***" + calls[c].astype(str).str.replace(r"\D", "", regex=True).str[-4:]
+    return out.head(limit)
+
+
+def ops_request_calls(qf, cols, request):
+    """The calls behind an answer: Step 5A filter_calls for the same scope and period (and the named segment, if any)."""
+    spec = {}
+    if request.get("entity"):
+        spec[request["entity"][0]] = request["entity"][1]
+    tl = request["period"][1] if request.get("period") else None
+    if tl and tl.get("start") is not None:
+        spec["timeline"] = tl
+    res = filter_calls(qf, cols, spec, title="Supporting calls")
+    if not res.available:
+        return None, res.message
+    calls = res.data
+    if request.get("seg"):
+        calls = _ops_segment_calls(calls, cols, *request["seg"])
+    return calls, None
+
+
+# ---------------- answer builders ----------------
+def _ops_name(entity):
+    return f"{QUERY_LABELS[entity[0]].lower()} '{entity[1]}'" if entity else "the whole network"
+
+
+def _ops_dir_word(chg):
+    return "rose" if chg > 0 else "fell"
+
+
+def _ops_need_metric(scope_text):
+    return OpsAnswer(status="clarify", kind="need_metric", scope=scope_text,
+                     answer="Which measure do you mean: qualification rate, spam rate, VoIP rate, fake-number rate, average score, average duration or call volume?",
+                     clarify=["qualification", "spam", "VoIP", "fake", "score", "duration", "volume"])
+
+
+def _ops_why(qf, cols, ql, entity, period, metric, p_note, contributors, dim_label):
+    scope_txt = _ops_scope_text(entity, period)
+    if not metric:
+        return _ops_need_metric(scope_txt)
+    an = ops_change_analysis(qf, cols, entity, period[1], metric)
+    if an.get("error"):
+        return OpsAnswer(status="unavailable", kind="why", scope=scope_txt, answer=an["error"])
+    info = an["info"]
+    scope_txt = _ops_scope_text(entity, period, compare=f"{info['prev_name']} (Step 5A previous equivalent period)")
+    a = OpsAnswer(kind="contributors" if contributors else "why", scope=scope_txt, sources=["filter_calls", "compare_group_periods", "detect_anomalies", "explain_anomaly"])
+    a.names = [entity[1]] if entity else []
+    a.request = {"kind": a.kind, "entity": entity, "period": period, "metric": metric, "seg": None}
+    now, before, chg = an["now"], an["before"], an["chg"]
+    who = _ops_name(entity)
+    if p_note:
+        a.caveats.append(p_note)
+    a.observed.append(f"Calls: {an['n_before']:,} in {info['prev_name']}, {an['n_now']:,} in {info['cur_name']}.")
+    if an["qc_caveat"]:
+        a.caveats.append(an["qc_caveat"])
+    if pd.isna(now) or pd.isna(before) or pd.isna(chg):
+        a.status = "unavailable"
+        empty = info["prev_name"] if not an["n_before"] else info["cur_name"] if not an["n_now"] else None
+        a.answer = (f"There are no calls for {who} in {empty}, so {metric} cannot be compared." if empty
+                    else f"{metric} cannot be compared for {who}: it has no value in one of the two periods ({INSUFFICIENT_MSG})")
+        return a
+    empty = info["prev_name"] if not an["n_before"] else info["cur_name"] if not an["n_now"] else None
+    if empty:
+        a.status = "unavailable"
+        a.answer = f"There are no calls for {who} in {empty}, so {metric} cannot be compared."
+        return a
+    asked_down, asked_up = bool(re.search(OPS_DOWN, ql)), bool(re.search(OPS_UP, ql))
+    shown = f"{fmt_trend_value(metric, before)} → {fmt_trend_value(metric, now)} ({_fmt_change(metric, chg, before)})"
+    if chg == 0:
+        a.answer = f"{metric} did not change for {who}: {fmt_trend_value(metric, now)} in both periods."
+    else:
+        a.answer = f"{metric} {_ops_dir_word(chg)} for {who}: {shown}."
+        if (asked_down and chg > 0 and not asked_up) or (asked_up and chg < 0 and not asked_down):
+            a.answer = f"It did not move that way. {a.answer}"
+    a.simple = (f"{metric} {'went up' if chg > 0 else 'went down'} for {who}, from {fmt_trend_value(metric, before)} to {fmt_trend_value(metric, now)}."
+                if chg else f"{metric} stayed the same for {who}.")
+    if not an["enough"]:
+        a.observed.append(f"Too few calls for a reliable comparison (Step 5A needs at least {TREND_MIN_VOLUME if metric == 'Calls' else TREND_MIN_CALLS} calls per period).")
+        a.caveats.append("Limited data: treat this as a small-sample observation.")
+    else:
+        a.observed.append("Step 5A flags this move as a significant anomaly." if an["flagged"]
+                          else "Step 5A does not flag this move as a significant anomaly (it is within the usual thresholds).")
+    ex = an["ex"]
+    a.evidence.append(("Before and now (Step 5A)", _ops_metric_table(an)))
+    dims = [dim_label] if dim_label else None
+    if ex:
+        for d in ex["drivers"]:
+            a.observed.append("Step 6 breakdown: " + d["text"])
+            a.names.append(str(d["segment"]) if d["dimension"] in ("Campaign", "Buyer", "Publisher", "Phone Company") else "")
+        if not ex["drivers"]:
+            a.observed.append("Step 6 breakdown: " + ex["summary"])
+        shown_dims = [d for d in ex["tables"] if (dims is None or d in dims)]
+        if contributors and dim_label and dim_label not in ex["tables"]:
+            a.caveats.append(f"A {dim_label.lower()} breakdown is not available for this scope (the scope itself is that dimension, or the data is missing).")
+        for d in shown_dims:
+            t = ex["tables"][d]
+            show = t.reindex(t["contribution"].abs().sort_values(ascending=False).index).head(5).reset_index()
+            show.columns = [d] + list(show.columns[1:])
+            show = show.rename(columns={"n_p": "Calls before", "n_c": "Calls now", "share_p": "Share before %", "share_c": "Share now %", "rate_p": "Rate before",
+                                        "rate_c": "Rate now", "contribution": "Contribution", "explained": "Explained %", "effect": "Main effect"})
+            a.evidence.append((f"Where the change happened: by {d.lower()} (Step 6)",
+                               show[[d, "Calls before", "Calls now", "Share before %", "Share now %", "Rate before", "Rate now", "Contribution", "Explained %", "Main effect"]].round(1)))
+            if d in ("Campaign", "Buyer", "Publisher", "Phone Company"):
+                a.names += [str(x) for x in show[d]]
+        top_dim = None
+        if contributors and dim_label and ex["tables"].get(dim_label) is not None:
+            t = ex["tables"][dim_label]
+            delta = t["contribution"].sum()
+            if delta:
+                same = t[t["contribution"] * delta > 0].sort_values("contribution", key=lambda s_: s_.abs(), ascending=False)
+                if len(same):
+                    top = same.iloc[0]
+                    top_dim = (dim_label, same.index[0])
+                    a.answer += f" The largest contributor by {dim_label.lower()} is '{same.index[0]}' ({top['explained']:.0f}% of the change)."
+                    a.simple += f" Most of it came from {dim_label.lower()} '{same.index[0]}'."
+        if not top_dim and ex["drivers"]:
+            top_dim = (ex["drivers"][0]["dimension"], ex["drivers"][0]["segment"])
+        a.request["seg"] = top_dim
+        for d in ex["drivers"][:2]:
+            if d["effect"] == "mix":
+                a.possible.append(f"Traffic may have shifted towards {d['dimension'].lower()} '{d['segment']}' (for example a change in sources, caps or targeting). The data shows the shift, not its reason.")
+            else:
+                a.possible.append(f"{d['dimension']} '{d['segment']}' itself performed differently. Lead quality, buyer handling or rule changes are possible reasons; the data cannot show which.")
+        if a.possible:
+            a.possible.append("Things changing together is a correlation, not proof of cause.")
+    elif an["enough"]:
+        a.observed.append("A segment breakdown is not available for this change.")
+    if a.possible == [] and chg:
+        a.possible.append("No cause can be named from this data; the numbers show what changed, not why.")
+    if an["qc_caveat"]:
+        a.possible.insert(0, "The change may be partly or wholly an artefact of missing AI QC (calls without a QC result are not counted as qualified or spam).")
+    # advice grounded in the Step 6 action table
+    if an["flagged"]:
+        prio, tmpl = ANOMALY_ACTIONS.get(metric, ("Medium", "Review {label} '{name}' ({chg})."))
+        label = QUERY_LABELS[entity[0]].lower() if entity else "network"
+        step = tmpl.format(label=label, name=entity[1] if entity else "all calls", chg=_fmt_change(metric, chg, before)).replace(" 'all calls'", "")
+        if a.request["seg"]:
+            step += f" Start with {a.request['seg'][0].lower()} '{a.request['seg'][1]}'."
+        a.steps.append(step)
+    elif an["enough"]:
+        a.steps.append("No action is suggested by the Step 6 rules for a change of this size; keep watching it.")
+    a.names = [n for n in dict.fromkeys(a.names) if n]
+    return a
+
+
+def _ops_trend(qf, cols, entity, period, p_note):
+    scope_txt = _ops_scope_text(entity, period)
+    an = ops_change_analysis(qf, cols, entity, period[1], None)
+    if an.get("error"):
+        return OpsAnswer(status="unavailable", kind="trend", scope=scope_txt, answer=an["error"])
+    info, row = an["info"], an["row"]
+    scope_txt = _ops_scope_text(entity, period, compare=f"{info['prev_name']} (Step 5A previous equivalent period)")
+    a = OpsAnswer(kind="trend", scope=scope_txt, sources=["filter_calls", "compare_group_periods"], names=[entity[1]] if entity else [])
+    a.request = {"kind": "trend", "entity": entity, "period": period, "metric": None, "seg": None}
+    if p_note:
+        a.caveats.append(p_note)
+    imp, dec, stab = [], [], []
+    for key, label, _ in TREND_METRICS:
+        t = str(row.get(f"Trend: {label}", "n/a"))
+        (imp if "Improving" in t else dec if "Declining" in t else stab if "Stable" in t else []).append(label)
+    who = _ops_name(entity)
+    enough = str(row.get("Enough data", "")).startswith("Yes")
+    if not enough and not (imp or dec or stab):
+        a.status = "unavailable"
+        a.answer = f"There is not enough data to call a trend for {who}: {row.get('Enough data')}."
+        a.observed.append(f"Calls: {an['n_before']:,} before, {an['n_now']:,} now.")
+        return a
+    verdict = "mixed" if imp and dec else "improving" if imp else "declining" if dec else "stable"
+    a.answer = f"{who[0].upper() + who[1:]} is {verdict} compared with {info['prev_name']}."
+    if imp:
+        a.observed.append("Improving: " + ", ".join(imp) + ".")
+    if dec:
+        a.observed.append("Declining: " + ", ".join(dec) + ".")
+    if stab:
+        a.observed.append("Stable: " + ", ".join(stab) + ".")
+    a.observed.append(f"Calls: {an['n_before']:,} before, {an['n_now']:,} now.")
+    if not enough:
+        a.caveats.append(f"Limited data: {row.get('Enough data')}. Trends are only shown where Step 5A has enough calls.")
+    q = _ops_qc_caveat(an["comp"].extra, "Qualification %")
+    if q:
+        a.caveats.append(q)
+    a.evidence.append(("Before and now (Step 5A)", _ops_metric_table(an)))
+    a.simple = f"{who[0].upper() + who[1:]} looks {verdict} compared with {info['prev_name']}."
+    a.possible.append("A trend only describes direction; it does not say why it moved.")
+    return a
+
+
+def _ops_changes(qf, cols, entity, period, p_note):
+    scope_txt = _ops_scope_text(entity, period)
+    an = ops_change_analysis(qf, cols, entity, period[1], None)
+    if an.get("error"):
+        return OpsAnswer(status="unavailable", kind="changes", scope=scope_txt, answer=an["error"])
+    info, row = an["info"], an["row"]
+    scope_txt = _ops_scope_text(entity, period, compare=f"{info['prev_name']} (Step 5A previous equivalent period)")
+    a = OpsAnswer(kind="changes", scope=scope_txt, sources=["filter_calls", "compare_group_periods", "detect_anomalies", "compute_step6"], names=[entity[1]] if entity else [])
+    a.request = {"kind": "changes", "entity": entity, "period": period, "metric": None, "seg": None}
+    if p_note:
+        a.caveats.append(p_note)
+    t = _ops_metric_table(an)
+    a.evidence.append(("Before and now (Step 5A)", t))
+    bits = []
+    for m in ("Calls", "Qualification %", "Spam %", "VoIP %"):
+        r = t[t["Metric"] == m].iloc[0]
+        bits.append(f"{m} {r['Before']} → {r['Now']}")
+    a.answer = f"Compared with {info['prev_name']} for {_ops_name(entity)}: " + "; ".join(bits) + "."
+    a.simple = "The main numbers compared with the previous period: " + "; ".join(bits) + "."
+    a.observed.append(f"Calls: {an['n_before']:,} before, {an['n_now']:,} now.")
+    if not an["n_before"] or not an["n_now"]:
+        a.caveats.append(f"Limited data: {'the comparison period' if not an['n_before'] else 'the current period'} has no calls in the sheet, so changes cannot be calculated. "
+                         "(A period in progress is compared with the same elapsed time of the previous one.)")
+    q = _ops_qc_caveat(an["comp"].extra, "Qualification %")
+    if q:
+        a.caveats.append(q)
+    if entity:
+        det = an["det"]
+        flagged = det.data if det.available and det.data is not None else pd.DataFrame()
+        names = ["Metric", "Anomaly", "Previous", "Current", "Change"]
+        if len(flagged):
+            a.evidence.append(("Significant changes flagged by Step 5A", flagged[names]))
+            a.observed += [f"Step 5A flags: {r['Details']}" for _, r in flagged.iterrows()]
+        else:
+            a.observed.append("Step 5A flags no significant anomaly for this scope.")
+    else:
+        b = _ops_step6(qf, cols, period[1])
+        if b.get("ok"):
+            n = b["n_anomalies"]
+            a.observed.append(f"Step 6 found {n} anomal{'y' if n == 1 else 'ies'} among publishers, buyers and campaigns in this period.")
+            rows = [{"Type": QUERY_LABELS[i["entity_type"]], "Name": i["entity"], "Anomaly": i["anomaly"], "Change": i["change"], "Calls now": i["calls_now"]} for i in b["rc"]]
+            if rows:
+                a.evidence.append(("Anomalies by publisher / buyer / campaign (Step 6)", pd.DataFrame(rows)))
+                a.names += [str(r["Name"]) for r in rows]
+                a.steps += [r["Suggestion"] for r in b["recs"] if r["Rule"].startswith("A-")][:3]
+            if n > len(b["rc"]):
+                a.caveats.append(f"Only the {len(b['rc'])} largest of {n} anomalies are listed (Step 6 limit).")
+    a.possible.append("These are differences between two periods; they do not say what caused them. Ask 'Why did <metric> change?' for the Step 6 breakdown.")
+    a.names = [n for n in dict.fromkeys(a.names) if n]
+    return a
+
+
+def _ops_type_words(ql):
+    return [k for k, pat in (("publisher", r"\bpublishers?\b"), ("buyer", r"\bbuyers?\b"), ("campaign", r"\bcampaigns?\b")) if re.search(pat, ql)]
+
+
+def _ops_overview(qf, cols, period, p_note):
+    scope_txt = _ops_scope_text(None, period)
+    b = _ops_step6(qf, cols, period[1])
+    a = OpsAnswer(kind="overview", scope=scope_txt, sources=["compute_step6", "get_group_stats", "compare_group_periods"])
+    a.request = {"kind": "overview", "entity": None, "period": period, "metric": None, "seg": None}
+    if not b.get("ok"):
+        a.status, a.answer = "unavailable", b.get("message", INSUFFICIENT_MSG)
+        return a
+    if p_note:
+        a.caveats.append(p_note)
+    net = b["network"] or {}
+    counts = {k: v["counts"] for k, v in b["entities"].items()}
+    high, watch = sum(c["High Risk"] for c in counts.values()), sum(c["Watch"] for c in counts.values())
+    a.answer = (f"The network handled {b['n_calls']:,} calls in {period[0]}. Health: {net.get('Health', 'not rated')}. "
+                f"{high} publisher / buyer / campaign entries are High Risk, {watch} are on Watch, and {b['n_anomalies']} significant change(s) were flagged.")
+    a.simple = f"{b['n_calls']:,} calls. Overall health: {net.get('Health', 'not rated')}. {high} high-risk and {watch} watch-list entries."
+    if net.get("Health_Reason"):
+        a.observed.append("Step 6 health reason: " + str(net["Health_Reason"]))
+    qc = net.get("QC Completion %")
+    if qc is not None and pd.notna(qc) and qc < 80:
+        a.caveats.append(f"AI QC is complete for only {qc:.0f}% of these calls, so qualification, spam and health ratings are limited.")
+    an = ops_change_analysis(qf, cols, None, period[1], None)
+    if not an.get("error"):
+        a.evidence.append(("Before and now (Step 5A)", _ops_metric_table(an)))
+        a.observed.append(f"Calls: {an['n_before']:,} in {an['info']['prev_name']}, {an['n_now']:,} in {an['info']['cur_name']}.")
+        a.scope += f" · Compared with: {an['info']['prev_name']}"
+    rows = [{"Type": QUERY_LABELS[k], "High Risk": c["High Risk"], "Watch": c["Watch"], "Healthy": c["Healthy"], "Insufficient Data": c["Insufficient Data"]} for k, c in counts.items()]
+    if rows:
+        a.evidence.append(("Health by type (Step 6)", pd.DataFrame(rows)))
+    a.steps += [r["Suggestion"] for r in b["recs"][:3]]
+    a.possible.append("Health ratings follow fixed thresholds; they flag where to look, not why a number is what it is.")
+    return a
+
+
+def _ops_poor(qf, cols, ql, period, p_note):
+    scope_txt = _ops_scope_text(None, period)
+    b = _ops_step6(qf, cols, period[1])
+    a = OpsAnswer(kind="poor", scope=scope_txt, sources=["compute_step6", "get_group_stats"])
+    a.request = {"kind": "poor", "entity": None, "period": period, "metric": None, "seg": None}
+    if not b.get("ok"):
+        a.status, a.answer = "unavailable", b.get("message", INSUFFICIENT_MSG)
+        return a
+    if p_note:
+        a.caveats.append(p_note)
+    types = _ops_type_words(ql) or list(b["entities"])
+    rows, insufficient = [], 0
+    for k in types:
+        info = b["entities"].get(k)
+        if not info:
+            a.caveats.append(f"{QUERY_LABELS[k]} data is not available.")
+            continue
+        t = info["table"]
+        insufficient += int((t["Health"] == "⚪ INSUFFICIENT DATA").sum())
+        for _, r in t[t["Health"].isin(["🔴 HIGH RISK", "🟡 WATCH"])].iterrows():
+            rows.append({"Type": QUERY_LABELS[k], "Name": r[info["gcol"]], "Status": r["Health"], "Calls": int(r["Calls"]), "Why": r["Health_Reason"]})
+    rows.sort(key=lambda r: (r["Status"] != "🔴 HIGH RISK", -r["Calls"]))
+    label = "/".join(QUERY_LABELS[k].lower() + "s" for k in types)
+    if rows:
+        top = ", ".join(f"{r['Name']} ({'High Risk' if 'HIGH' in r['Status'] else 'Watch'})" for r in rows[:5])
+        a.answer = f"{len(rows)} of the {label} need attention in {period[0]}: {top}" + (" and more." if len(rows) > 5 else ".")
+        a.simple = f"{len(rows)} {label} look weak under the fixed rules. The first ones to look at: {top}."
+        a.evidence.append(("High Risk and Watch (Step 6)", pd.DataFrame(rows)))
+        a.names = [str(r["Name"]) for r in rows]
+        a.observed += [f"{r['Type']} '{r['Name']}': {r['Why']} ({r['Calls']:,} calls)" for r in rows[:5]]
+        a.steps += [r["Suggestion"] for r in b["recs"] if r["Type"] in {QUERY_LABELS[k] for k in types} and r["Priority"] in ("High", "Medium") and r["Rule"][:1] in ("S", "N")][:3]
+    else:
+        a.answer = f"None of the {label} is High Risk or on Watch in {period[0]} under the Step 6 rules."
+        a.simple = "Nothing crosses the warning rules in this period."
+    if insufficient:
+        a.caveats.append(f"{insufficient} entries have too little data or AI QC to be rated, so they are not counted as healthy or poor.")
+    a.possible.append("A 'poor' rating means a metric crosses a fixed threshold; the data does not show why.")
+    return a
+
+
+def _ops_recs(qf, cols, ql, entity, period, ctx, p_note):
+    types = _ops_type_words(ql)
+    if not types and not entity and ctx and ctx.get("request") and ctx["request"].get("metric") and ctx["request"].get("kind") in ("why", "contributors"):
+        r = ctx["request"]
+        a = _ops_why(qf, cols, "", r["entity"], r["period"], r["metric"], None, False, None)
+        a.kind = "recs"
+        return a
+    scope_txt = _ops_scope_text(entity, period)
+    b = _ops_step6(qf, cols, period[1])
+    a = OpsAnswer(kind="recs", scope=scope_txt, sources=["compute_step6", "build_recommendations"])
+    a.request = {"kind": "recs", "entity": entity, "period": period, "metric": None, "seg": None}
+    if not b.get("ok"):
+        a.status, a.answer = "unavailable", b.get("message", INSUFFICIENT_MSG)
+        return a
+    if p_note:
+        a.caveats.append(p_note)
+    recs = b["recs"]
+    if types:
+        recs = [r for r in recs if r["Type"] in {QUERY_LABELS[k] for k in types}]
+    if entity:
+        recs = [r for r in recs if str(r["Name"]) == str(entity[1])]
+    if not recs:
+        a.answer = "The Step 6 rules do not suggest anything to investigate for this scope and period."
+        a.simple = "Nothing needs attention under the fixed rules."
+        return a
+    top = recs[:5]
+    a.answer = "Start with " + "; then ".join(f"{r['Type'].lower()} '{r['Name']}'" for r in top[:3]) + ". They are ranked by priority, then by call volume."
+    a.simple = "The first things to check are: " + ", ".join(f"{r['Name']}" for r in top[:3]) + "."
+    a.names = [str(r["Name"]) for r in top]
+    a.steps = [f"{r['Suggestion']} ({r['Why']})" for r in top[:3]]
+    a.observed = [f"[{r['Rule']}] {r['Type']} '{r['Name']}': {r['Why']}" for r in top[:3]]
+    a.evidence.append(("Step 6 suggestions", pd.DataFrame(top)[["Priority", "Type", "Name", "Suggestion", "Why", "Rule", "Calls"]]))
+    a.possible.append("These are rule-based suggestions to review, not proven problems.")
+    a.caveats.append(OPS_ADVISORY)
+    return a
+
+
+def _ops_calls(qf, cols, ctx):
+    if not ctx or not ctx.get("request"):
+        return OpsAnswer(status="clarify", kind="calls", answer="Which conclusion? Ask a question first (for example 'Why did qualification drop this week?') and then ask for its calls.")
+    r = ctx["request"]
+    calls, err = ops_request_calls(qf, cols, r)
+    if calls is None:
+        return OpsAnswer(status="unavailable", kind="calls", answer=err or UNAVAILABLE_MSG)
+    seg = f" · {r['seg'][0]}: {r['seg'][1]}" if r.get("seg") else ""
+    a = OpsAnswer(kind="calls", scope=_ops_scope_text(r.get("entity"), r.get("period")) + seg,
+                  sources=["filter_calls"], request=r)
+    a.calls, a.calls_desc = calls, f"{len(calls):,} calls match"
+    a.answer = f"{len(calls):,} calls match the scope of the last answer" + (f" (showing the first {OPS_MAX_CALLS})" if len(calls) > OPS_MAX_CALLS else "") + "."
+    a.simple = a.answer
+    a.caveats.append("Caller IDs are shortened to the last 4 digits; recordings, notes and summaries are not shown here.")
+    a.caveats.append("These are the calls in the period being examined. They show what the numbers are made of; they do not prove a cause.")
+    return a
+
+
+def _ops_simplify(ctx):
+    if not ctx or not ctx.get("simple"):
+        return OpsAnswer(status="clarify", kind="simplify", answer="There is no earlier answer to explain yet. Ask a question first.")
+    return OpsAnswer(kind="simplify", answer="In simple terms: " + ctx["simple"], simple=ctx["simple"], scope=ctx.get("scope", ""))
+
+
+OPS_UNSUPPORTED_TEXT = ("I can answer from the call data in this sheet: counts, rates (qualification, spam, VoIP, fake numbers), scores, durations, "
+                        "rankings, comparisons, trends, health, anomalies and their breakdowns. I cannot answer about revenue, payouts, cost, "
+                        "forecasts or other data that is not in the sheet, and I do not run code or change routing, blocking or publishers.")
+OPS_HINT = re.compile(r"\b(calls?|how many|count|qualif\w*|spam\w*|voip|fake|rate|score|duration|publishers?|buyers?|campaigns?|compare\w*|vs|versus|"
+                      r"top|best|worst|highest|lowest|most|least|rank\w*|share|breakdown|anomal\w*|improv\w*|declin\w*|insurance|hangup|wrong number|"
+                      r"silent|volume|caller|phone|show|list|average|avg|total)\b")
+
+
+def _ops_from_nl(nlq, out, qf, cols):
+    """Wrap a Step 5B outcome (already computed by Step 5A) as an OpsAnswer."""
+    if not out.ok:
+        st_ = "clarify" if out.kind == "ambiguous" else "unavailable"
+        return OpsAnswer(status=st_, kind="nl", answer=out.message, scope=describe_nl(nlq), clarify=list(nlq.ambiguities), sources=["parse_nl_question", "run_nl_deterministic"])
+    a = OpsAnswer(kind="nl", answer=out.headline, simple=out.headline, scope=describe_nl(nlq), sources=["parse_nl_question", "run_nl_deterministic"])
+    if out.table is not None and not out.table.empty:
+        a.evidence.append(("Result (Step 5A)", out.table))
+        first = out.table.columns[0]
+        if first in ("Publisher", "Buyer", "Campaign", "Phone Company"):
+            a.names = [str(x) for x in out.table[first].head(10)]
+    a.observed = [out.headline]
+    a.caveats = list(nlq.notes) + list(out.notes[:4])
+    a.calls = out.calls
+    a.names += [v for vals in nlq.entities.values() for v in vals]
+    ent = [(k, v[0]) for k, v in nlq.entities.items() if len(v) == 1 and k in QUERY_LABELS]
+    metric, mnote = _ops_nl_metric(nlq)
+    if mnote:
+        a.caveats.append(mnote)
+    a.request = {"kind": "nl", "entity": ent[0] if len(ent) == 1 else None,
+                 "period": nlq.timelines[0] if nlq.timelines and nlq.timelines[0][1].get("start") is not None else None,
+                 "metric": metric, "seg": None}
+    return a
+
+
+def _ops_scope_inputs(q, ql, qf, cols, today, ctx, follow, what_about, sidebar_tl, tz, intent):
+    """(entity, period, p_note, error_answer). Names and periods in the question win; only an explicit follow-up cue uses the context."""
+    text = q
+    if intent in ("changes", "compare_prev"):       # 'compared with last week' names the comparison period, which Step 5A derives itself
+        text = re.sub(r"\bcompared?\s+(?:with|to|against)\b.*$|\bversus\b.*$|\bvs\b.*$", " ", q, flags=re.I)
+    nlq = _ops_light_parse(text, qf, cols, today, None, None)
+    if nlq.ambiguities or nlq.unavailable:
+        msgs = nlq.ambiguities + nlq.unavailable
+        return None, None, None, OpsAnswer(status="clarify" if nlq.ambiguities else "unavailable", kind=intent, answer=" ".join(msgs), clarify=list(nlq.ambiguities))
+    ents = [(k, v) for k, vals in nlq.entities.items() for v in vals if k in QUERY_LABELS]
+    if len(ents) > 1:
+        return None, None, None, OpsAnswer(status="clarify", kind=intent, answer=(
+            "That names more than one " + ("value" if len({k for k, _ in ents}) == 1 else "field") + " (" + ", ".join(f"{QUERY_LABELS[k].lower()} {v}" for k, v in ents[:4]) +
+            "). I analyse one publisher, buyer or campaign at a time here: which one? (For a side-by-side, ask 'Compare A and B'.)"))
+    use_ctx = (follow or what_about) and ctx
+    entity = ents[0] if ents else (ctx.get("entity") if use_ctx else None)
+    named = [(l, t) for l, t in nlq.timelines if t.get("start") is not None]
+    ctx_period = ctx.get("period") if use_ctx else None
+    if intent == "compare_prev" and ctx_period:
+        pair, extra = ctx_period, "The previous period is Step 5A's equivalent previous period."
+    elif named:
+        pair, extra = named[0], None
+    elif ctx_period:
+        pair, extra = ctx_period, None
+    else:
+        pair, extra = None, None
+    label, tl, note = _ops_period(pair, sidebar_tl, today)
+    if nlq.timelines and not named and not pair:
+        note = "'All time' has no comparison period. " + (note or "")
+    return entity, (label, tl), " ".join(x for x in (extra, note) if x) or None, None
+
+
+def ops_answer(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_TIMEZONE):
+    """One question -> (OpsAnswer, new context, new Step 5B 'previous query').
+    A question that cannot be answered (clarify / unavailable / unsupported) returns no context: it is never a basis for the next follow-up."""
+    q = str(question or "").strip()
+    if not q:
+        return OpsAnswer(status="clarify", kind="empty", answer="Please type a question."), ctx, nl_prev
+    ql = q.lower()
+    what_about = bool(_FOLLOW_WHAT_ABOUT.match(ql))
+    follow = bool(_OPS_FOLLOW_CUE.search(re.sub(r"\bthis (?:week|month|year|period)\b", " ", ql)))
+    intent = next((n for n, p in OPS_INTENTS if re.search(p, ql)), None)
+    if what_about and ctx and ctx.get("via") == "ops" and ctx.get("request", {}).get("kind") in ("why", "contributors", "trend", "changes", "overview", "poor"):
+        intent = ctx["request"]["kind"]
+    ans = None
+    if intent == "unsupported":
+        ans = OpsAnswer(status="unsupported", kind="unsupported", answer=OPS_UNSUPPORTED_TEXT)
+    elif intent == "simplify":
+        ans = _ops_simplify(ctx)
+    elif intent == "calls":
+        ans = _ops_calls(qf, cols, ctx)
+    elif intent in ("why", "contributors", "trend", "changes", "compare_prev", "overview", "poor", "recs"):
+        if intent == "compare_prev" and not (ctx and ctx.get("request") and ctx["request"].get("period")):
+            ans = OpsAnswer(status="clarify", kind="compare_prev", answer="Compare what with the previous period? Ask a question first, or say for example 'What changed compared with last week?'.")
+        else:
+            entity, period, p_note, err = _ops_scope_inputs(q, ql, qf, cols, today, ctx, follow, what_about, sidebar_tl, tz, intent)
+            if err is not None:
+                ans = err
+            elif intent in ("why", "contributors"):
+                metric = _ops_metric(ql) or ((ctx or {}).get("metric") if (follow or what_about) and ctx else None)
+                dim = None
+                if intent == "contributors":
+                    dim = next((lab for lab, pat in (("Campaign", r"\bcampaigns?\b"), ("Buyer", r"\bbuyers?\b"), ("Publisher", r"\bpublishers?\b"),
+                                                     ("Phone Company", r"phone compan\w+"), ("Line Type", r"line types?")) if re.search(pat, ql)), "Campaign")
+                ans = _ops_why(qf, cols, ql, entity, period, metric, p_note, intent == "contributors", dim)
+            elif intent == "trend":
+                ans = _ops_trend(qf, cols, entity, period, p_note)
+            elif intent in ("changes", "compare_prev"):
+                ans = _ops_changes(qf, cols, entity, period, p_note)
+            elif intent == "overview":
+                ans = _ops_overview(qf, cols, period, p_note)
+            elif intent == "poor":
+                ans = _ops_poor(qf, cols, ql, period, p_note)
+            else:
+                ans = _ops_recs(qf, cols, ql, entity, period, ctx, p_note)
+    else:
+        if what_about and nl_prev is None and not OPS_HINT.search(ql.replace("what about", " ")):
+            ans = OpsAnswer(status="clarify", kind="follow_up", answer="'What about ...' refers to an earlier question, but no earlier question was answered. "
+                            "Please state the full question, for example 'How many calls did publisher ABC get this week?'.")
+        elif not OPS_HINT.search(ql) and not (nl_prev is not None and (what_about or follow)):
+            ans = OpsAnswer(status="unsupported", kind="unsupported", answer=OPS_UNSUPPORTED_TEXT)
+        else:
+            text = q
+            if re.match(r"\s*(?:and\s+)?how many (?:were|are|was)\b", ql) and nl_prev is not None and not _FOLLOW_OF_THOSE.search(ql):
+                text = q.rstrip(" ?.!") + " of those"        # 'How many were qualified?' continues the previous count
+            nlq = parse_nl_question(text, qf, cols, today, focus={}, previous=nl_prev)
+            out = run_nl_deterministic(nlq, qf, cols)
+            ans = _ops_from_nl(nlq, out, qf, cols)
+            if out.ok:
+                ans.calls = out.calls
+                ans.calls_desc = f"{len(out.calls):,} calls" if out.calls is not None else ""
+                nl_prev = nlq
+            else:
+                nl_prev = None
+    if ans.status != "ok":
+        return ans, None, None
+    new_ctx = {"via": "nl" if ans.kind == "nl" else "ops", "request": ans.request, "entity": (ans.request or {}).get("entity"),
+               "period": (ans.request or {}).get("period"), "metric": (ans.request or {}).get("metric"),
+               "simple": ans.simple or ans.answer, "scope": ans.scope}
+    if intent in ("simplify", "calls"):                  # these only re-present the last answer; its context stays
+        new_ctx = ctx
+    if ans.kind != "nl":
+        nl_prev = nl_prev if intent in ("simplify", "calls") else None
+    return ans, new_ctx, nl_prev
+
+
+# ---------------- optional AI wording (explains verified findings only) ----------------
+OPS_AI_SYSTEM = (
+    "You rewrite ALREADY-VERIFIED findings of a call-network dashboard in plain English for an operations manager. "
+    "Use ONLY the facts given. Never add, change, round or infer a number, a name, a cause or a recommendation. "
+    "Where a fact says a cause is not proven, keep it that way. At most 120 words. "
+    'Reply with ONE JSON object only: {"text": string}.'
+)
+_OPS_NUM = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
+
+
+def _ops_nums(text):
+    out = set()
+    for m in _OPS_NUM.findall(str(text)):
+        try:
+            out.add(round(float(m.replace(",", "")), 1))
+        except ValueError:
+            pass
+    return out
+
+
+def ops_ai_payload(ans):
+    """(text sent to the AI, alias -> real name). Only the verified statements; entity / segment names become aliases;
+    caller IDs, phone numbers, URLs, e-mails and dates are scrubbed as a safety net. Scope lines, tables and calls are never sent."""
+    names = sorted({n for n in ans.names if n and len(str(n)) >= 2}, key=lambda n: -len(str(n)))
+    rev, text = {}, "\n".join("- " + f for f in ans.facts if f)
+    for i, n in enumerate(names, 1):
+        alias = f"name_{i:03d}"
+        rev[alias] = str(n)
+        text = text.replace(str(n), alias)
+    text = re.sub(r"https?://\S+|\S+@\S+\.\S+", "[removed]", text)
+    text = re.sub(r"\+?\d[\d\s().-]{8,}\d", "[removed]", text)
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "[date]", text)
+    return text, rev
+
+
+def ops_ai_validate(reply, ans, rev):
+    """(real text or None, reason). The reply is untrusted: every number must occur in the verified facts and every name must be one of them."""
+    text = str(reply or "").strip()
+    if not text or len(text) > 1500:
+        return None, "the reply was empty or too long"
+    allowed = _ops_nums("\n".join(ans.facts))
+    extra = _ops_nums(text) - allowed
+    if extra:
+        return None, "it contained numbers that are not in the verified findings (" + ", ".join(f"{x:g}" for x in sorted(extra)[:4]) + ")"
+    used = set(re.findall(r"name_\d{3}", text))
+    if used - set(rev):
+        return None, "it used a name that is not in the verified findings"
+    for alias, real in rev.items():
+        text = text.replace(alias, real)
+    for q in re.findall(r"'([^']{2,60})'", text):
+        if q not in ans.names and q not in "\n".join(ans.facts):
+            return None, f"it quoted '{q}', which is not in the verified findings"
+    return text, None
+
+
+def ops_ai_reword(ans, provider, model):
+    """(validated text | None, note). Never raises; the deterministic answer is never changed."""
+    if provider not in AI_PROVIDERS:
+        return None, "Unknown AI provider."
+    keys = _secret_keys(provider)
+    if not keys:
+        return None, f"No {provider} API key in Streamlit Secrets ({' / '.join(AI_PROVIDERS[provider]['secrets'])}); showing the verified answer only."
+    payload, rev = ops_ai_payload(ans)
+    last = "unknown error"
+    for key in keys:
+        try:
+            raw = call_ai_provider(provider, key, model, OPS_AI_SYSTEM, "Verified findings:\n" + payload)
+            data = json.loads(re.sub(r"^```(?:json)?|```$", "", str(raw).strip(), flags=re.MULTILINE).strip())
+            text, why = ops_ai_validate(data.get("text") if isinstance(data, dict) else None, ans, rev)
+            if text is None:
+                return None, f"The AI wording was rejected because {why}; showing the verified answer only."
+            return text, None
+        except urllib.error.HTTPError as exc:
+            last = f"HTTP {exc.code}"
+            if exc.code not in (401, 403, 429):
+                break
+        except Exception as exc:
+            last = str(exc).replace(key, "***")[:160]
+            break
+    return None, f"AI wording unavailable ({last}); showing the verified answer only."
+
+
+# ---------------- UI ----------------
+OPS_STATE_KEYS = ("ops_chat", "ops_ctx", "ops_nl_prev")
+
+
+def ops_clear_conversation():
+    for k in OPS_STATE_KEYS:
+        st.session_state.pop(k, None)
+
+
+def _ops_show_answer(a):
+    badge = {"ok": "", "clarify": "❓ ", "unavailable": "⚠️ ", "unsupported": "🚫 "}[a.status]
+    st.markdown(f"**Answer:** {badge}{a.answer}")
+    if a.scope:
+        st.caption("Scope: " + a.scope)
+    if a.ai_text:
+        st.info("🤖 Plain-English wording by AI (checked against the verified findings): " + a.ai_text)
+    if a.ai_note:
+        st.caption("ℹ️ " + a.ai_note)
+    for c in a.caveats:
+        st.warning(c) if ("QC" in c or "Limited" in c or "limited" in c or "Too few" in c) else st.caption("ℹ️ " + c)
+    if a.status != "ok":
+        return
+    if a.observed or a.evidence:
+        with st.expander("Evidence (observed facts)"):
+            for o in a.observed:
+                st.markdown("- " + o)
+            for title, t in a.evidence:
+                st.caption(title)
+                st.dataframe(t, width="stretch", hide_index=True)
+            if a.sources:
+                st.caption("Calculated by: " + ", ".join(a.sources))
+    if a.possible:
+        st.markdown("**Interpretation (possible explanations, not proven):**")
+        for p in a.possible:
+            st.markdown("- " + p)
+    if a.steps:
+        st.markdown("**Recommended next step (advisory):**")
+        for s_ in a.steps:
+            st.markdown("- " + s_)
+    if a.calls is not None and len(a.calls):
+        with st.expander(f"Supporting calls ({len(a.calls):,})"):
+            st.dataframe(ops_mask_calls(a.calls, st.session_state.get("ops_cols", {})), width="stretch", hide_index=True)
+            st.caption("Caller IDs are shortened; recordings, notes and summaries are not shown.")
+
+
+def render_ops_assistant(df, available_columns, overrides, sidebar_timeline):
+    """Step 7 panel: ask in plain English; every number comes from Steps 5A / 5B / 6."""
+    st.markdown("### 💬 AI Network Operations Assistant")
+    cols = resolve_query_columns(available_columns, overrides)
+    st.session_state["ops_cols"] = cols
+    st.caption("Ask about performance, changes, causes, publishers, campaigns and what to look at first. Numbers come from the Step 5A engine, "
+               "findings from Step 6; nothing is calculated by an AI. " + OPS_ADVISORY)
+    if not cols.get("date"):
+        st.info("The assistant needs a readable Call Date column.")
+        return
+    qf = get_query_frame(df, cols)
+    tz = st.session_state.get("date_tz", DEFAULT_TIMEZONE)
+    use_ai, provider, model = False, "Groq", ""
+    with st.expander("Optional: AI wording (off by default)"):
+        use_ai = st.checkbox("Let an external AI reword answers in plain English (sends anonymised verified statements only)", value=False, key="ops_use_ai")
+        if use_ai:
+            c = st.columns(2)
+            provider = c[0].selectbox("AI provider:", list(AI_PROVIDERS), key="ops_provider")
+            model = c[1].text_input("Model:", AI_PROVIDERS[provider]["model"], key=f"ops_model_{provider}")
+            st.caption("🔒 Sent: the already-calculated statements of the answer, with publisher / buyer / campaign names replaced by aliases. Never sent: "
+                       "your question, caller IDs, phone numbers, recordings, notes, summaries, dates, tables or call rows. The reply is rejected if it "
+                       "contains a number or name that is not in those statements.")
+            if not _secret_keys(provider):
+                st.caption(f"ℹ️ No {provider} key in Streamlit Secrets; answers will be shown without AI wording.")
+    with st.form("ops_form", clear_on_submit=True):
+        question = st.text_input("Ask the assistant:", key="ops_question", placeholder="Why did qualification drop this week?")
+        send = st.form_submit_button("Send")
+    if st.button("🧹 Clear conversation", key="ops_clear"):
+        ops_clear_conversation()
+    ctx = st.session_state.get("ops_ctx")
+    if ctx and ctx.get("request"):
+        r = ctx["request"]
+        st.caption("Active context: " + " · ".join(x for x in (
+            f"{QUERY_LABELS[r['entity'][0]]}: {r['entity'][1]}" if r.get("entity") else "Whole network",
+            "Period: " + _tl_text(*r["period"]) if r.get("period") else "Period: not set",
+            f"Metric: {r['metric']}" if r.get("metric") else "") if x) + " (a question that names its own filters replaces these; use Clear to start fresh)")
+    else:
+        st.caption("Active context: none. The next question starts fresh.")
+    if send and question.strip():
+        today, _ = get_today(tz)
+        with st.spinner("Working it out ..."):
+            ans, new_ctx, new_prev = ops_answer(question, qf, cols, today, sidebar_timeline, ctx, st.session_state.get("ops_nl_prev"), tz)
+            if use_ai and ans.status == "ok":
+                ans.ai_text, ans.ai_note = ops_ai_reword(ans, provider, model.strip() or AI_PROVIDERS[provider]["model"])
+        st.session_state["ops_ctx"], st.session_state["ops_nl_prev"] = new_ctx, new_prev
+        st.session_state.setdefault("ops_chat", []).append({"q": question.strip(), "a": ans})
+    chat = st.session_state.get("ops_chat", [])
+    if not chat:
+        st.caption("Examples: " + " · ".join(f"“{e}”" for e in OPS_EXAMPLES))
+    for item in reversed(chat):
+        st.markdown(f"**🧑 {item['q']}**")
+        _ops_show_answer(item["a"])
+        st.divider()
 
 
 def render_query_layer(df, available_columns, overrides, sidebar_timeline):
@@ -4486,6 +5436,12 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
     # ---------------------------------------------------------------
     # Step 6: Network Intelligence briefing (advisory only; reads the loaded sheet through Step 5A)
     render_network_briefing(
+        df, available_columns,
+        {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
+        timeline,
+    )
+    # Step 7: AI Network Operations Assistant (reads Steps 5A / 5B / 6; advisory only)
+    render_ops_assistant(
         df, available_columns,
         {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
         timeline,
