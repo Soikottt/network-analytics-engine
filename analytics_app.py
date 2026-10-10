@@ -3281,7 +3281,7 @@ def run_nl_deterministic(nlq, qf, cols):
 AI_PROVIDERS = {
     "Groq": {"secrets": ("GROQ_API_KEY", "GROQ_SECONDARY_API_KEY", "GROQ_API_KEY_3", "GROQ_API_KEY_4"),
              "model": "llama-3.3-70b-versatile"},
-    "Gemini": {"secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "model": "gemini-2.0-flash"},
+    "Gemini": {"secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "model": "gemini-2.5-flash"},
 }
 
 
@@ -3323,14 +3323,17 @@ def _secret_keys(provider):
     return keys
 
 
+AI_USER_AGENT = "ringba-dashboard/1.0"    # providers behind Cloudflare (Groq) answer 403 to the default "Python-urllib" agent
+
+
 def _http_post_json(url, payload, headers, timeout=60):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", **headers}, method="POST")
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "User-Agent": AI_USER_AGENT, **headers}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def _http_get_json(url, headers, timeout=3):
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    req = urllib.request.Request(url, headers={"User-Agent": AI_USER_AGENT, **headers}, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -3632,6 +3635,14 @@ def ai_complete(system_prompt, user_prompt, json_mode=True, use_cache=True):
             except Exception as exc:
                 kind = classify_ai_error(exc)
                 res.attempts.append((label, kind))
+                if isinstance(exc, urllib.error.HTTPError):
+                    try:
+                        body = re.sub(r"<[^>]+>|\s+", " ", exc.read().decode("utf-8", "ignore")).strip()[:140]
+                    except Exception:
+                        body = ""
+                    for k_ in _secret_keys(_CLOUD_NAME[name]) if name != "local" else []:
+                        body = body.replace(k_, "***")
+                    res.warnings.append(f"{label}: HTTP {exc.code}" + (f" - {body}" if body else ""))
                 use["failures"][kind] = use["failures"].get(kind, 0) + 1
                 AI_LOG.warning("ai fail provider=%s kind=%s", name, kind)
                 if name == "local" and kind in ("connection", "dns", "timeout", "server"):
@@ -5769,7 +5780,7 @@ def ops_chat(question, qf, cols, history=None, use_ai=True):
                 return a
             a.ai_note = f"The AI reply was dropped because {why}; a built-in reply is shown."
         else:
-            a.ai_note = "No AI provider answered (" + res.error + "); a built-in reply is shown."
+            a.ai_note = "No AI provider answered (" + res.error + ")" + (" Details: " + " | ".join(res.warnings) if res.warnings else "") + "; a built-in reply is shown."
     a.answer = _ops_chat_fallback(q)
     return a
 
