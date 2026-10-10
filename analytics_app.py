@@ -4527,7 +4527,7 @@ OPS_STOP = set("""should i we you do does did would could can will shall am is a
     why drop dropped decrease decreased decreasing increase increased fall fell rise rose jump change changed
 improving declining trend trending performing performance poorly poor network operations recommend recommendation
 explain simpler terms contributed contribute contribution drove driver conclusion supporting investigate next anything
-risk risky attention health briefing issue issues problem problems quality whole results numbers worse worsen worsened struggling suspicious junk
+paused pause pausing block blocked blocking stop stopped remove removed cut ban banned suspend minimum min risk risky attention health briefing issue issues problem problems quality whole results numbers worse worsen worsened struggling suspicious junk
     low going wrong went everything things overall each every all against versus compare compared comparing sending traffic leads lead""".split())
 OPS_METRIC_WORDS = [   # (regex, Step 5A metric)
     (r"qualif\w*", "Qualification %"), (r"\bspam\w*|robo\w*", "Spam %"), (r"\bvoip\b", "VoIP %"), (r"\bfake\b", "Fake %"),
@@ -4542,7 +4542,10 @@ OPS_COLS = {   # metric -> (label used in compare_group_periods, change column)
 OPS_TYPE_METRIC = {"qualified": "Qualification %", "spam": "Spam %", "voip": "VoIP %"}
 OPS_DOWN = r"drop\w*|decreas\w*|declin\w*|fell|fall\w*|lower|down|worse|worsen\w*|dip\w*|slump\w*|reduc\w*|less"
 OPS_UP = r"increas\w*|rose|rise\w*|jump\w*|spik\w*|higher|up|better|improv\w*|grew|grow\w*|more"
+OPS_PAUSE_VERBS = r"paus\w*|block\w*|stop\w*|remov\w*|cut|cutting|drop\w*|ban\w*|suspend\w*|shut\w*|disabl\w*|terminat\w*|cancel\w*|kick\w*"
 OPS_INTENTS = [   # checked in this order
+    ("action_which", r"\b(?:which|what)\b.*\b(?:publishers?|buyers?|campaigns?)\b.*\b(?:should|shall|must|do) (?:i|we)\b.*\b(?:" + OPS_PAUSE_VERBS + r")\b"
+                     r"|\b(?:should|shall) (?:i|we)\b.*\b(?:" + OPS_PAUSE_VERBS + r")\b.*\b(?:publishers?|buyers?|campaigns?)\b"),
     ("unsupported", r"\b(revenue|payouts?|profit\w*|margins?|roi|spend|earn\w*|commissions?|rpc|conversion rate|ltv)\b"
                    r"|\b(forecast\w*|predict\w*|projection\w*|will (?:we|it|they|the) )"
                    r"|^\s*(?:please )?(?:block|pause|suspend|disable|reroute|route|cap|shut|ban|terminate)\b"
@@ -5668,7 +5671,7 @@ def _ops_scope_inputs(q, ql, qf, cols, today, ctx, follow, what_about, sidebar_t
     return entity, (label, tl), " ".join(x for x in (extra, note) if x) or None, None
 
 
-def ops_answer(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_TIMEZONE):
+def _ops_answer_core(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_TIMEZONE):
     """One question -> (OpsAnswer, new context, new Step 5B 'previous query').
     A question that cannot be answered (clarify / unavailable / unsupported) returns no context: it is never a basis for the next follow-up."""
     q = str(question or "").strip()
@@ -5691,7 +5694,7 @@ def ops_answer(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_T
         ans = _ops_simplify(ctx)
     elif intent == "calls":
         ans = _ops_calls(qf, cols, ctx)
-    elif intent in ("why", "contributors", "trend", "changes", "compare_prev", "overview", "poor", "recs", "compare_all", "suspicious", "investigate"):
+    elif intent in ("why", "contributors", "trend", "changes", "compare_prev", "overview", "poor", "recs", "compare_all", "suspicious", "investigate", "action_which"):
         if intent == "compare_prev" and not (ctx and ctx.get("request") and ctx["request"].get("period")):
             ans = OpsAnswer(status="clarify", kind="compare_prev", answer="Compare what with the previous period? Ask a question first, or say for example 'What changed compared with last week?'.")
         else:
@@ -5717,6 +5720,13 @@ def ops_answer(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_T
                 ans = _ops_changes(qf, cols, entity, period, p_note)
             elif intent == "overview":
                 ans = _ops_overview(qf, cols, period, p_note)
+            elif intent == "action_which":
+                ans = _ops_poor(qf, cols, ql if _ops_type_words(ql) else ql + " publishers", period, p_note) if not entity else _ops_recs(qf, cols, ql, entity, period, ctx, p_note)
+                if ans.status == "ok":
+                    ans.kind = "poor" if not entity else ans.kind
+                    ans.answer = ("I can't pause, block or change anything: this assistant is advisory only and the decision is yours. "
+                                  "Under the fixed health rules, this is what to review first. " + ans.answer)
+                    ans.simple = ans.answer
             elif intent == "poor":
                 ans = _ops_poor(qf, cols, ql, period, p_note)
             else:
@@ -5752,12 +5762,35 @@ def ops_answer(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_T
     return ans, new_ctx, nl_prev
 
 
+OPS_MIN_CALLS = re.compile(r"[,;.]?\s*\b(?:with\s+)?(?:a\s+)?(?:minimum|min\.?|at least)\s*(?:number\s+)?(?:of\s+)?(?:calls?\s*)?(?:of\s+)?(\d{1,5})(?:\s*(?:\+|or more))?(?:\s*calls?)?\b", re.I)
+
+
+def ops_answer(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_TIMEZONE):
+    """One question -> (OpsAnswer, new context, new Step 5B 'previous query'). A phrase like 'minimum calls of 10' sets the
+    health volume minimum for THIS question only (the sidebar settings are restored afterwards)."""
+    q = str(question or "")
+    m = OPS_MIN_CALLS.search(q)
+    if not m:
+        return _ops_answer_core(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz)
+    n = max(1, int(m.group(1)))
+    saved = {k: HEALTH_RULES[k] for k in ("min_calls", "min_calls_high_risk")}
+    HEALTH_RULES.update(min_calls=n, min_calls_high_risk=max(n, 1))
+    try:
+        ans, c, p = _ops_answer_core(OPS_MIN_CALLS.sub(" ", q).strip() or q, qf, cols, today, sidebar_tl, ctx, nl_prev, tz)
+    finally:
+        HEALTH_RULES.update(saved)
+    if ans.status == "ok":
+        ans.caveats.insert(0, f"Minimum calls of {n} was applied to this question only (groups with fewer calls are not rated).")
+    return ans, c, p
+
+
 # ---------------- Step 7: natural conversation, intent routing, optional whitelisted AI planner ----------------
 # A message is classified BEFORE any provider or sheet query: casual chat never touches the Sheet data and never contains company figures;
 # business questions go to the deterministic engine. The AI never calculates; it may (1) chat, (2) reword verified answers, (3) map an
 # unclear business question onto ONE of a few whitelisted templates (validated against the real data) that the engine then answers.
 OPS_BUSINESS = re.compile(r"\b(calls?|callers?|qualif\w*|spam\w*|voip|fake|publishers?|buyers?|campaigns?|network|traffic|qc|scores?|durations?|hangups?|anomal\w*|"
                           r"leads?|ringba|dashboard|kpis?|insurance|medicaid|medi-?cal|recordings?|transcripts?|line types?|phone compan\w+|quality score)\b")
+OPS_INTENTS_UNSUPPORTED = r"\b(?:run|execute) (?:python|sql|code|a script|a command)\b|\bsql\b|\bpython\b"
 OPS_ACTION_REQ = re.compile(r"^\s*(?:please )?(?:block|pause|suspend|disable|reroute|route|cap|shut|ban|terminate)\b|\b(?:run|execute) (?:python|sql|code|a script|a command)\b")
 OPS_WEAK = re.compile(r"\b(quality|performance|numbers|results|drop\w*|stats|metrics?|trend\w*|week|month|yesterday|today)\b")
 
@@ -5862,6 +5895,7 @@ OPS_PLAN_TEMPLATES = {
     "compare_all": "Compare all {etype}s {period}",
     "suspicious": "Which {etype}s are sending suspicious or low-quality calls {period}?",
     "overview": "How is the network doing {period}?",
+    "poor": "Which {etype}s need attention {period}?",
     "recs": "What should I investigate first {period}?",
 }
 OPS_PLAN_SYSTEM = (
@@ -5935,16 +5969,22 @@ def ops_respond(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_
     if kind == "casual":
         return ops_chat(question, qf, cols, history, use_ai), ctx, nl_prev
     ans, new_ctx, new_prev = ops_answer(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz)
-    if use_ai and ans.status == "unsupported" and ans.kind == "unsupported" and ops_message_kind(question, qf, cols, None, None) == "data" and not re.search(OPS_INTENTS[0][1], str(question).lower()):
+    if use_ai and ans.status in ("unsupported", "unavailable") and ans.kind in ("unsupported", "nl") and not re.search(OPS_INTENTS_UNSUPPORTED, str(question).lower()):
+        # the fixed parser could not read the question: let the AI pick ONE whitelisted analysis (validated against the data), else answer as general advice
         q2, res, note = ops_plan_question(question, qf, cols)
         if q2:
             ans2, c2, p2 = ops_answer(q2, qf, cols, today, sidebar_tl, ctx, nl_prev, tz)
             if ans2.status == "ok":
-                ans2.caveats.insert(0, f"I understood your question as: “{q2}” (mapped by the AI onto a supported analysis; the engine, not the AI, calculated the answer).")
+                ans2.caveats.insert(0, f"I understood your question as: \u201c{q2}\u201d (mapped by the AI onto a supported analysis; the engine, not the AI, calculated the answer).")
                 ans2.ai_meta = res
                 ans, new_ctx, new_prev = ans2, c2, p2
         elif note:
             ans.ai_note = note
+        if ans.status != "ok":
+            gen = ops_chat(question, qf, cols, history, True)
+            if gen.ai_meta is not None and gen.ai_meta.ok and "built-in" not in gen.answer:
+                gen.scope = "General answer: I could not match this to your sheet data, so this is general advice, NOT based on your numbers."
+                return gen, ctx, nl_prev
     if use_ai and ans.status == "ok" and ans.kind in OPS_REWORD_KINDS:
         ans.ai_text, ans.ai_note = ops_ai_reword(ans)
     return ans, new_ctx, new_prev
