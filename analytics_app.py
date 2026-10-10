@@ -4136,6 +4136,7 @@ class OpsAnswer:
     sources: list = field(default_factory=list)        # existing functions that produced the numbers
     request: dict = None               # what to re-run for follow-ups
     names: list = field(default_factory=list)          # entity / segment names in the text (aliased before any AI call)
+    evid: dict = None                  # structured evidence object (metrics, periods, directions, findings) for the optional AI step
     ai_text: str = None                # optional, validated AI wording
     ai_note: str = None
 
@@ -4335,6 +4336,23 @@ def _ops_need_metric(scope_text):
                      clarify=["qualification", "spam", "VoIP", "fake", "score", "duration", "volume"])
 
 
+def _ops_evid(an, entity, primary=None):
+    """Structured evidence for the optional AI step: labelled metrics, periods, directions, call counts (all from Step 5A)."""
+    info, row = an["info"], an["row"]
+    metrics = []
+    for m, (lab, chg_col) in OPS_COLS.items():
+        b, n, c = row[f"{lab} (before)"], row[f"{lab} (now)"], row[chg_col]
+        unit, cunit = OPS_UNITS.get(m, ("percent", "percentage points"))
+        f = lambda v: None if pd.isna(v) else round(float(v), 1)
+        d = "n/a" if pd.isna(b) or pd.isna(n) else ("up" if n > b else "down" if n < b else "flat")
+        metrics.append({"metric": m, "unit": unit, "previous": f(b), "current": f(n), "change": f(c), "change_unit": cunit, "direction": d})
+    return {"scope": {"type": entity[0] if entity else "network", "name": entity[1] if entity else None},
+            "periods": {"previous": info["prev_name"], "current": info["cur_name"]},
+            "call_counts": {"previous": an["n_before"], "current": an["n_now"]},
+            "metrics": metrics, "primary_metric": primary, "anomaly_flagged": None, "segments": [],
+            "causation": "not established: the data shows differences and correlations only"}
+
+
 def _ops_why(qf, cols, ql, entity, period, metric, p_note, contributors, dim_label):
     scope_txt = _ops_scope_text(entity, period)
     if not metric:
@@ -4441,6 +4459,18 @@ def _ops_why(qf, cols, ql, entity, period, metric, p_note, contributors, dim_lab
     elif an["enough"]:
         a.steps.append("No action is suggested by the Step 6 rules for a change of this size; keep watching it.")
     a.names = [n for n in dict.fromkeys(a.names) if n]
+    a.evid = _ops_evid(an, entity, metric)
+    a.evid["anomaly_flagged"] = an["flagged"] if an["enough"] else None
+    a.evid["recommendations"] = [{"text": s_} for s_ in a.steps if not s_.startswith("No action is suggested")]
+    if ex:
+        for dname, t in ex["tables"].items():
+            top = t.reindex(t["contribution"].abs().sort_values(ascending=False).index).head(2)
+            for seg, r_ in top.iterrows():
+                a.evid["segments"].append({"dimension": dname, "segment": str(seg), "effect": r_["effect"], "explained_pct": None if pd.isna(r_["explained"]) else round(float(r_["explained"]), 1),
+                                           "rate_previous": None if pd.isna(r_["rate_p"]) else round(float(r_["rate_p"]), 1), "rate_current": None if pd.isna(r_["rate_c"]) else round(float(r_["rate_c"]), 1),
+                                           "share_previous": round(float(r_["share_p"]), 1), "share_current": round(float(r_["share_c"]), 1),
+                                           "calls_previous": int(r_["n_p"]), "calls_current": int(r_["n_c"]),
+                                           "named_by_step6": any(d_["dimension"] == dname and str(d_["segment"]) == str(seg) for d_ in ex["drivers"])})
     return a
 
 
@@ -4483,6 +4513,7 @@ def _ops_trend(qf, cols, entity, period, p_note):
     a.evidence.append(("Before and now (Step 5A)", _ops_metric_table(an)))
     a.simple = f"{who[0].upper() + who[1:]} looks {verdict} compared with {info['prev_name']}."
     a.possible.append("A trend only describes direction; it does not say why it moved.")
+    a.evid = _ops_evid(an, entity)
     return a
 
 
@@ -4530,11 +4561,13 @@ def _ops_changes(qf, cols, entity, period, p_note):
             if rows:
                 a.evidence.append(("Anomalies by publisher / buyer / campaign (Step 6)", pd.DataFrame(rows)))
                 a.names += [str(r["Name"]) for r in rows]
+                a.observed += [f"{r['Type']} '{r['Name']}': {r['Anomaly']} ({r['Change']}; {r['Calls now']:,} calls now)." for r in rows[:5]]
                 a.steps += [r["Suggestion"] for r in b["recs"] if r["Rule"].startswith("A-")][:3]
             if n > len(b["rc"]):
                 a.caveats.append(f"Only the {len(b['rc'])} largest of {n} anomalies are listed (Step 6 limit).")
     a.possible.append("These are differences between two periods; they do not say what caused them. Ask 'Why did <metric> change?' for the Step 6 breakdown.")
     a.names = [n for n in dict.fromkeys(a.names) if n]
+    a.evid = _ops_evid(an, entity)
     return a
 
 
@@ -4817,58 +4850,344 @@ def ops_answer(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_T
 
 
 # ---------------- optional AI wording (explains verified findings only) ----------------
+# The AI never calculates and never answers on its own. It receives a compact STRUCTURED evidence object (labelled metrics,
+# periods, directions, entities, Step 6 findings) built from the verified result, and may only reword it. Its text is then
+# checked CLAIM BY CLAIM with fixed rules (direction, period, metric, unit, entity, cause vs correlation, recommendation).
+# A text that fails any rule is dropped and the deterministic answer is shown, with the reason.
 OPS_AI_SYSTEM = (
     "You rewrite ALREADY-VERIFIED findings of a call-network dashboard in plain English for an operations manager. "
-    "Use ONLY the facts given. Never add, change, round or infer a number, a name, a cause or a recommendation. "
-    "Where a fact says a cause is not proven, keep it that way. At most 120 words. "
+    "You receive a JSON evidence object. Every number is labelled with its metric, its unit and its period ('previous' or 'current'); "
+    "'direction' says whether the metric went up or down from previous to current. "
+    "Rules: use ONLY this evidence. Never add, change, round or infer a number, a name, a cause or a recommendation. "
+    "Never reverse a direction and never swap previous and current. Say 'percent' or 'points' only for rates and 'calls' only for call counts. "
+    "Do not state or imply that anything caused anything: the evidence shows differences, not causes (say 'may', 'could' or 'the data cannot show why'). "
+    "Recommend only what is listed under 'recommendations'; if the list is empty, recommend nothing. Never suggest blocking, pausing or removing anything. "
+    "At most 120 words. "
     'Reply with ONE JSON object only: {"text": string}.'
 )
 _OPS_NUM = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
+_OPS_NUM_UNIT = re.compile(r"(?P<n>\d+(?:,\d{3})*(?:\.\d+)?)\s*(?P<u>%|percentage points?\b|percent\b|points?\b|pp\b|calls?\b|seconds?\b|secs?\b|days?\b|weeks?\b|months?\b|hours?\b)?", re.I)
+_OPS_ALIAS = re.compile(r"name_\d{3}")
+OPS_UNITS = {"Calls": ("calls", "calls"), "Avg Score": ("score points", "points"), "Avg Duration (sec)": ("seconds", "seconds")}
+OPS_GOOD_DIR = {"Calls": 1, "Qualification %": 1, "Spam %": -1, "VoIP %": -1, "Fake %": -1, "Avg Score": 1, "Avg Duration (sec)": 1}
+OPS_METRIC_MENTION = [
+    ("Qualification %", r"qualif\w*"), ("Spam %", r"\bspam\w*|\brobo\w*"), ("VoIP %", r"\bvoip\b"), ("Fake %", r"\bfake\b"),
+    ("Avg Score", r"\bscores?\b|quality score"), ("Avg Duration (sec)", r"\bdurations?\b|call length"),
+    ("Calls", r"\bvolume\b|\bcall (?:count|volume)\b|\bcalls?\s+(?:also\s+|have\s+|has\s+|were\s+|was\s+)?(?:rose|rise[sn]?|increas\w*|up|grew|grow\w*|jump\w*|fell|fall\w*|drop\w*|decreas\w*|declin\w*|down|lower|higher)\b|\b(?:more|fewer|less)\s+calls\b"),
+]
+_OPS_UP = re.compile(r"\b(?:rose|rises?|risen|rising|increas\w*|higher|grew|grow\w*|climb\w*|jump\w*|spik\w*|surg\w*|gain\w*|upward)\b|(?:went|moved|is|was|are|were|been|goes|gone)\s+up\b|\bup\s+(?:from|to|by)\b")
+_OPS_DOWN = re.compile(r"\b(?:fell|fall\w*|drop\w*|decreas\w*|declin\w*|lower|dip\w*|slump\w*|reduc\w*|shr[au]nk|shrink\w*|plung\w*|slid\w*|sank|downward)\b|(?:went|moved|is|was|are|were|been|goes|gone)\s+down\b|\bdown\s+(?:from|to|by)\b")
+_OPS_BETTER = re.compile(r"\b(?:improv\w*|better)\b")
+_OPS_WORSE = re.compile(r"\b(?:worsen\w*|worse|deteriorat\w*)\b")
+_OPS_NEG = re.compile(r"(?:\bnot|n't|\bno|\bnever|\bwithout)\s+(?:\w+\s+){0,2}$")
+_OPS_CAUSAL = re.compile(r"\b(?:because|caused?|causing|due to|led to|leads to|results? (?:in|from)|resulted (?:in|from)|driven by|drove|drives|responsible for|"
+                         r"reason (?:is|was|for)|root cause|the cause|attributable|thanks to|that is why|which is why|explains why|therefore|as a result|owing to|stems? from|triggered)\b")
+_OPS_HEDGE = re.compile(r"\b(?:may|might|could|possibly|possible|perhaps|potentially|suggests?|suggested|appears?|likely|not (?:proven|proof|established|confirmed)|cannot (?:show|confirm|say|tell)|"
+                        r"correlat\w*|not clear|unclear|no proof|does not (?:show|prove|say))\b")
+_OPS_REC = re.compile(r"\b(?:should|recommend\w*|suggest\w*|consider|advis\w*|need to|needs to|must|ought|next step|best to|worth (?:checking|reviewing|investigating|looking))\b|\bcould (?:also )?(?:review|check|sample|audit|investigate|verify|look|start|flag)\b|^\s*(?:please\s+)?(?:review|check|sample|audit|investigate|verify|flag|pause|block|stop|suspend|reduce|increase|remove|cut|disable|ban|escalate|contact|start)\b")
+_OPS_FORBIDDEN = re.compile(r"\b(?:block\w*|pause\w*|suspend\w*|disabl\w*|re-?rout\w*|terminat\w*|ban(?:ned|ning)?|blacklist\w*|throttl\w*|cancel\w*|shut(?:ting)? (?:it |them )?down|cut (?:off|them|it)|stop (?:sending|routing|accepting|buying)|remove (?:the |this |that )?(?:publisher|campaign|buyer)|cap (?:the |this )?(?:publisher|campaign|buyer|traffic))\b")
+_OPS_WATCH = re.compile(r"\b(?:keep (?:an eye|watching|monitoring)|continue (?:to )?monitor\w*|monitor\w*|watch\w*)\b")
+_OPS_NO_CONCERN = re.compile(r"\b(?:no action (?:is )?(?:needed|required|necessary)|nothing (?:to worry|unusual|needs attention)|no (?:cause for )?concern|nothing to investigate|all (?:is )?(?:fine|well)|perfectly healthy|no issues?)\b")
+_OPS_ALARM = re.compile(r"\b(?:significant|serious|major|severe|alarming|critical|dramatic|sharp|abnormal)\b")
+_OPS_PREV_CUE = re.compile(r"\b(?:previous|prior|earlier|before|previously|last (?:week|month|year|period)|the week before|baseline)\b")
+_OPS_CUR_CUE = re.compile(r"\b(?:now|currently|current|latest|today|this (?:week|month|year|period)|selected (?:period|dates)|most recent)\b")
 
 
-def _ops_nums(text):
-    out = set()
-    for m in _OPS_NUM.findall(str(text)):
-        try:
-            out.add(round(float(m.replace(",", "")), 1))
-        except ValueError:
-            pass
-    return out
+def _ops_alias_pairs(ans):
+    """[(real name, alias)] in a fixed order; the same mapping is used for the payload and for validation."""
+    names = sorted({str(n) for n in ans.names if n and len(str(n)) >= 2}, key=lambda n: (-len(n), n))
+    return [(n, f"name_{i:03d}") for i, n in enumerate(names, 1)]
+
+
+def _ops_alias_text(text, pairs):
+    for real, alias in pairs:
+        text = str(text).replace(real, alias)
+    return text
+
+
+def _ops_alias_obj(obj, pairs):
+    if isinstance(obj, dict):
+        return {k: _ops_alias_obj(v, pairs) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_ops_alias_obj(v, pairs) for v in obj]
+    return _ops_alias_text(obj, pairs) if isinstance(obj, str) else obj
+
+
+def _ops_r1(x):
+    try:
+        return round(float(str(x).replace(",", "")), 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def ops_evidence(ans):
+    """The structured evidence object for one answer (real names; aliased only when it is sent). Every field comes from the verified result."""
+    ev = {"answer_kind": ans.kind, "scope": None, "periods": None, "call_counts": None, "metrics": [], "primary_metric": None,
+          "anomaly_flagged": None, "segments": [], "recommendations": [{"text": s} for s in ans.steps],
+          "causation": "not established: the data shows differences and correlations only"}
+    if ans.evid:
+        ev.update(ans.evid)
+    return ev
 
 
 def ops_ai_payload(ans):
-    """(text sent to the AI, alias -> real name). Only the verified statements; entity / segment names become aliases;
-    caller IDs, phone numbers, URLs, e-mails and dates are scrubbed as a safety net. Scope lines, tables and calls are never sent."""
-    names = sorted({n for n in ans.names if n and len(str(n)) >= 2}, key=lambda n: -len(str(n)))
-    rev, text = {}, "\n".join("- " + f for f in ans.facts if f)
-    for i, n in enumerate(names, 1):
-        alias = f"name_{i:03d}"
-        rev[alias] = str(n)
-        text = text.replace(str(n), alias)
+    """(text sent to the AI, alias -> real name). Structured, labelled evidence plus the verified statements; names become aliases;
+    caller IDs, phone numbers, URLs, e-mails and dates are scrubbed as a safety net. The question, tables and call rows are never sent."""
+    pairs = _ops_alias_pairs(ans)
+    rev = {alias: real for real, alias in pairs}
+    ev = _ops_alias_obj(ops_evidence(ans), pairs)
+    facts = _ops_alias_text("\n".join("- " + f for f in ans.facts if f), pairs)
+    text = ("Verified evidence (JSON). 'previous' and 'current' are the two compared periods; 'direction' is the move from previous to current:\n"
+            + json.dumps(ev, ensure_ascii=False, default=str) + "\nVerified statements:\n" + facts)
     text = re.sub(r"https?://\S+|\S+@\S+\.\S+", "[removed]", text)
     text = re.sub(r"\+?\d[\d\s().-]{8,}\d", "[removed]", text)
     text = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "[date]", text)
     return text, rev
 
 
+def _ops_unit_kind(u):
+    u = (u or "").lower()
+    if u in ("%", "percent") or u.startswith("percentage") or u.startswith("point") or u == "pp":
+        return "pct"
+    if u.startswith("call"):
+        return "count"
+    if u.startswith(("second", "sec")):
+        return "sec"
+    if u.startswith(("day", "week", "month", "hour")):
+        return "time"
+    return "none"
+
+
+def _ops_claim_model(ans, pairs):
+    """Allowed numbers by kind (percent / count / other), the numbers each entity owns, and the labelled metric values (alias space)."""
+    ev = _ops_alias_obj(ops_evidence(ans), pairs)
+    pct, cnt, oth, ent, scope_nums = set(), set(), set(), {}, set()
+    metrics = {m["metric"]: m for m in ev.get("metrics") or []}
+
+    def add(bucket, *vals):
+        for v in vals:
+            r = _ops_r1(v)
+            if r is not None:
+                bucket.add(r)
+                bucket.add(abs(r))
+
+    for m in metrics.values():
+        kind = {"calls": cnt, "seconds": oth, "score points": oth}.get(m.get("unit"), pct)
+        add(kind, m.get("previous"), m.get("current"), m.get("change"))
+        add(scope_nums, m.get("previous"), m.get("current"), m.get("change"))
+    cc = ev.get("call_counts") or {}
+    add(cnt, cc.get("previous"), cc.get("current"))
+    add(scope_nums, cc.get("previous"), cc.get("current"))
+    sc = ev.get("scope") or {}
+    scope_alias = sc.get("name") if sc.get("name") else None
+    for sg in ev.get("segments") or []:
+        nm = sg.get("segment")
+        for k in ("explained_pct", "rate_previous", "rate_current", "share_previous", "share_current"):
+            add(pct, sg.get(k)); add(ent.setdefault(nm, set()), sg.get(k))
+        for k in ("calls_previous", "calls_current"):
+            add(cnt, sg.get(k)); add(ent.setdefault(nm, set()), sg.get(k))
+    for fact in [_ops_alias_text(f, pairs) for f in ans.facts if f]:
+        als = set(_OPS_ALIAS.findall(fact))
+        for m in _OPS_NUM_UNIT.finditer(_OPS_ALIAS.sub(" ", fact)):
+            k = _ops_unit_kind(m.group("u"))
+            if k == "time":
+                continue
+            add({"pct": pct, "count": cnt}.get(k, oth), m.group("n"))
+            for a_ in als:
+                add(ent.setdefault(a_, set()), m.group("n"))
+    if scope_alias:
+        ent.setdefault(scope_alias, set()).update(scope_nums)
+    oth = oth - cnt - pct          # a unit-less number that is a known call count / rate is NOT a free-for-all number
+    return {"ev": ev, "pct": pct, "cnt": cnt, "oth": oth, "ent": ent, "scope_nums": scope_nums if not scope_alias else set(), "metrics": metrics, "scope_alias": scope_alias, "scope_all": scope_nums}
+
+
+def _ops_clauses(sentence):
+    return [c for c in re.split(r";|,|\bbut\b|\bwhile\b|\bwhereas\b|\band\b", sentence) if c.strip()]
+
+
+def _ops_direction_claims(clause):
+    """[(+1 | -1 | 'better' | 'worse')] direction words in a clause, with simple negation turning a claim around."""
+    out = []
+    for pat, d in ((_OPS_UP, 1), (_OPS_DOWN, -1), (_OPS_BETTER, "better"), (_OPS_WORSE, "worse")):
+        for m in pat.finditer(clause):
+            neg = bool(_OPS_NEG.search(clause[:m.start()][-24:]))
+            if neg:
+                d_ = {1: -1, -1: 1, "better": "worse", "worse": "better"}[d]
+            else:
+                d_ = d
+            out.append(d_)
+    return out
+
+
+def ops_ai_check_claims(text, ans, pairs):
+    """Deterministic claim check of an AI text (alias space) against the structured evidence. Returns a list of reasons (empty = accepted)."""
+    M = _ops_claim_model(ans, pairs)
+    ev, metrics = M["ev"], M["metrics"]
+    reasons = []
+    names = {"previous": str((ev.get("periods") or {}).get("previous", "")).lower().replace("the ", "", 1) or None,
+             "current": str((ev.get("periods") or {}).get("current", "")).lower().replace("the ", "", 1) or None}
+    flagged = ev.get("anomaly_flagged")
+    recs = ev.get("recommendations") or []
+    rec_aliases = set(a for r in recs for a in _OPS_ALIAS.findall(str(r.get("text", ""))))
+    for sentence in [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", str(text)) if s.strip()]:
+        low = sentence.lower()
+        # -- causes vs correlation
+        if _OPS_CAUSAL.search(low) and not _OPS_HEDGE.search(low):
+            reasons.append("it states a cause as a fact (the evidence shows differences, not causes)")
+        # -- verified-finding contradictions
+        if _OPS_NO_CONCERN.search(low) and (flagged is True or recs):
+            reasons.append("it says nothing needs attention, but the verified findings list something to review")
+        if flagged is False:
+            for m in _OPS_ALARM.finditer(low):
+                if not _OPS_NEG.search(low[:m.start()][-24:]):
+                    reasons.append(f"it calls the change '{m.group(0)}', but the verified findings do not flag it as significant")
+                    break
+        if flagged is True and re.search(r"within (?:the )?usual|not (?:a )?significant|no significant|nothing unusual|normal range", low):
+            reasons.append("it says the change is not significant, but the verified findings flag it")
+        # -- recommendations
+        if _OPS_REC.search(low):
+            if _OPS_FORBIDDEN.search(low):
+                reasons.append("it recommends blocking, pausing or removing something (this assistant is advisory only)")
+            elif not recs and not _OPS_WATCH.search(low):
+                reasons.append("it recommends an action, but the verified findings contain no recommendation")
+            else:
+                extra = set(_OPS_ALIAS.findall(sentence)) - rec_aliases
+                if extra and recs:
+                    reasons.append("it recommends looking at an entity that the verified recommendations do not name")
+        # -- numbers: units, metric, period, entity
+        aliases = set(_OPS_ALIAS.findall(sentence))
+        masked = _OPS_ALIAS.sub(lambda m: " " * len(m.group(0)), sentence)
+        toks = [m for m in _OPS_NUM_UNIT.finditer(masked) if _ops_unit_kind(m.group("u")) != "time"]
+        mentions = sorted([(m.start(), name) for name, pat in OPS_METRIC_MENTION for m in re.finditer(pat, low)])
+        for i, tk in enumerate(toks):
+            val, kind = _ops_r1(tk.group("n")), _ops_unit_kind(tk.group("u"))
+            if val is None:
+                continue
+            if val not in (M["pct"] | M["cnt"] | M["oth"]):
+                reasons.append(f"it uses {tk.group('n')}, which is not in the verified evidence")
+                continue
+            if kind == "pct" and val not in M["pct"] and val not in M["oth"]:
+                reasons.append(f"it presents {tk.group('n')} (a call count) as a percentage")
+            if kind == "count" and val not in M["cnt"] and val not in M["oth"]:
+                reasons.append(f"it presents {tk.group('n')} (a percentage) as a call count")
+            if aliases:       # entity attribution
+                own = set().union(*[M["ent"].get(a, set()) for a in aliases]) | M["scope_nums"]
+                if val not in own:
+                    reasons.append(f"it attributes {tk.group('n')} to {', '.join(sorted(aliases))}, but that number belongs to something else")
+                    continue
+            nxt = masked[tk.end(): toks[i + 1].start()] if i + 1 < len(toks) else masked[tk.end():]
+            if re.match(r"\s*(?:of (?:the )?(?:change|calls|volume|traffic|total)|explain\w*|share)", nxt.lower()):
+                continue                                                     # shares and 'explained %' are not metric values
+            prev_end = toks[i - 1].end() if i else 0
+            before_cx = masked[max(prev_end, tk.start() - 24): tk.start()].lower()
+            near = [(p, n) for p, n in mentions if p < tk.start()] or [(p, n) for p, n in mentions if p >= tk.end()]
+            if not near:
+                continue
+            metric = near[-1][1] if mentions and [p for p, _ in mentions if p < tk.start()] else near[0][1]
+            mv = metrics.get(metric)
+            if not mv or mv.get("previous") is None or mv.get("current") is None:
+                continue
+            if aliases and (M["scope_alias"] not in aliases or val not in M["scope_all"]):
+                continue                                           # a number of another entity: the entity check above covers it
+            allowed = {_ops_r1(mv["previous"]), _ops_r1(mv["current"]), abs(_ops_r1(mv["change"])) if mv.get("change") is not None else None}
+            if kind in ("pct", "none") and metric != "Calls" and val not in allowed:
+                reasons.append(f"it gives {tk.group('n')} for {metric}, but that is not a {metric} value")
+                continue
+            # which period does the number claim to belong to?
+            window = (before_cx + " " + nxt[:28]).lower()
+            role = None
+            has_prev = bool(_OPS_PREV_CUE.search(window) or (names["previous"] and names["previous"] in window))
+            has_cur = bool(_OPS_CUR_CUE.search(window) or (names["current"] and names["current"] in window))
+            if has_prev != has_cur:
+                role = "previous" if has_prev else "current"
+            pv, cv = _ops_r1(mv["previous"]), _ops_r1(mv["current"])
+            if role and pv != cv and val in (pv, cv):
+                want = pv if role == "previous" else cv
+                if val != want:
+                    reasons.append(f"it swaps the periods: {tk.group('n')} is the {'current' if role == 'previous' else 'previous'} {metric}, not the {role} one")
+        # -- direction, per clause
+        for clause in _ops_clauses(sentence):
+            cl = clause.lower()
+            ments = [n for n in dict.fromkeys(name for _, name in sorted((m.start(), nm) for nm, pat in OPS_METRIC_MENTION for m in re.finditer(pat, cl)))]
+            claims = _ops_direction_claims(cl)
+            c_alias = set(_OPS_ALIAS.findall(clause))
+            if c_alias and M["scope_alias"] not in c_alias:     # another entity: only checkable for the segment rates in the evidence
+                seg = next((sg for sg in ev.get("segments") or [] if sg.get("segment") in c_alias), None)
+                pm = ev.get("primary_metric")
+                if claims and seg and pm and pm in ments and seg.get("rate_previous") is not None and seg.get("rate_current") is not None and seg["rate_previous"] != seg["rate_current"]:
+                    want = 1 if seg["rate_current"] > seg["rate_previous"] else -1
+                    c0 = claims[0]
+                    c0 = (OPS_GOOD_DIR.get(pm, 1) if c0 == "better" else -OPS_GOOD_DIR.get(pm, 1)) if c0 in ("better", "worse") else c0
+                    if c0 != want:
+                        reasons.append(f"it gets the direction of {pm} wrong for {', '.join(sorted(c_alias))}")
+                continue
+            if claims and not ments and len(metrics) and ev.get("primary_metric"):
+                ments = [ev["primary_metric"]]
+            if not claims or not ments:
+                continue
+            if len(set(map(str, claims))) > 1:
+                reasons.append("it makes opposite direction claims in one statement, which cannot be checked reliably")
+                continue
+            for m in ments:
+                mv = metrics.get(m)
+                if not mv:
+                    reasons.append(f"it makes a claim about {m}, which is not in the verified evidence")
+                    continue
+                true = mv.get("direction")
+                if true in (None, "n/a"):
+                    reasons.append(f"it makes a direction claim about {m}, but the verified evidence has no comparison for it")
+                    continue
+                c = claims[0]
+                if c in ("better", "worse"):
+                    good = OPS_GOOD_DIR.get(m, 1)
+                    c = (good if c == "better" else -good)
+                want = {"up": 1, "down": -1}.get(true, 0)
+                if c != want:
+                    reasons.append(f"it says {m} went {'up' if c == 1 else 'down'}, but the verified evidence says it {'went ' + true if true != 'flat' else 'did not change'}")
+            fm = re.search(r"from\s+(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:%|points?|calls?)?\s+to\s+(\d+(?:,\d{3})*(?:\.\d+)?)", cl) or None
+            tm = re.search(r"to\s+(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:%|points?|calls?)?\s+from\s+(\d+(?:,\d{3})*(?:\.\d+)?)", cl)
+            pair = (_ops_r1(fm.group(1)), _ops_r1(fm.group(2))) if fm else ((_ops_r1(tm.group(2)), _ops_r1(tm.group(1))) if tm else None)
+            if pair and len(ments) == 1 and metrics.get(ments[0]) and (not c_alias or M["scope_alias"] in c_alias):
+                mv = metrics[ments[0]]
+                pv, cv = _ops_r1(mv.get("previous")), _ops_r1(mv.get("current"))
+                if pv is not None and pv != cv and pair == (cv, pv):
+                    reasons.append(f"it swaps previous and current for {ments[0]} (the earlier value is {pv:g}, the later value is {cv:g})")
+                elif pv is not None and pair != (pv, cv):
+                    reasons.append(f"it gives a {ments[0]} movement that does not match the verified values")
+    return list(dict.fromkeys(reasons))
+
+
 def ops_ai_validate(reply, ans, rev):
-    """(real text or None, reason). The reply is untrusted: every number must occur in the verified facts and every name must be one of them."""
+    """(real text or None, reason). The reply is untrusted: the numbers, names AND claims must all be backed by the structured evidence."""
     text = str(reply or "").strip()
     if not text or len(text) > 1500:
         return None, "the reply was empty or too long"
-    allowed = _ops_nums("\n".join(ans.facts))
-    extra = _ops_nums(text) - allowed
+    allowed = _ops_nums("\n".join(ans.facts)) | _ops_nums(json.dumps(ops_evidence(ans), default=str))
+    extra = _ops_nums(_OPS_ALIAS.sub(" ", text)) - allowed
     if extra:
         return None, "it contained numbers that are not in the verified findings (" + ", ".join(f"{x:g}" for x in sorted(extra)[:4]) + ")"
-    used = set(re.findall(r"name_\d{3}", text))
+    used = set(_OPS_ALIAS.findall(text))
     if used - set(rev):
         return None, "it used a name that is not in the verified findings"
+    pairs = _ops_alias_pairs(ans)
+    why = ops_ai_check_claims(text, ans, pairs)
+    if why:
+        return None, "; ".join(why[:3])
     for alias, real in rev.items():
         text = text.replace(alias, real)
     for q in re.findall(r"'([^']{2,60})'", text):
         if q not in ans.names and q not in "\n".join(ans.facts):
             return None, f"it quoted '{q}', which is not in the verified findings"
     return text, None
+
+
+def _ops_nums(text):
+    out = set()
+    for m in _OPS_NUM.findall(str(text)):
+        r = _ops_r1(m)
+        if r is not None:
+            out.add(r)
+    return out
 
 
 def ops_ai_reword(ans, provider, model):
@@ -4882,11 +5201,11 @@ def ops_ai_reword(ans, provider, model):
     last = "unknown error"
     for key in keys:
         try:
-            raw = call_ai_provider(provider, key, model, OPS_AI_SYSTEM, "Verified findings:\n" + payload)
+            raw = call_ai_provider(provider, key, model, OPS_AI_SYSTEM, payload)
             data = json.loads(re.sub(r"^```(?:json)?|```$", "", str(raw).strip(), flags=re.MULTILINE).strip())
             text, why = ops_ai_validate(data.get("text") if isinstance(data, dict) else None, ans, rev)
             if text is None:
-                return None, f"The AI wording was rejected because {why}; showing the verified answer only."
+                return None, f"The AI explanation could not be verified ({why}), so the verified deterministic answer is shown instead."
             return text, None
         except urllib.error.HTTPError as exc:
             last = f"HTTP {exc.code}"
