@@ -7641,7 +7641,10 @@ def _ops_show_answer(a, key="a", question="", latest=False):
     if a.ai_note:
         st.caption("ℹ️ " + a.ai_note)
     for c in a.caveats:
-        st.warning(c) if ("QC" in c or "Limited" in c or "limited" in c or "Too few" in c) else st.caption("ℹ️ " + c)
+        if "QC" in c or "Limited" in c or "limited" in c or "Too few" in c:
+            st.warning(c)
+        else:
+            st.caption("ℹ️ " + c)
     if a.status != "ok":
         return
     for title, table, spec in a.charts[:2]:
