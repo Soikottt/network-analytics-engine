@@ -4565,7 +4565,7 @@ OPS_INTENTS = [   # checked in this order
     ("suspicious", r"\b(?:suspicious|fraud\w*|low[- ]quality|poor[- ]quality|junk)\b.*\b(?:calls?|traffic|leads?)\b|\b(?:calls?|traffic|leads?)\b.*\b(?:suspicious|fraud\w*|low[- ]quality|poor[- ]quality|junk)\b"),
     ("simplify", r"\b(simpler|simple terms|plain (?:english|language)|layman|eli5|in other words|dumb (?:it )?down|explain (?:that|it|this) (?:again|better|simply))\b"),
     ("calls", r"\b(supporting|behind|evidence)\b.*\b(calls?|records?)\b|\b(calls?|records?)\b.*\b(supporting|behind|evidence|conclusion)\b"),
-    ("compare_prev", r"\bcompare\w* (?:that|this|it|those)\b|\b(?:that|this|it|those)\b.*\bcompared? (?:with|to|against)\b"),
+    ("compare_prev", r"\bcompare\w* (?:that|this(?! (?:week|month|year|period|quarter)\b)|it|those)\b|\b(?:that|this(?! (?:week|month|year|period|quarter)\b)|it|those)\b.*\bcompared? (?:with|to|against)\b"),
     ("contributors", r"\bcontribut\w*|\bdrove\b|\bdrivers?\b|responsible for|\bbehind (?:that|the|this) (?:drop|change|decrease|increase|rise|spike)"),
     ("why", r"\bwhy\b|\bwhat caused\b|\bwhat (?:happened|is going on|went wrong)\b"),
     ("recs", r"\brecommend\w*|\bwhat (?:should|would|could) (?:i|we) do\b|\bwhat next\b|\bnext steps?\b|\binvestigate first\b|\bshould i (?:investigate|look|check|review|start)\b"
@@ -4573,7 +4573,7 @@ OPS_INTENTS = [   # checked in this order
     ("trend", r"\b(?:improving|declining|getting (?:better|worse)|trending|deteriorating)\b"),
     ("changes", r"\bwhat (?:has |have )?(?:changed|moved)\b|\bwhat.s different\b|\bwhat is different\b"),
     ("poor", r"\b(?:poor\w*|badly|worst performing|underperform\w*|problem\w*|at risk|risky|high[- ]risk|needs? attention|struggling|unhealthy|suspicious|fraud\w*)\b"),
-    ("overview", r"\bhow (?:is|are) (?:my |the |our )?(?:network|traffic|business|we|things|everything)\b|\bnetwork (?:performance|health|status|overview)\b"
+    ("overview", r"\bhow (?:is|are|was|were) (?:my |the |our )?(?:network|traffic|business|we|things|everything|performance|numbers|results|quality)\b|\bnetwork (?:performance|health|status|overview)\b"
                  r"|\boverall (?:performance|health)\b|\bhealth (?:check|briefing|summary)\b|\bhow (?:am|are) (?:i|we) doing\b"),
 ]
 _OPS_FOLLOW_CUE = re.compile(r"\b(?:that|those|it|them|this|these)\b|^\s*(?:and\s+)?(?:what|how) about\b|^\s*and (?:for|in)\b|\bsame\b")
@@ -4669,7 +4669,7 @@ _OPS_S6_KEY = "ops_s6_cache"
 
 def _ops_step6(qf, cols, tl):
     """Step 6 briefing for a period (cached for the session; the dashboard briefing computes the same thing)."""
-    key = (id(qf), tl.get("preset"), str(tl.get("start")), str(tl.get("end")),
+    key = (id(qf), len(qf), tuple(sorted((str(k), str(v)) for k, v in getattr(qf, "attrs", {}).items())), tl.get("preset"), str(tl.get("start")), str(tl.get("end")),
            tuple(sorted((k, str(v)) for k, v in HEALTH_RULES.items())), tuple(sorted((k, str(v)) for k, v in cols.items())))
     c = st.session_state.get(_OPS_S6_KEY)
     if c and c["key"] == key:
@@ -5821,6 +5821,403 @@ def _ops_mentions_entity(ql, qf, cols):
     return next((n for n in _ops_entity_names(qf, cols) if n.lower() in ql), None)
 
 
+# ---------------- Step 8 review: name resolution (publisher / buyer / campaign) ----------------
+# One resolver turns "shark", "SearchShark", "serch shark", "broker calls" or a configured alias into the exact sheet value, BEFORE the
+# existing parsers run. A name that fits more than one entity is never guessed: the person is asked. Two different values are never merged.
+ENTITY_LEGAL_SUFFIX = {"inc", "llc", "ltd", "co", "corp", "corporation", "company", "limited", "lp", "llp", "incorporated"}
+ENTITY_DIMS = ("publisher", "buyer", "campaign")
+ENTITY_DIM_WORDS = {"publisher": "publisher", "publishers": "publisher", "pub": "publisher", "pubs": "publisher",
+                    "buyer": "buyer", "buyers": "buyer", "campaign": "campaign", "campaigns": "campaign"}
+ENTITY_CUE_WORDS = {"for", "of", "by", "from", "vs", "versus", "with", "compare", "compared", "and", "against", "than", "named", "called", "about", "on", "to",
+                    "publisher", "publishers", "pub", "buyer", "buyers", "campaign", "campaigns"}
+ENTITY_FUZZY_CUTOFF = 0.84
+
+
+def entity_alias_config():
+    """{alias: canonical} from ENTITY_ALIASES (Secrets / env). JSON object, a TOML table, or lines 'ABC = Apex Leads'.
+    A value that is a list means canonical -> aliases:  {"Apex Leads": ["ABC", "apex one"]}."""
+    raw = None
+    try:
+        raw = st.secrets.get("ENTITY_ALIASES", None)
+    except Exception:
+        raw = None
+    if raw is None or (not hasattr(raw, "items") and not str(raw).strip()):
+        raw = os.environ.get("ENTITY_ALIASES", "")
+    pairs = []
+    try:
+        if not hasattr(raw, "items"):
+            s_ = str(raw).strip()
+            if not s_:
+                return {}
+            if s_[0] in "{[":
+                raw = json.loads(s_)
+            else:
+                for ln in re.split(r"[\n;]+", s_):
+                    if "=" in ln:
+                        a, c = ln.split("=", 1)
+                        if a.strip() and c.strip():
+                            pairs.append((a.strip(), c.strip()))
+                raw = {}
+        for k, v in dict(raw).items():
+            if isinstance(v, (list, tuple)) or hasattr(v, "__iter__") and not isinstance(v, str):
+                pairs += [(str(a).strip(), str(k).strip()) for a in v if str(a).strip()]
+            else:
+                pairs.append((str(k).strip(), str(v).strip()))
+    except Exception:
+        return {}
+    return {a: c for a, c in pairs if a and c}
+
+
+def _ent_compact(s):
+    toks = _nl_norm(s).split()
+    while len(toks) > 1 and toks[-1] in ENTITY_LEGAL_SUFFIX:
+        toks.pop()
+    return "".join(toks), toks
+
+
+def entity_catalog(qf, cols):
+    """{dim: [exact sheet values]} for publisher, buyer, campaign."""
+    return {k: _nl_values(qf, cols, k) for k in ENTITY_DIMS}
+
+
+def entity_resolve_alias_map(cat):
+    """(usable {alias_compact: [(dim, value)]}, problems [text]). An alias must point at a value that exists; it never overrides a real name."""
+    out, problems = {}, []
+    real = {}
+    for k, vals in cat.items():
+        for v in vals:
+            real.setdefault(_ent_compact(v)[0], []).append((k, v))
+    for alias, target in entity_alias_config().items():
+        tc = _ent_compact(target)[0]
+        hits = [(k, v) for k, vals in cat.items() for v in vals if _ent_compact(v)[0] == tc]
+        if not hits and any(_ent_compact(v)[0] == _ent_compact(alias)[0] for vals in cat.values() for v in vals):
+            alias, target = target, alias                      # written the other way round: 'Real Name = short'
+            tc = _ent_compact(target)[0]
+            hits = [(k, v) for k, vals in cat.items() for v in vals if _ent_compact(v)[0] == tc]
+        if not hits:
+            problems.append(f"Alias '{alias}' points to '{target}', which is not a publisher, buyer or campaign in the loaded data (ignored).")
+            continue
+        ac = _ent_compact(alias)[0]
+        if ac in real and not any(h in real[ac] for h in hits):
+            problems.append(f"Alias '{alias}' is also the real name of another value, so it was ignored (real names always win).")
+            continue
+        out.setdefault(ac, [])
+        for h in hits:
+            if h not in out[ac]:
+                out[ac].append(h)
+    return out, problems
+
+
+def entity_match_phrase(phrase, cat, alias_map, dim_hint=None):
+    """Best-tier candidates for a phrase: (tier, [(dim, value)]). tier 0 alias, 1 same name ignoring spaces / punctuation / legal suffix,
+    2 all words of the phrase are words (or long prefixes of words) of the name, 3 close spelling. (None, []) when nothing fits."""
+    pc, ptoks = _ent_compact(phrase)
+    if not pc:
+        return None, []
+    dims = [dim_hint] if dim_hint else list(ENTITY_DIMS)
+    if pc in alias_map:
+        c = [x for x in alias_map[pc] if x[0] in dims]
+        if c:
+            return 0, c
+    t1, t2, t3 = [], [], []
+    for k in dims:
+        for v in cat.get(k, []):
+            vc, vtoks = _ent_compact(v)
+            if not vc:
+                continue
+            if vc == pc:
+                t1.append((k, v))
+                continue
+            if all(any(t == w or (len(t) >= 5 and w.startswith(t) and len(t) >= 0.6 * len(w)) for w in vtoks) for t in ptoks) and len(pc) >= 3:
+                t2.append((k, v))
+                continue
+            if len(pc) >= 5 and len(vc) >= 5 and difflib.SequenceMatcher(None, pc, vc).ratio() >= ENTITY_FUZZY_CUTOFF:
+                t3.append((k, v))
+    for tier, c in ((1, t1), (2, t2), (3, t3)):
+        if c:
+            return tier, c
+    return None, []
+
+
+_ENTITY_COMMON = None
+
+
+def _entity_vocab():
+    global _ENTITY_COMMON
+    if _ENTITY_COMMON is None:
+        v = set(NL_STOP) | set(OPS_STOP) | set(NL_SERVICES) | set(NL_MONTHS)
+        v |= set("monday tuesday wednesday thursday friday saturday sunday week weeks weekly performance then also please tell about next than into out up down "
+                 "last first more less good bad new old data report reports status trend trends pattern patterns problematic problem problems investigate analyze analyse "
+                 "increase increased decreased dropped drop one two three four five six seven eight nine ten".split())
+        _ENTITY_COMMON = v - {"one", "two", "three"}      # "Buyer One" is a real name; number words stay usable inside names when a dim word or cue precedes
+    return _ENTITY_COMMON
+
+
+_ENT_TOKEN = re.compile(r"[A-Za-z0-9ঀ-৿][A-Za-z0-9ঀ-৿'&.\-/]*")
+
+
+def ops_resolve_names(question, qf, cols):
+    """(rewritten question, notes, clarify_text, options). Short / misspelled / alias names are replaced by the exact sheet value;
+    names that fit several values give clarify_text and options. Exact names are left to the existing parser."""
+    q = str(question or "")
+    cat = entity_catalog(qf, cols)
+    if not any(cat.values()):
+        return q, [], None, []
+    alias_map, _ = entity_resolve_alias_map(cat)
+    toks = [(re.sub(r"['\u2019]s$", "", m.group(0)).strip(".'&-/"), m.start(), m.end()) for m in _ENT_TOKEN.finditer(q)]
+    toks = [t for t in toks if t[0]]
+    low = [t[0].lower() for t in toks]
+    n = len(toks)
+    exact_norms = {}
+    for k, vals in cat.items():
+        for v in vals:
+            nv = _nl_norm(v)
+            if nv:
+                exact_norms.setdefault(nv, []).append((k, v))
+    covered = [False] * n
+    for L in range(min(6, n), 0, -1):                              # exact (normalised) names already present: the existing parser handles them
+        for i in range(0, n - L + 1):
+            if any(covered[i:i + L]):
+                continue
+            if _nl_norm(" ".join(low[i:i + L])) in exact_norms:
+                for j in range(i, i + L):
+                    covered[j] = True
+    vocab = _entity_vocab()
+    found = []   # (tier, -length, start, end, cands, dim_hint, cue)
+    for L in range(min(4, n), 0, -1):
+        for i in range(0, n - L + 1):
+            if any(covered[i:i + L]):
+                continue
+            words = low[i:i + L]
+            prev = low[i - 1] if i > 0 else ""
+            dim_hint = ENTITY_DIM_WORDS.get(prev)
+            cue = bool(dim_hint) or prev in ENTITY_CUE_WORDS
+            if words[0] in ENTITY_DIM_WORDS or all(w in vocab or w in ENTITY_CUE_WORDS for w in words):
+                tier_ok_vocab = False
+            else:
+                tier_ok_vocab = True
+            phrase = " ".join(words)
+            tier, cands = entity_match_phrase(phrase, cat, alias_map, dim_hint)
+            if tier is None:
+                continue
+            if tier >= 2:
+                if not tier_ok_vocab or any(w in vocab for w in words):
+                    continue
+                if tier == 3 and not cue:
+                    continue
+                if tier == 2 and L == 1 and len(words[0]) < 4 and not dim_hint:
+                    continue
+            elif tier == 1 and L == 1 and words[0] in vocab and not dim_hint:
+                continue
+            found.append((tier, -L, i, i + L, cands, dim_hint, cue))
+    found.sort(key=lambda f: (f[0], f[1], f[2]))
+    used = [False] * n
+    repl, notes = [], []
+    for tier, negl, i, j, cands, dim_hint, cue in found:
+        if any(used[i:j]):
+            continue
+        distinct = list(dict.fromkeys(cands))
+        phrase = q[toks[i][1]:toks[j - 1][2]]
+        if len(distinct) > 1:
+            if not (cue or dim_hint):
+                continue
+            for x in range(i, j):
+                used[x] = True
+            opts = [f"{QUERY_LABELS[k]} {v}" for k, v in distinct[:8]]
+            return q, notes, (f"'{phrase}' could mean more than one thing: " + "; ".join(opts) + ". Which one do you mean? "
+                              "(Different names are never merged automatically; ask again with the full name, e.g. '" + QUERY_LABELS[distinct[0][0]].lower() + " " + distinct[0][1] + "'.)"), opts
+        k, v = distinct[0]
+        for x in range(i, j):
+            used[x] = True
+        if _nl_norm(phrase) == _nl_norm(v):
+            continue
+        add_word = "" if dim_hint else QUERY_LABELS[k].lower() + " "
+        repl.append((toks[i][1], toks[j - 1][2], add_word + v))
+        how = {0: "configured alias", 1: "same name apart from spacing or punctuation", 2: "partial name", 3: "close spelling"}[tier]
+        notes.append(f"'{phrase}' was understood as {QUERY_LABELS[k]} '{v}' ({how}).")
+    for s_, e_, txt in sorted(repl, reverse=True):
+        q = q[:s_] + txt + q[e_:]
+    return q, notes, None, []
+
+
+def ops_entity_report(qf, cols):
+    """Lines for the data-health panel: configured aliases that cannot be used, and different values whose names are nearly identical (never merged)."""
+    cat = entity_catalog(qf, cols)
+    _, problems = entity_resolve_alias_map(cat)
+    out = list(problems)
+    for k, vals in cat.items():
+        comp = {}
+        for v in vals:
+            comp.setdefault(_ent_compact(v)[0], []).append(v)
+        for c, vs in comp.items():
+            if len(vs) > 1:
+                out.append(f"{QUERY_LABELS[k]} values that differ only in spacing/punctuation: {', '.join(vs)}. They are treated as DIFFERENT; use ENTITY_ALIASES only if you want a short name for one of them.")
+        names = sorted(comp)
+        for a_i in range(len(names)):
+            for b_i in range(a_i + 1, len(names)):
+                a, b = names[a_i], names[b_i]
+                if len(a) >= 6 and len(b) >= 6 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.9:
+                    out.append(f"{QUERY_LABELS[k]} names that look very similar: {comp[a][0]} / {comp[b][0]} (kept separate).")
+    return out
+
+
+# ---------------- Step 8 review: Banglish / Bengali-script / mixed-language questions ----------------
+# A fixed dictionary turns the question into plain English BEFORE the existing parsers run. No AI is involved, so numbers can never come from it.
+# Unknown words (names such as 'ABC') are kept exactly as typed. The English reading is always shown to the person.
+_BN_RE = re.compile(r"[ঀ-৿]")
+BN_STRONG = set("""ajke aj aaj ajker ajkey gotokal ghotokal goto gato ager ei koyta koyti koita koyto koto kotogulo kothay kon kun konta ashche asche esheche ashse aseche
+komse kome komche komeche komlo kombe bereche berese barche barlo keno kenu kno kemon cheye koro kor korun koren dekhao dekhan bolo bolun jonno jonne jonyo shoptaho soptaho saptaho
+sobcheye shobcheye kharap valo bhalo bhaalo hoyeche hoise hocche tarpor ebong shob sob kolgulo""".split())
+BN_WORDS = {   # Banglish (lowercase) -> English ("" = particle, dropped)
+    "ajke": "today", "aj": "today", "aaj": "today", "ajker": "today", "ajkey": "today", "kal": "yesterday", "gotokal": "yesterday", "ghotokal": "yesterday",
+    "ei": "this", "eai": "this", "ager": "last", "goto": "last", "gato": "last", "gotoo": "last", "shesh": "last",
+    "shoptaho": "week", "soptaho": "week", "saptaho": "week", "mas": "month", "mash": "month", "mase": "month", "bochor": "year", "bosor": "year", "din": "days",
+    "koyta": "how many", "koyti": "how many", "koita": "how many", "koyto": "how many", "koto": "how many", "kotogulo": "how many",
+    "call": "calls", "calls": "calls", "kol": "calls", "kolgulo": "calls", "kolgula": "calls",
+    "ashche": "", "asche": "", "esheche": "", "ashse": "", "aseche": "", "ache": "", "hoyeche": "", "hoise": "", "hocche": "", "hochhe": "", "holo": "", "ase": "",
+    "komse": "dropped", "kome": "dropped", "komche": "dropped", "komeche": "dropped", "komlo": "dropped", "kombe": "dropped", "komgese": "dropped",
+    "bereche": "increased", "berese": "increased", "barche": "increased", "barlo": "increased", "beshi": "highest", "bashi": "highest", "kom": "lowest",
+    "keno": "why", "kenu": "why", "kno": "why", "kon": "which", "kun": "which", "konta": "which", "kothay": "which",
+    "kemon": "performance", "kharap": "worst", "valo": "best", "bhalo": "best", "bhaalo": "best", "bhal": "best",
+    "koro": "", "kor": "", "korun": "", "koren": "", "dekhao": "", "dekhan": "", "dekhaw": "", "bolo": "", "bolun": "", "bol": "",
+    "jonno": "", "jonne": "", "jonyo": "", "moddhe": "", "majhe": "", "er": "", "e": "", "ke": "", "te": "", "theke": "", "diye": "", "o": "", "ta": "", "ti": "", "gulo": "", "ki": "",
+    "tarpor": "then", "ebong": "and", "ar": "and", "shob": "all", "sob": "all", "shomossha": "problem", "somossha": "problem", "shomoshya": "problem",
+    "pub": "publisher", "pubs": "publisher", "pablisher": "publisher", "publisher": "publisher", "publishers": "publishers", "buyer": "buyer", "byr": "buyer",
+    "camp": "campaign", "kampen": "campaign", "campaign": "campaign", "campaigns": "campaigns",
+    "perfomance": "performance", "parformance": "performance", "performance": "performance", "porformance": "performance",
+}
+BN_PHRASES = [   # multi-word Banglish, matched on lowercase tokens before the single-word table
+    (("er", "cheye"), "<<THAN>>"), (("theke", "beshi"), "<<THAN>>"), (("cheye",), "<<THAN>>"),
+    (("sobcheye", "kharap"), "worst"), (("shobcheye", "kharap"), "worst"), (("sobcheye", "valo"), "best"), (("shobcheye", "valo"), "best"), (("shobcheye", "bhalo"), "best"),
+    (("sobcheye", "bhalo"), "best"), (("sobcheye", "beshi"), "highest"), (("shobcheye", "beshi"), "highest"), (("sobcheye", "kom"), "lowest"), (("shobcheye", "kom"), "lowest"),
+    (("kome", "gese"), "dropped"), (("kom", "hoyeche"), "dropped"), (("kom", "hoise"), "dropped"), (("bere", "gese"), "increased"), (("beshi", "hoyeche"), "increased"),
+    (("goto", "kal"), "yesterday"), (("ghoto", "kal"), "yesterday"), (("ei", "shoptaho"), "this week"), (("ei", "mash"), "this month"), (("ei", "mas"), "this month"),
+    (("ager", "shoptaho"), "last week"), (("ager", "mas"), "last month"), (("goto", "shoptaho"), "last week"), (("goto", "mas"), "last month"),
+    (("then",), "then"),
+]
+BN_SCRIPT_WORDS = {   # Bengali script, base forms (inflections -টা -টি -গুলো -ের -কে -তে are stripped first)
+    "আজ": "today", "আজকে": "today", "আজকের": "today", "গতকাল": "yesterday", "গতকালের": "yesterday", "কাল": "yesterday",
+    "কয়টা": "how many", "কয়টি": "how many", "কতগুলো": "how many", "কতটা": "how many", "কত": "how many", "কতো": "how many",
+    "কল": "calls", "কলের": "calls", "কলগুলো": "calls", "কলগুলি": "calls", "কলে": "calls", "কলগুলোর": "calls",
+    "এসেছে": "", "এসেছিল": "", "আছে": "", "হয়েছে": "", "হচ্ছে": "", "হলো": "", "আসছে": "", "এর": "", "থেকে": "", "জন্য": "", "ও": "", "এ": "", "কি": "", "কী": "", "টা": "", "টি": "",
+    "এই": "this", "গত": "last", "সপ্তাহ": "week", "সপ্তাহে": "week", "সপ্তাহের": "week", "উইক": "week", "মাস": "month", "মাসে": "month", "মাসের": "month", "বছর": "year", "বছরের": "year", "দিন": "days",
+    "কেন": "why", "কোন": "which", "কোনটি": "which", "কোনগুলো": "which", "কোনটা": "which", "কমেছে": "dropped", "কমে": "dropped", "কমলো": "dropped", "কমেছে।": "dropped",
+    "বেড়েছে": "increased", "বাড়ছে": "increased", "বাড়লো": "increased", "বেশি": "highest", "বেশী": "highest", "কম": "lowest",
+    "পাবলিশার": "publisher", "পাবলিশারের": "publisher", "পাবলিশাররা": "publishers", "বায়ার": "buyer", "বায়ারের": "buyer", "ক্যাম্পেইন": "campaign", "ক্যাম্পেন": "campaign",
+    "ক্যাম্পেইনের": "campaign", "ক্যাম্পেইনগুলো": "campaigns",
+    "স্প্যাম": "spam", "স্প্যামের": "spam", "ভিওআইপি": "voip", "কোয়ালিফাইড": "qualified", "তুলনা": "compare", "করো": "", "করুন": "", "কর": "", "দেখাও": "", "দেখান": "", "বলো": "", "বলুন": "",
+    "পারফরম্যান্স": "performance", "পারফরমেন্স": "performance", "কেমন": "performance", "খারাপ": "worst", "ভালো": "best", "ভাল": "best", "তারপর": "then", "সমস্যা": "problem",
+    "সমস্যাযুক্ত": "problematic", "তদন্ত": "investigate", "বিশ্লেষণ": "analyze", "সব": "all", "সবগুলো": "all", "সবচেয়ে": "most", "চেয়ে": "<<THAN>>",
+}
+_BN_SUFFIXES = ("গুলোর", "গুলো", "গুলি", "টার", "টির", "টা", "টি", "ের", "কে", "তে", "র", "ে")
+_BN_VERBS = {"compare", "investigate", "analyze", "check", "explain", "show", "list", "rank"}
+_BN_PERIOD = {"today", "yesterday", "this", "last", "week", "month", "year", "days", "day", "previous", "past", "current"}
+_BN_TOKEN = re.compile(r"[ঀ-৿]+|[A-Za-z0-9][A-Za-z0-9'&.\-/]*|[,;.]")
+
+
+def ops_is_bangla_like(question):
+    q = str(question or "")
+    if _BN_RE.search(q):
+        return True
+    toks = re.findall(r"[a-z]+", q.lower())
+    return sum(1 for t in toks if t in BN_STRONG) >= 1
+
+
+def _bn_strip(word):
+    if word in BN_SCRIPT_WORDS:
+        return BN_SCRIPT_WORDS[word]
+    for suf in _BN_SUFFIXES:
+        if word.endswith(suf) and len(word) > len(suf) + 1 and word[:-len(suf)] in BN_SCRIPT_WORDS:
+            return BN_SCRIPT_WORDS[word[:-len(suf)]]
+    return None
+
+
+def ops_translate_question(question):
+    """(english question, was_translated). Dictionary based; English-only questions are returned unchanged."""
+    q = str(question or "").strip()
+    if not q or not ops_is_bangla_like(q):
+        return q, False
+    raw = [t.rstrip(".-/'&") if t[:1].isascii() and len(t) > 1 else t for t in _BN_TOKEN.findall(q)]
+    raw = [t for t in raw if t]
+    toks = []                                   # (text, is_known_translation)
+    i = 0
+    while i < len(raw):
+        t = raw[i]
+        tl = t.lower()
+        done = False
+        for ph, rep in sorted(BN_PHRASES, key=lambda p: -len(p[0])):
+            L = len(ph)
+            if tuple(x.lower() for x in raw[i:i + L]) == ph:
+                if ph == ("then",):
+                    break
+                toks.append((rep, True))
+                i += L
+                done = True
+                break
+        if done:
+            continue
+        if _BN_RE.search(t):
+            tr = _bn_strip(t)
+            toks.append((tr, True) if tr is not None else (t, False))
+        elif tl in BN_WORDS:
+            toks.append((BN_WORDS[tl], True))
+        else:
+            toks.append((t, False))
+        i += 1
+    # flatten, drop empties and doubled words
+    words = []
+    for text, known in toks:
+        for w in str(text).split():
+            if w and (not words or words[-1][0] != w):
+                words.append((w, known))
+    # "A than B": B compared with A  ("last week er cheye ei week e performance" -> compare this week with last week performance)
+    if any(w == "<<THAN>>" for w, _ in words):
+        k = next(i for i, (w, _) in enumerate(words) if w == "<<THAN>>")
+        left, right = words[:k], words[k + 1:]
+        a = []
+        while left and left[-1][0].lower() in _BN_PERIOD:
+            a.insert(0, left.pop())
+        b = []
+        while right and right[0][0].lower() in _BN_PERIOD:
+            b.append(right.pop(0))
+        if a and b:
+            words = [("compare", True)] + b + [("with", True)] + a + left + right
+        else:
+            words = left + right
+    # NAME + publisher/buyer/campaign  ->  publisher NAME   (Banglish word order: "ABC pub")
+    out = []
+    for w, known in words:
+        if out and w.lower() in ("publisher", "buyer", "campaign") and not out[-1][1] and out[-1][0].lower() not in _entity_vocab() and not out[-1][0] in ",;.":
+            prev = out.pop()
+            out.append((w, True))
+            out.append(prev)
+        else:
+            out.append((w, known))
+    # a verb that ends a clause moves to its front:  "ABC calls compare then problems investigate"  ->  "compare ABC calls then investigate problems"
+    segs, cur = [], []
+    for w, known in out:
+        if w.lower() in ("then", ",", ";", "."):
+            segs.append(cur)
+            segs.append([(w if w.lower() == "then" else "then", True)])
+            cur = []
+        else:
+            cur.append((w, known))
+    segs.append(cur)
+    final = []
+    for sg in segs:
+        if len(sg) > 1 and sg[-1][0].lower() in _BN_VERBS and sg[0][0].lower() not in _BN_VERBS:
+            sg = [sg[-1]] + sg[:-1]
+        final += sg
+    text = " ".join(w for w, _ in final)
+    text = re.sub(r"\bthen\b(?:\s+then\b)+", "then", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^(?:then\s+)+|(?:\s+then)+$", "", text, flags=re.I)
+    if text and not re.search(r"\b(how many|which|why|compare|investigate|show|list|rank|performance|highest|lowest|best|worst)\b", text, re.I):
+        text = ("show " + text) if text else text
+    return text, text.lower() != q.lower()
+
+
+
 def ops_message_kind(question, qf, cols, ctx=None, nl_prev=None):
     """'empty' | 'data' | 'casual'. Deterministic; decides whether the sheet is touched at all."""
     q = str(question or "").strip()
@@ -5835,6 +6232,9 @@ def ops_message_kind(question, qf, cols, ctx=None, nl_prev=None):
         return "data"
     if OPS_WEAK.search(ql) and (intent or hint) and re.search(r"\b(?:quality|performance|numbers|results|stats|metrics?|drop\w*|trend\w*)\b", ql):
         return "data"
+    first = next((n for n, p in OPS_INTENTS if re.search(p, ql)), None)
+    if first in ("changes", "trend", "poor", "overview", "contributors", "why", "compare_all", "compare_prev") and OPS_WEAK.search(ql):
+        return "data"                                  # "what changed this week?" is a question about the sheet, not small talk
     has_ctx = bool(ctx) or nl_prev is not None
     follow = bool(_FOLLOW_WHAT_ABOUT.match(ql)) or bool(_OPS_FOLLOW_CUE.search(re.sub(r"\bthis (?:week|month|year|period)\b", " ", ql)))
     if has_ctx and (_FOLLOW_WHAT_ABOUT.match(ql) or ((follow or len(ql.split()) <= 6) and (intent or hint))):
@@ -5983,7 +6383,336 @@ def _agent_ctx(a):
     return {"via": "agent", "request": {}, "entity": None, "period": None, "metric": None, "simple": a.answer, "scope": a.scope}
 
 
-def ops_respond(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_TIMEZONE, use_ai=None, history=None, mode=None, memory=None):
+# ---------------- Step 8 review: whole-network / one-name comparison of any two periods ----------------
+OPS_PAIR_METRICS = ["Calls", "Qualified", "Qualification %", "Spam %", "VoIP %", "Fake %", "Avg Score", "Avg Duration (sec)", "QC Completion %"]
+_OPS_PAIR_CUE = re.compile(r"\b(?:compare\w*|vs|versus|against|than|compared (?:to|with))\b", re.I)
+_OPS_PAIR_SKIP = re.compile(r"\b(?:which|rank\w*|top|best|worst|highest|lowest|biggest|most|least|why|anomal\w*|spam|voip|fake|qualif\w*|score|duration|calls?|volume)\b", re.I)
+
+
+def ops_period_pair(question, qf, cols, today):
+    """(entity, [(label, timeline) x 2]) when the question compares two explicit periods of the whole network or one named publisher / buyer / campaign
+    without naming a single metric ('compare this week with last week performance'); else None. Questions about one metric stay with Step 5B."""
+    ql = str(question or "").lower()
+    if not _OPS_PAIR_CUE.search(ql) or re.search(r"\b(?:all|every|each)\b|\b(?:publishers|buyers|campaigns)\b", ql):
+        return None
+    rest = re.sub(r"\b(?:performance|quality|numbers|results|stats|everything|overall|how|is|are|was|were|the|my|our|in|of|calls?)\b", " ", ql)
+    if _OPS_PAIR_SKIP.search(re.sub(r"\bcalls?\b", " ", ql)) and not re.search(r"\bperformance\b", ql):
+        return None
+    if re.search(r"\b(?:which|rank\w*|top|best|worst|highest|lowest|biggest|most|least|why|anomal\w*)\b", ql):
+        return None
+    nlq = _ops_light_parse(question, qf, cols, today, {}, None)
+    if nlq.ambiguities or nlq.unavailable:
+        return None
+    tls = [t for t in nlq.timelines if t[1].get("start") is not None and t[1].get("end") is not None]
+    uniq = []
+    for lab, tl in tls:
+        if not any(tl["start"] == u[1]["start"] and tl["end"] == u[1]["end"] for u in uniq):
+            uniq.append((lab, tl))
+    if len(uniq) != 2:
+        return None
+    ents = [(k, v) for k in ENTITY_DIMS for v in nlq.entities.get(k, [])]
+    if len(ents) > 1 or any(k not in ENTITY_DIMS for k in nlq.entities):
+        return None
+    return (ents[0] if ents else None), sorted(uniq, key=lambda t: t[1]["start"])
+
+
+def ops_period_pair_answer(qf, cols, entity, pair):
+    spec = {entity[0]: entity[1]} if entity else {}
+    scope = filter_calls(qf, cols, spec, title="Scope")
+    if not scope.available:
+        return OpsAnswer(status="unavailable", kind="period_pair", answer=scope.message)
+    (la, ta), (lb, tb) = pair
+    rows, stats, days = {}, {}, {}
+    for tag, tl in (("A", ta), ("B", tb)):
+        sl = slice_period(scope.data, tl["start"], tl["end"])
+        days[tag] = (pd.Timestamp(tl["end"]) - pd.Timestamp(tl["start"])).days + 1
+        g = get_group_stats(sl, cols, None, health=False, title="Period")
+        stats[tag] = (len(sl), g.data.iloc[0] if g.data is not None and len(g.data) else None)
+    names = [entity[1]] if entity else []
+    a = OpsAnswer(kind="period_pair", sources=["filter_calls", "slice_period", "get_group_stats"], names=list(names),
+                  scope=_ops_scope_text(entity, (la, ta), compare=f"{lb}: {describe_period(tb['start'], tb['end'])}"))
+    if not stats["A"][0] or not stats["B"][0]:
+        empty = la if not stats["A"][0] else lb
+        a.status = "unavailable"
+        a.answer = f"There are no calls in the sheet for {empty} ({_ops_name(entity)}), so the two periods cannot be compared."
+        return a
+    ra, rb = stats["A"][1], stats["B"][1]
+    table = []
+    for m in OPS_PAIR_METRICS:
+        va, vb = ra.get(m, float("nan")), rb.get(m, float("nan"))
+        ch = "–" if pd.isna(va) or pd.isna(vb) else (_fmt_change(m, vb - va, va) if m in OPS_COLS or m == "QC Completion %" or m == "Qualified" else "–")
+        if m == "Qualified":
+            ch = "–" if pd.isna(va) or pd.isna(vb) else f"{vb - va:+,.0f} calls"
+        if m == "QC Completion %" and not pd.isna(va) and not pd.isna(vb):
+            ch = f"{vb - va:+.1f} points"
+        table.append({"Metric": m, f"{la} ({describe_period(ta['start'], ta['end'])})": fmt_trend_value(m, va) if m != "Qualified" else f"{int(va):,}",
+                      f"{lb} ({describe_period(tb['start'], tb['end'])})": fmt_trend_value(m, vb) if m != "Qualified" else f"{int(vb):,}", "Change (later vs earlier)": ch})
+    a.evidence.append(("Two periods side by side (Step 5A metrics)", pd.DataFrame(table)))
+    ca, cb = int(ra["Calls"]), int(rb["Calls"])
+    pa, pb = ra["Qualification %"], rb["Qualification %"]
+    a.answer = (f"For {_ops_name(entity)}: {la} had {ca:,} calls and {lb} had {cb:,} calls. "
+                f"Qualification {fmt_trend_value('Qualification %', pa)} → {fmt_trend_value('Qualification %', pb)}; "
+                f"Spam {fmt_trend_value('Spam %', ra['Spam %'])} → {fmt_trend_value('Spam %', rb['Spam %'])}; VoIP {fmt_trend_value('VoIP %', ra['VoIP %'])} → {fmt_trend_value('VoIP %', rb['VoIP %'])}.")
+    a.simple = a.answer
+    a.observed.append(f"{la}: {days['A']} day(s); {lb}: {days['B']} day(s).")
+    if days["A"] != days["B"]:
+        a.caveats.append(f"The two periods have different lengths ({days['A']} day(s) vs {days['B']} day(s)), so the call counts are not like-for-like. Compare the percentages, "
+                         "or ask 'what changed this week' for the same-elapsed-time comparison.")
+    for lab, r in ((la, ra), (lb, rb)):
+        qc = r.get("QC Completion %")
+        if qc is not None and pd.notna(qc) and qc < 80:
+            a.caveats.append(f"AI QC is complete for only {qc:.0f}% of the calls in {lab}, so qualification and spam figures for that period are limited.")
+    a.possible.append("These are differences between two periods; they do not show what caused them. Ask 'Why did <metric> change?' for the breakdown.")
+    return a
+
+
+# ---------------- Step 8 review: "which campaign / publisher / buyer got worse / increased / dropped" ----------------
+_OPS_MOV_UP = r"increas\w*|rose|rise\w*|jump\w*|spik\w*|grew|grow\w*|went up|gone up|higher"
+_OPS_MOV_DOWN = r"drop\w*|decreas\w*|declin\w*|fell|fall\w*|dipp?\w*|went down|gone down|lower"
+_OPS_MOV_BAD = r"worse|worsen\w*|deteriorat\w*|got worse|gotten worse"
+_OPS_MOV_RE = re.compile(r"\b(" + _OPS_MOV_UP + r"|" + _OPS_MOV_DOWN + r"|" + _OPS_MOV_BAD + r")\b", re.I)
+_OPS_MOV_BLOCK = re.compile(r"\b(?:why|should (?:i|we)|recommend\w*|what caused|contribut\w*|improv\w*|better|best|worst|highest|lowest|most|least|top)\b", re.I)
+
+
+def ops_movers(question, qf, cols, today, sidebar_tl):
+    """Which publishers / buyers / campaigns went up, down or got worse between the period and its previous equivalent period (Step 5A compare_group_periods).
+    None when the question is not of that form (then the normal assistant answers)."""
+    ql = str(question or "").lower()
+    dims = [k for k, p in (("publisher", r"\bpublishers?\b"), ("buyer", r"\bbuyers?\b"), ("campaign", r"\bcampaigns?\b")) if re.search(p, ql)]
+    if len(dims) != 1 or not re.search(r"\b(?:which|what|any)\b", ql) or _OPS_MOV_BLOCK.search(ql):
+        return None
+    mv = _OPS_MOV_RE.search(ql)
+    if not mv:
+        return None
+    nlq = _ops_light_parse(question, qf, cols, today, {}, None)
+    if nlq.entities or nlq.ambiguities or nlq.unavailable:
+        return None
+    dim = dims[0]
+    word = mv.group(1)
+    kind = "up" if re.fullmatch(_OPS_MOV_UP, word) else "down" if re.fullmatch(_OPS_MOV_DOWN, word) else "bad"
+    metric = _ops_metric(ql)
+    if metric is None and kind != "bad":
+        metric = "Calls"
+    tl_pair = nlq.timelines[0] if nlq.timelines else None
+    label, tl, p_note = _ops_period(tl_pair, sidebar_tl, today)
+    comp = compare_group_periods(qf, cols, [dim], tl, reference=qf)
+    scope_txt = _ops_scope_text(None, (label, tl), extra=[f"Grouped by: {QUERY_LABELS[dim]}"])
+    a = OpsAnswer(kind="movers", scope=scope_txt, sources=["compare_group_periods"])
+    if not comp.available or comp.data is None or comp.data.empty:
+        a.status, a.answer = "unavailable", (comp.message if not comp.available else INSUFFICIENT_MSG)
+        return a
+    df_, gcol = comp.data, comp.extra["gcols"][0]
+    info = comp.extra["info"]
+    a.scope += f" · Compared with: {info['prev_name']}"
+    if p_note:
+        a.caveats.append(p_note)
+    enough = df_["Enough data"].astype(str).str.startswith("Yes") if metric != "Calls" else pd.Series(True, index=df_.index)
+    use = df_[enough]
+    n_all, n_use = len(df_), len(use)
+    lower_better = metric in NL_LOWER_IS_BETTER if metric else False
+    if metric:
+        lab, chg = OPS_COLS[metric]
+        rows = use[use[chg].notna()]
+        want_up = (kind == "up") or (kind == "bad" and lower_better)
+        pick = rows[rows[chg] > 0] if want_up else rows[rows[chg] < 0]
+        pick = pick.sort_values(chg, ascending=not want_up).head(8)
+        word_txt = {"up": "increased", "down": "decreased", "bad": "got worse"}[kind]
+        tab = pd.DataFrame({QUERY_LABELS[dim]: pick[gcol], f"{metric} (before)": [fmt_trend_value(metric, v) for v in pick[f"{lab} (before)"]],
+                            f"{metric} (now)": [fmt_trend_value(metric, v) for v in pick[f"{lab} (now)"]],
+                            "Change": [_fmt_change(metric, c, b) for c, b in zip(pick[chg], pick[f"{lab} (before)"])],
+                            "Calls (now)": pick["Calls (now)"].astype(int), "Calls (before)": pick["Calls (before)"].astype(int)})
+        if not n_use:
+            a.answer = f"No {QUERY_LABELS[dim].lower()} has enough calls in both periods ({info['prev_name']} and {info['cur_name']}) to rate {metric} reliably."
+        elif pick.empty:
+            a.answer = f"No {QUERY_LABELS[dim].lower()} shows {metric} {word_txt} between {info['prev_name']} and {info['cur_name']} among the {n_use} with enough calls."
+        else:
+            top = "; ".join(f"{r[gcol]} ({_fmt_change(metric, r[chg], r[f'{lab} (before)'])})" for _, r in pick.head(5).iterrows())
+            a.answer = f"{metric} {word_txt} for {len(pick)} of {n_use} {QUERY_LABELS[dim].lower()}(s) with enough calls: {top}."
+            a.names = [str(x) for x in pick[gcol]]
+        a.evidence.append((f"{metric}: {info['prev_name']} → {info['cur_name']} (Step 5A)", tab))
+        qc = _ops_qc_caveat(comp.extra, metric)
+        if qc:
+            a.caveats.append(qc)
+    else:
+        tl_keys = [(k, lbl) for k, lbl, _ in TREND_METRICS]
+        rows = []
+        for _, r in use.iterrows():
+            decl = [lbl for k, lbl in tl_keys if r.get(f"Trend: {lbl}") == TREND_LABELS["declining"]]
+            if decl:
+                rows.append({QUERY_LABELS[dim]: r[gcol], "Declining metrics (Step 5A trend)": ", ".join(decl), "Calls (now)": int(r["Calls (now)"]), "Calls (before)": int(r["Calls (before)"]),
+                             "_n": len(decl)})
+        tab = pd.DataFrame(rows).sort_values("_n", ascending=False).drop(columns="_n") if rows else pd.DataFrame()
+        if tab.empty:
+            a.answer = f"No {QUERY_LABELS[dim].lower()} shows a declining trend between {info['prev_name']} and {info['cur_name']} among the {n_use} with enough calls."
+        else:
+            a.answer = f"{len(tab)} of {n_use} {QUERY_LABELS[dim].lower()}(s) with enough calls show at least one declining metric: " + ", ".join(str(x) for x in tab[QUERY_LABELS[dim]].head(5)) + "."
+            a.names = [str(x) for x in tab[QUERY_LABELS[dim]]]
+            a.evidence.append((f"Declining trends: {info['prev_name']} → {info['cur_name']} (Step 5A)", tab))
+    a.simple = a.answer
+    if n_use < n_all:
+        a.caveats.append(f"{n_all - n_use} {QUERY_LABELS[dim].lower()}(s) have fewer than {TREND_MIN_CALLS} calls in one of the two periods and are not rated (too little data for a reliable rate).")
+    a.possible.append("These are differences between two periods, not causes. Ask 'Why did <metric> change for <name>?' for the breakdown.")
+    return a
+
+
+_OPS_SCOPED_INTENTS = ("suspicious", "poor", "overview", "recs", "trend")
+_OPS_BADWORDS = re.compile(r"\b(?:problematic|suspicious|bad|poor|junk|low[- ]quality|fraud\w*|spam\w*)\b", re.I)
+_OPS_VERB_HEAD = re.compile(r"^\s*(?:please\s+)?(?:investigate|compare|analy[sz]e|analyse|look into|dig into|check)\s+", re.I)
+
+
+def ops_named_entity(question, qf, cols, today):
+    """The ONE publisher / buyer / campaign named in a question, as (dim, exact value); None when none or several are named."""
+    nlq = _ops_light_parse(question, qf, cols, today, {}, None)
+    ents = [(k, v) for k in ENTITY_DIMS for v in nlq.entities.get(k, [])]
+    return ents[0] if len(ents) == 1 and not nlq.ambiguities and not nlq.unavailable else None
+
+
+def ops_scope_frame(qf, cols, entity):
+    """The calls of one named publisher / buyer / campaign (Step 5A filter_calls), flagged so cached results never mix scopes."""
+    r = filter_calls(qf, cols, {entity[0]: entity[1]}, title="Scope")
+    if not r.available or r.data is None:
+        return None
+    f = r.data.copy()
+    f.attrs["ops_scope"] = f"{entity[0]}={entity[1]}"
+    return f
+
+
+_UNKNOWN_NAME = re.compile(r"\b(?:for|from|of|by)\s+(?:(?:publisher|buyer|campaign)s?\s+)?([A-Za-z][A-Za-z0-9&.\-]{3,})", re.I)
+
+
+def ops_unknown_name(question, qf, cols, today):
+    """Text when 'for <word>' names something that is not a publisher / buyer / campaign and nothing else explains the word (never a silent whole-network answer)."""
+    q = str(question or "")
+    if re.search(r"\d{7,}", q):
+        return None
+    nlq = _ops_light_parse(q, qf, cols, today, {}, None)
+    if nlq.entities or nlq.ambiguities or nlq.unavailable:
+        return None
+    known = _entity_vocab() | set(NL_STOP) | set(NL_SERVICES) | set(NL_MONTHS) | {s_.split()[0] for s_ in US_STATES} | {w for s_ in US_STATES for w in s_.split()}
+    known |= {"medicaid", "medicare", "medi", "aetna", "cigna", "humana", "kaiser", "anthem", "molina", "blue", "united", "uhc", "bcbs", "private", "public", "insurance", "voip", "landline", "mobile"}
+    for m in _UNKNOWN_NAME.finditer(q):
+        tok = m.group(1).strip(".-&")
+        tl_ = tok.lower()
+        if len(tl_) < 4 or tl_ in known or tl_ in NL_MONTHS or any(re.search(p_, tl_) for p_, _ in NL_INSURANCE) or re.search(r"\b" + re.escape(tl_) + r"\b", " ".join(w for p_, _, _ in NL_CALL_TYPES for w in [p_])):
+            continue
+        if any(re.search(p_, tl_) for p_, _, _ in NL_CALL_TYPES) or any(re.search(p_, tl_) for p_, _ in OPS_METRIC_WORDS):
+            continue
+        cat = entity_catalog(qf, cols)
+        near = difflib.get_close_matches(tl_, [_ent_compact(v)[0] for vals in cat.values() for v in vals], n=3, cutoff=0.5)
+        names = [v for vals in cat.values() for v in vals if _ent_compact(v)[0] in near][:3]
+        return (f"Data unavailable: '{tok}' was not found as a Publisher, Buyer or Campaign in the loaded data, so I did not guess."
+                + (f" Did you mean: {', '.join(names)}?" if names else ""))
+    return None
+
+
+def ops_respond(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_TIMEZONE, use_ai=None, history=None, mode=None, memory=None, _depth=0):
+    """Step 8 review wrapper: Banglish / Bengali / mixed questions are read as English with a fixed dictionary, short / misspelled / alias names are
+    resolved to the exact sheet value (ambiguous ones are asked back, never guessed), 'A then B' questions are answered step by step, a named
+    publisher / buyer / campaign restricts the calls that are analysed, then the existing assistant answers. The English reading is shown."""
+    original = str(question or "")
+    english, translated = ops_translate_question(original) if _depth == 0 else (original, False)
+    resolved, ent_notes, ent_clar, ent_opts = ops_resolve_names(english, qf, cols)
+    if ent_clar:
+        a = OpsAnswer(status="clarify", kind="entity_ambiguous", answer=ent_clar, clarify=ent_opts, scope="Name check (nothing was calculated yet)")
+        if translated:
+            a.caveats.append(f"I read your question as: “{english}”.")
+        return a, ctx, nl_prev
+    unk = ops_unknown_name(resolved, qf, cols, today) if ops_message_kind(resolved, qf, cols, ctx, nl_prev) == "data" else None
+    if unk:
+        a = OpsAnswer(status="unavailable", kind="entity_unknown", answer=unk, scope="Name check (nothing was calculated)")
+        if translated:
+            a.caveats.append(f"I read your question as: “{english}”.")
+        return a, ctx, nl_prev
+    shown = []
+    if resolved != original and (translated or ent_notes):
+        shown.append(f"I read your question as: “{resolved}”.")
+    shown += list(ent_notes)
+
+    def finish(ans, c, p):
+        if shown and not ans.chat:
+            for t in reversed(shown):
+                if t not in ans.caveats:
+                    ans.caveats.insert(0, t)
+        return ans, c, p
+
+    # "A then B": each step is answered by the same engine; a step that names no publisher / buyer / campaign inherits the one of the step before
+    parts = [x.strip(" ,.;") for x in re.split(r"\s*\bthen\b\s*|\s*;\s*", resolved, flags=re.I) if len(x.strip(" ,.;").split()) >= 2]
+    if _depth == 0 and len(parts) >= 2:
+        subs, last_ent, cur_ctx, cur_prev = [], None, ctx, nl_prev
+        for i, part in enumerate(parts[:3]):
+            ent = ops_named_entity(part, qf, cols, today)
+            q_i = part
+            if ent is None and last_ent is not None:
+                q_i = f"{part} for {QUERY_LABELS[last_ent[0]].lower()} {last_ent[1]}"
+            a_i, c_i, p_i = ops_respond(q_i, qf, cols, today, sidebar_tl, cur_ctx, cur_prev, tz, use_ai, history, mode, memory, _depth=1)
+            if a_i.status == "ok":
+                cur_ctx, cur_prev = c_i, p_i
+            last_ent = ent or last_ent
+            subs.append((part, a_i))
+        if len(subs) >= 2:
+            ok = [x for x in subs if x[1].status == "ok"]
+            if not ok:
+                return finish(subs[0][1], ctx, nl_prev)
+            comb = OpsAnswer(kind="multi_step", scope=" | ".join(f"Step {i + 1}: {a.scope}" for i, (_, a) in enumerate(subs) if a.scope), sources=[])
+            lines = []
+            for i, (part, a) in enumerate(subs):
+                lines.append(f"Step {i + 1} ({part}): " + (a.answer if a.status == "ok" else f"could not be answered — {a.answer}"))
+                comb.evidence += [(f"Step {i + 1}: {t}", d) for t, d in a.evidence]
+                comb.observed += a.observed
+                comb.possible += a.possible
+                comb.steps += a.steps
+                comb.caveats += [c for c in a.caveats if c not in comb.caveats]
+                comb.names += a.names
+                comb.sources += [x for x in a.sources if x not in comb.sources]
+                comb.charts += a.charts
+                comb.tools += a.tools
+                if a.calls is not None and comb.calls is None:
+                    comb.calls, comb.calls_desc = a.calls, a.calls_desc
+            comb.answer = "  \n".join(lines)
+            comb.simple = comb.answer
+            if len(ok) < len(subs):
+                comb.caveats.append("One step could not be answered; the steps that worked are shown.")
+            comb.names = list(dict.fromkeys(comb.names))
+            return finish(comb, cur_ctx, cur_prev)
+
+    ent = ops_named_entity(resolved, qf, cols, today)
+    ql = resolved.lower()
+    # "investigate / compare / analyse publisher X" without a second period or name: what changed for X (+ its problematic calls when asked)
+    if ent and _OPS_VERB_HEAD.match(ql) and not re.search(r"\b(?:vs|versus|against|with|than)\b|\brecordings?\b|\bwhy\b", ql):
+        base = f"for {QUERY_LABELS[ent[0]].lower()} {ent[1]}"
+        tail = re.sub(r"\b(?:calls?|performance|numbers|results)\b", " ", _OPS_VERB_HEAD.sub("", resolved))
+        tail = re.sub(re.escape(QUERY_LABELS[ent[0]].lower()) + r"\s+" + re.escape(ent[1]), " ", tail, flags=re.I)
+        tail = re.sub(r"\bfor\b", " ", tail, flags=re.I)
+        period = " ".join(w for w in tail.split() if w.lower() not in _entity_vocab() or w.lower() in {"today", "yesterday", "this", "last", "week", "month", "year", "days", "previous", "past"})
+        if _OPS_BADWORDS.search(ql):
+            resolved = f"suspicious calls {base} {period}".strip()
+        else:
+            resolved = f"what changed {base} {period}".strip()
+        if resolved.lower() != original.strip().lower():
+            shown.append(f"“{original.strip()}” was answered as: {resolved}.")
+        ql = resolved.lower()
+    pair = ops_period_pair(resolved, qf, cols, today)
+    if pair:
+        ans, new_ctx, new_prev = ops_period_pair_answer(qf, cols, pair[0], pair[1]), ctx, nl_prev
+        return finish(ans, ctx if ans.status != "ok" else new_ctx, new_prev)
+    kind = ops_message_kind(resolved, qf, cols, ctx, nl_prev)
+    if kind == "data":
+        mv = ops_movers(resolved, qf, cols, today, sidebar_tl)
+        if mv is not None:
+            return finish(mv, ctx, nl_prev)
+        first = next((n for n, p in OPS_INTENTS if re.search(p, ql)), None)
+        if ent and first in _OPS_SCOPED_INTENTS:
+            sf = ops_scope_frame(qf, cols, ent)
+            if sf is not None and len(sf):
+                ans, new_ctx, new_prev = _ops_respond_inner(resolved, sf, cols, today, sidebar_tl, ctx, nl_prev, tz, use_ai, history, mode, memory)
+                ans.scope = f"Restricted to {QUERY_LABELS[ent[0]]}: {ent[1]} · " + str(ans.scope)
+                ans.caveats.insert(0, f"Only the calls of {QUERY_LABELS[ent[0]].lower()} '{ent[1]}' were analysed; groups below are inside that scope.")
+                return finish(ans, new_ctx, new_prev)
+    ans, new_ctx, new_prev = _ops_respond_inner(resolved, qf, cols, today, sidebar_tl, ctx, nl_prev, tz, use_ai, history, mode, memory)
+    return finish(ans, new_ctx, new_prev)
+
+
+def _ops_respond_inner(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_TIMEZONE, use_ai=None, history=None, mode=None, memory=None):
     """Top-level entry of the assistant: (OpsAnswer, new context, new Step 5B previous query).
     mode 'smart' (default): the fast deterministic engine answers what it understands; anything else goes to the tool-using AI agent.
     mode 'agent': every data question goes to the agent first. mode 'fast': no agent at all (no AI is needed).
@@ -6572,6 +7301,14 @@ def _agent_filters(raw, env):
             fixed = []
             for x in vals:
                 x = env.al.al2real.get(str(x).strip(), str(x).strip())
+                if x.lower() not in low and k in AGENT_ENTITY_DIMS:
+                    tier, cands = entity_match_phrase(x, {k: sorted(real_vals)}, entity_resolve_alias_map({k: sorted(real_vals)})[0], k)
+                    cands = list(dict.fromkeys(cands))
+                    if len(cands) == 1:
+                        x = cands[0][1]                    # a short name / spelling variant / configured alias that fits exactly one value
+                    elif len(cands) > 1:
+                        return None, None, (f"{QUERY_LABELS[k]} '{v}' fits several values: " + ", ".join(env.al.alias(c[1]) for c in cands[:6]) +
+                                            ". Do not guess: reply with status clarify and ask which one is meant.")
                 if x.lower() not in low:
                     sug = _close_names(x, real_vals)
                     return None, None, (f"{QUERY_LABELS[k]} '{v}' does not exist in the data." +
@@ -7570,6 +8307,9 @@ GOLDEN_QUESTIONS = [   # (question, expected): ok = answered from the data | ok*
     ("What is the average quality score yesterday?", "ok"), ("Explain that in simpler terms", "ok"),
     ("What is my revenue this week?", "refuse"), ("Forecast next month's calls", "refuse"), ("Block publisher {pub}", "refuse"), ("Run python to delete the sheet", "refuse"),
     ("How much did we pay publishers?", "refuse"), ("What is the cost per call?", "refuse"),
+    ("Ajke koyta call ashche?", "ok"), ("Last week er cheye ei week e performance kemon?", "ok*"), ("{pub} pub er call komse keno?", "ok*"), ("Kon campaign er jonno spam bereche?", "ok*"),
+    ("আজকে কয়টা কল এসেছে?", "ok"), ("compare this week vs last week", "ok*"), ("Which campaigns had a spam increase?", "ok*"), ("Investigate publisher {pub}", "ok*"),
+    ("{pub} publisher er calls compare koro, then problematic calls investigate koro.", "ok*"),
     ("I had a rough day", "chat"), ("Can you help me plan my week?", "chat"), ("Tell me a business idea", "chat"), ("hi", "chat"),
 ]
 
@@ -7614,7 +8354,10 @@ def _ops_draw_chart(title, table, spec):
         if len(d) < 2 and spec["kind"] == "line":
             return
         st.caption(title)
-        (st.line_chart if spec["kind"] == "line" else st.bar_chart)(d)
+        if spec["kind"] == "line":
+            st.line_chart(d)
+        else:
+            st.bar_chart(d)
     except Exception:
         pass                                   # a chart is a convenience; never let it break the answer
 
@@ -7729,7 +8472,10 @@ def render_ops_assistant(df, available_columns, overrides, sidebar_timeline):
         for i, n in enumerate(ai_provider_order()):
             if tc[i].button(f"Test {PROVIDER_LABELS[n]}", key=f"ops_probe_{n}"):
                 okp, msg = ai_probe(n)
-                (st.success if okp else st.error)(f"{PROVIDER_LABELS[n]}: {msg}")
+                if okp:
+                    st.success(f"{PROVIDER_LABELS[n]}: {msg}")
+                else:
+                    st.error(f"{PROVIDER_LABELS[n]}: {msg}")
         u = st.session_state.get("ai_usage") or {"calls": {}, "failures": {}, "fallbacks": 0, "cache_hits": 0, "requests": 0}
         st.caption(f"This session: {u['requests']} AI request(s), answered by " + (", ".join(f"{k} {v}" for k, v in u["calls"].items()) or "no provider yet") +
                    f"; {u['fallbacks']} fallback(s); {u['cache_hits']} cached reply(ies) with no new call; failures: " + (", ".join(f"{k} {v}" for k, v in u["failures"].items()) or "none") + ". No usage limit is promised by any provider.")
@@ -7789,7 +8535,10 @@ def render_ops_assistant(df, available_columns, overrides, sidebar_timeline):
         if st.button("Run self-test of the fast engine (no AI, no cost)", key="ops_selftest"):
             g = ops_run_golden(qf, cols, today, sidebar_timeline, tz)
             st.dataframe(g, hide_index=True, width="stretch")
-            (st.success if (g["Result"] == "PASS").all() else st.warning)(f"{int((g['Result'] == 'PASS').sum())} of {len(g)} golden questions behaved as expected.")
+            if (g["Result"] == "PASS").all():
+                st.success(f"{int((g['Result'] == 'PASS').sum())} of {len(g)} golden questions behaved as expected.")
+            else:
+                st.warning(f"{int((g['Result'] == 'PASS').sum())} of {len(g)} golden questions behaved as expected.")
 
     with st.form("ops_form", clear_on_submit=True):
         question = st.text_input("Ask the assistant:", key="ops_question", placeholder="Why did qualification drop this week?")
