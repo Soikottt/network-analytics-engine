@@ -8865,6 +8865,1960 @@ if st.sidebar.button("🔄 Connect & Load Fresh Data") or "sheet_loaded" not in 
         st.session_state["sheet_loaded"] = False
 
 
+# =====================================================================================================================
+# STEP 9 - Predictive network intelligence: anomaly detection, alerts, forecasting.   (ADDED; nothing above this line was changed.)
+# Python does every calculation. No AI is used anywhere in detection, severity, alerts, e-mail or forecasts.
+# A detected anomaly means "different from the chosen baseline". It is NOT proof of fraud, misconduct or an outage.
+# =====================================================================================================================
+import math
+import hashlib
+import sqlite3
+import threading
+import numpy as np
+import smtplib
+import ssl as _ssl
+from email.message import EmailMessage
+from urllib.parse import urlparse
+
+S9_SCHEMA_VERSION = 1
+S9_SEVERITIES = ["info", "low", "medium", "high", "critical"]
+S9_ACTIVE = ("new", "acknowledged", "recurring")
+S9_STATUSES = ("new", "acknowledged", "recurring", "resolved")
+S9_DISCLAIMER = "This means the metric differs from its baseline. It is not proof of fraud, publisher misconduct or an operational failure."
+
+# key: (label, kind, bad direction, alert label up / down)
+S9_METRICS = {
+    "calls": ("Call volume", "count", "both", ("Unusual call-volume increase", "Unusual call-volume drop")),
+    "avg_duration": ("Average call duration (sec)", "mean", "both", ("Longer-than-usual average duration", "Shorter-than-usual average duration")),
+    "short_rate": ("Short-call rate", "rate", "up", ("Higher-than-usual short-call rate", "")),
+    "qc_score": ("AI QC score", "mean", "down", ("", "QC score deterioration")),
+    "poor_rate": ("Poor-quality call rate", "rate", "up", ("Unusual suspicious-call indicator increase (poor-quality calls)", "")),
+    "spam_rate": ("Spam / robot rate", "rate", "up", ("Unusual suspicious-call indicator increase (spam / robot)", "")),
+    "voip_rate": ("VoIP rate", "rate", "up", ("Unusual suspicious-call indicator increase (VoIP)", "")),
+    "fake_rate": ("Fake-number rate", "rate", "up", ("Unusual suspicious-call indicator increase (fake number)", "")),
+}
+S9_QC_METRICS = {"qc_score", "poor_rate", "spam_rate", "voip_rate", "fake_rate"}      # need a completed AI QC: missing QC is "unknown", never zero
+S9_UNAVAILABLE_METRICS = ["Answer / connection rate: the sheet has no connected / answered field (only Duration), so it is not monitored. "
+                          "Short-call rate (Duration below the short-call limit) is monitored instead."]
+S9_LEVELS = {"network": [], "publisher": ["publisher"], "buyer": ["buyer"], "campaign": ["campaign"],
+             "publisher+campaign": ["publisher", "campaign"], "publisher+buyer": ["publisher", "buyer"]}
+
+# Every number below can be changed in the dashboard (or ALERT_CONFIG in Secrets). The defaults are conventional starting points, not statistical truths:
+S9_DEFAULTS = {
+    "modes": ["day", "rolling"],          # day = today so far vs the same weekday (same elapsed time); week = week to date vs earlier weeks; rolling = last N days vs earlier N-day windows
+    "levels": ["network", "publisher", "campaign", "buyer"],
+    "metrics": list(S9_METRICS),
+    "baseline_windows": 4,               # how many earlier windows form the baseline (4 weeks of the same weekday; 4 earlier rolling windows)
+    "min_baseline_windows": 3,           # fewer usable windows -> "Insufficient data", never a confident alert
+    "rolling_days": 3,
+    "z_threshold": 3.5,                  # robust z (counts) / two-proportion z (rates) / Welch z (means). 3.5 ~ rare under noise; raise it for fewer alerts
+    "count_rel_threshold": 0.30,         # a volume change must also be at least this share of the baseline median ...
+    "count_min_abs": 10,                 # ... and at least this many calls
+    "min_baseline_calls": 30,            # baseline median calls a window needs for a volume alert (below it: low data)
+    "count_alert_increase": True,        # volume increases are reported (informational / low) when True
+    "min_rate_n": 30,                    # evaluated calls needed in the current window for a rate alert
+    "min_rate_base_n": 90,               # evaluated calls needed in the baseline
+    "rate_min_delta": 0.05,              # rate must also rise by at least this much (0.05 = 5 percentage points)
+    "min_mean_n": 15, "min_mean_base_n": 45,
+    "score_min_delta": 5.0,              # QC score points
+    "duration_min_rel": 0.25,            # average duration change of at least 25 %
+    "short_call_sec": 30,                # a call shorter than this is a "short call"
+    "poor_score": 40,                    # a QC score below this is a "poor-quality call"
+    "qc_coverage_ratio": 0.6,            # current QC completion must be at least this share of the baseline's, or QC metrics are "incomplete"
+    "pct_min_base": 5,                   # percentage change is hidden when the baseline is below this many calls
+    "pct_min_rate": 0.02,                # ... or a baseline rate below 2 %: points are shown instead
+    "impact_tiers": [10, 40, 120],       # calls affected: <10 info, <40 low, <120 medium, else high
+    "max_entities": 40,                  # per level, largest first
+    "recovery_runs": 2,                  # consecutive normal runs (different data windows) before an alert is auto-resolved
+    "stale_hours": 6,                    # warn when the newest call is older than this
+}
+
+
+def s9_config(overrides=None):
+    """Defaults < ALERT_CONFIG (Secrets / env, JSON) < overrides (dashboard). Unknown keys are ignored; wrong types fall back to the default."""
+    cfg = json.loads(json.dumps(S9_DEFAULTS))
+    raw = None
+    try:
+        raw = st.secrets.get("ALERT_CONFIG", None)
+    except Exception:
+        raw = None
+    if raw is None or (not hasattr(raw, "items") and not str(raw).strip()):
+        raw = os.environ.get("ALERT_CONFIG", "")
+    extra = {}
+    try:
+        extra = dict(raw) if hasattr(raw, "items") else (json.loads(str(raw)) if str(raw).strip() else {})
+    except Exception:
+        extra = {}
+    for src in (extra, overrides or {}):
+        for k, v in dict(src).items():
+            if k not in cfg:
+                continue
+            d = cfg[k]
+            try:
+                if isinstance(d, bool):
+                    cfg[k] = bool(v)
+                elif isinstance(d, list):
+                    vv = list(v)
+                    if k == "modes":
+                        vv = [x for x in vv if x in ("day", "week", "rolling")]
+                    elif k == "levels":
+                        vv = [x for x in vv if x in S9_LEVELS]
+                    elif k == "metrics":
+                        vv = [x for x in vv if x in S9_METRICS]
+                    elif k == "impact_tiers":
+                        vv = sorted(float(x) for x in vv)[:3]
+                        if len(vv) != 3:
+                            continue
+                    if vv:
+                        cfg[k] = vv
+                elif isinstance(d, int):
+                    cfg[k] = int(float(v))
+                else:
+                    cfg[k] = float(v)
+            except Exception:
+                continue
+    cfg["baseline_windows"] = max(2, min(12, int(cfg["baseline_windows"])))
+    cfg["min_baseline_windows"] = max(2, min(int(cfg["baseline_windows"]), int(cfg["min_baseline_windows"])))
+    cfg["rolling_days"] = max(1, min(30, int(cfg["rolling_days"])))
+    cfg["z_threshold"] = max(1.5, float(cfg["z_threshold"]))
+    return cfg
+
+
+# ---------------- statistics helpers ----------------
+def _s9_robust(values):
+    """(median, robust sigma = 1.4826 * MAD)."""
+    v = np.asarray([x for x in values if x is not None and not (isinstance(x, float) and np.isnan(x))], dtype=float)
+    if v.size == 0:
+        return float("nan"), float("nan")
+    med = float(np.median(v))
+    return med, float(1.4826 * np.median(np.abs(v - med)))
+
+
+def _s9_wilson(x, n, z=1.96):
+    if n <= 0:
+        return float("nan"), float("nan")
+    p = x / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(max(p * (1 - p) / n + z * z / (4 * n * n), 0.0)) / d
+    return max(0.0, c - h), min(1.0, c + h)
+
+
+def _s9_pct(cur, base, min_base):
+    """Percentage change, or None when the baseline is zero / too small for a percentage to mean anything."""
+    if base is None or cur is None or (isinstance(base, float) and np.isnan(base)) or abs(base) < max(min_base, 1e-9):
+        return None
+    return (cur - base) / abs(base) * 100.0
+
+
+# ---------------- per-call frame ----------------
+def s9_prepare(qf, cols, cfg):
+    """A small numeric frame (one row per call) with every flag the detectors need. Unknown stays unknown (NaN / False in the *_ok column)."""
+    n = len(qf)
+    m = pd.DataFrame(index=qf.index)
+    m["ts"] = qf["Parsed_Date"] if "Parsed_Date" in qf.columns else pd.Series(pd.NaT, index=qf.index)
+    for k in ("publisher", "buyer", "campaign"):
+        c = cols.get(k)
+        if c and c in qf.columns:
+            v = qf[c].astype(str).str.strip()
+            m[k] = v.where(v != "", "(blank)")
+        else:
+            m[k] = "(not in sheet)"
+    m["_one"] = 1
+    dur = pd.to_numeric(qf["Duration_Num"], errors="coerce") if "Duration_Num" in qf.columns else pd.Series(np.nan, index=qf.index)
+    m["_dur_ok"] = dur.notna().astype(int)
+    m["_dur"] = dur.fillna(0.0)
+    m["_dur2"] = (dur.fillna(0.0)) ** 2
+    m["_short"] = ((dur < float(cfg["short_call_sec"])) & dur.notna()).astype(int)
+    sc = pd.to_numeric(qf["Quality_Score_Num"], errors="coerce") if "Quality_Score_Num" in qf.columns else pd.Series(np.nan, index=qf.index)
+    m["_sc_ok"] = sc.notna().astype(int)
+    m["_sc"] = sc.fillna(0.0)
+    m["_sc2"] = sc.fillna(0.0) ** 2
+    m["_poor"] = ((sc < float(cfg["poor_score"])) & sc.notna()).astype(int)
+    qcc = cols.get("qc")
+    if qcc and qcc in qf.columns:
+        txt = qf[qcc].astype(str)
+        m["_qc"] = txt.str.contains(QC_DONE_PAT, case=False, na=False, regex=True).astype(int)
+        m["_spam"] = (txt.str.contains(SPAM_PAT, case=False, na=False, regex=True) & (m["_qc"] == 1)).astype(int)
+    else:
+        m["_qc"] = 0
+        m["_spam"] = 0
+    lt = cols.get("line_type")
+    if lt and lt in qf.columns:
+        ls = qf[lt].astype(str).str.strip()
+        m["_line_ok"] = (ls != "").astype(int)
+        m["_voip"] = (ls.str.contains(VOIP_PAT, case=False, na=False, regex=True) & (ls != "")).astype(int)
+    else:
+        m["_line_ok"] = 0
+        m["_voip"] = 0
+    if "Fake_Known" in qf.columns:
+        m["_fk_ok"] = qf["Fake_Known"].astype(int)
+        m["_fake"] = qf["Fake_Flag"].astype(int)
+    else:
+        m["_fk_ok"] = 0
+        m["_fake"] = 0
+    return m[m["ts"].notna()].copy()
+
+
+_S9_SUM_COLS = ["_one", "_dur_ok", "_dur", "_dur2", "_short", "_sc_ok", "_sc", "_sc2", "_poor", "_qc", "_spam", "_line_ok", "_voip", "_fk_ok", "_fake"]
+
+
+def _s9_agg(m, start, end, keys):
+    """Sums per entity for [start, end). keys=[] -> one row 'ALL' (the network)."""
+    w = m[(m["ts"] >= start) & (m["ts"] < end)]
+    if not keys:
+        s = w[_S9_SUM_COLS].sum().to_frame().T
+        s.index = pd.Index(["ALL"], name="entity")
+        return s
+    if w.empty:
+        return pd.DataFrame(columns=_S9_SUM_COLS, index=pd.MultiIndex.from_tuples([], names=keys) if len(keys) > 1 else pd.Index([], name=keys[0]))
+    return w.groupby(keys)[_S9_SUM_COLS].sum()
+
+
+def _s9_value(row, metric):
+    """(value, n, sum_x, sum_x2) for one aggregated row. n is the number of calls that can actually be evaluated for this metric."""
+    g = lambda c: float(row[c]) if row is not None and c in row.index and pd.notna(row[c]) else 0.0
+    if metric == "calls":
+        return g("_one"), g("_one"), g("_one"), 0.0
+    if metric == "avg_duration":
+        n = g("_dur_ok")
+        return (g("_dur") / n if n else float("nan")), n, g("_dur"), g("_dur2")
+    if metric == "short_rate":
+        n = g("_dur_ok")
+        return (g("_short") / n if n else float("nan")), n, g("_short"), 0.0
+    if metric == "qc_score":
+        n = g("_sc_ok")
+        return (g("_sc") / n if n else float("nan")), n, g("_sc"), g("_sc2")
+    if metric == "poor_rate":
+        n = g("_sc_ok")
+        return (g("_poor") / n if n else float("nan")), n, g("_poor"), 0.0
+    if metric == "spam_rate":
+        n = g("_qc")
+        return (g("_spam") / n if n else float("nan")), n, g("_spam"), 0.0
+    if metric == "voip_rate":
+        n = g("_line_ok")
+        return (g("_voip") / n if n else float("nan")), n, g("_voip"), 0.0
+    if metric == "fake_rate":
+        n = g("_fk_ok")
+        return (g("_fake") / n if n else float("nan")), n, g("_fake"), 0.0
+    return float("nan"), 0.0, 0.0, 0.0
+
+
+# ---------------- windows ----------------
+def s9_windows(mode, as_of, cfg, target_date=None):
+    """Equal-duration comparison windows. The current period is trimmed to the data's last call (`as_of`), and every baseline window is trimmed to
+    the SAME elapsed time, so a half-finished day or week is never compared with complete ones.
+    Returns {current:(s,e), baselines:[(s,e)], label, partial, elapsed_text, mode}."""
+    as_of = pd.Timestamp(as_of)
+    B = int(cfg["baseline_windows"])
+    if mode == "day":
+        d = pd.Timestamp(target_date).normalize() if target_date is not None else as_of.normalize()
+        full_end = d + pd.Timedelta(days=1)
+        end = min(full_end, as_of) if as_of >= d else d
+        el = end - d
+        base = [(d - pd.Timedelta(days=7 * k), d - pd.Timedelta(days=7 * k) + el) for k in range(1, B + 1)]
+        return {"mode": mode, "current": (d, end), "baselines": base, "partial": end < full_end,
+                "label": f"{d.strftime('%a %Y-%m-%d')} {d.strftime('%H:%M')}-{end.strftime('%H:%M')}",
+                "baseline_label": f"the same weekday and hours in the previous {B} weeks", "unit": "day"}
+    if mode == "week":
+        d = pd.Timestamp(target_date).normalize() if target_date is not None else as_of.normalize()
+        ws = d - pd.Timedelta(days=d.weekday())
+        full_end = ws + pd.Timedelta(days=7)
+        end = min(full_end, as_of) if as_of >= ws else ws
+        el = end - ws
+        base = [(ws - pd.Timedelta(days=7 * k), ws - pd.Timedelta(days=7 * k) + el) for k in range(1, B + 1)]
+        return {"mode": mode, "current": (ws, end), "baselines": base, "partial": end < full_end,
+                "label": f"week of {ws.strftime('%Y-%m-%d')} (to {end.strftime('%a %H:%M')})",
+                "baseline_label": f"the same part of the previous {B} weeks", "unit": "week"}
+    R = int(cfg["rolling_days"])
+    dur = pd.Timedelta(days=R)
+    end = as_of
+    base = [(end - dur * (k + 1), end - dur * k) for k in range(1, B + 1)]
+    return {"mode": "rolling", "current": (end - dur, end), "baselines": base, "partial": False,
+            "label": f"last {R} day(s) to {end.strftime('%Y-%m-%d %H:%M')}",
+            "baseline_label": f"the {B} earlier {R}-day windows", "unit": f"{R}-day window"}
+
+
+def _s9_fmt_win(w):
+    return f"{pd.Timestamp(w[0]).strftime('%Y-%m-%d %H:%M')} to {pd.Timestamp(w[1]).strftime('%Y-%m-%d %H:%M')}"
+
+
+# ---------------- severity ----------------
+def s9_severity(metric, kind, direction, impact, z, magnitude, n, cfg, special=None):
+    """(severity, plain-language reason). Statistical evidence (z) and business impact (calls affected) are kept apart:
+    impact picks the tier, evidence only moves it by one step. A huge percentage on a handful of calls stays low."""
+    t = cfg["impact_tiers"]
+    tier = 0 if impact < t[0] else 1 if impact < t[1] else 2 if impact < t[2] else 3
+    why = [f"about {impact:,.0f} call(s) affected -> impact tier {['info', 'low', 'medium', 'high'][tier]}"]
+    strong = z >= max(6.0, cfg["z_threshold"] + 2.5) and magnitude >= 0.4
+    weak = z < cfg["z_threshold"] + 0.75 and magnitude < 0.5          # a change of half the baseline or more is never "just above the threshold" in business terms
+    rank = tier
+    if strong and tier >= 2:
+        rank += 1
+        why.append(f"very strong evidence (z={z:.1f}, large change) -> one level up")
+    elif weak and tier >= 1:
+        rank -= 1
+        why.append(f"evidence only just above the threshold (z={z:.1f}) -> one level down")
+    else:
+        why.append(f"evidence z={z:.1f}")
+    if n < 2 * (cfg["min_rate_n"] if kind == "rate" else cfg["min_mean_n"] if kind == "mean" else cfg["min_baseline_calls"]):
+        if rank > 2:
+            rank = 2
+            why.append("small sample -> capped at medium")
+    if kind == "count" and direction == "up":
+        rank = min(rank, 1)
+        why.append("a volume increase is informational / low by default")
+    if kind == "mean" and metric == "avg_duration":
+        rank = min(rank, 2)
+        why.append("average duration alone is capped at medium")
+    if special == "new_activity":
+        rank = 0
+        why = ["no calls in the baseline windows: new activity is informational"]
+    rank = max(0, min(4, rank))
+    return S9_SEVERITIES[rank], "; ".join(why)
+
+
+def _s9_next(metric, entity_type, direction):
+    if metric == "calls":
+        return ("Check which campaigns and buyers account for the change, whether the traffic source paused or changed, and whether caps or routing changed outside this sheet."
+                if direction == "down" else "Check the source of the extra traffic and whether buyers can absorb it.")
+    if metric == "short_rate":
+        return "Review a sample of the short calls (hang-up side, duration pattern, QC summaries) and compare by campaign and buyer before drawing conclusions."
+    if metric == "qc_score":
+        return "Compare QC issues and call types in this period with the baseline, and review the lowest-scored calls."
+    if metric in ("spam_rate", "poor_rate", "voip_rate", "fake_rate"):
+        return "Review the flagged calls and their QC reports. A higher indicator rate is a reason to look, not a verdict about the publisher."
+    return "Compare with the baseline by campaign and buyer."
+
+
+# ---------------- detectors ----------------
+def _s9_state_low(reason):
+    return {"state": "insufficient", "reason": reason}
+
+
+def s9_eval_metric(metric, cur, base, cfg, cov=None):
+    """cur = (value, n, sx, sx2); base = list of (value, n, sx, sx2) for the usable baseline windows.
+    Returns {'state': 'ok'|'fired'|'insufficient', ...}. Never raises on empty / NaN input."""
+    label, kind, bad, labels = S9_METRICS[metric]
+    z_thr = float(cfg["z_threshold"])
+    if len(base) < int(cfg["min_baseline_windows"]):
+        return _s9_state_low(f"only {len(base)} usable baseline window(s); at least {int(cfg['min_baseline_windows'])} are needed")
+    if cov is not None and metric in S9_QC_METRICS:
+        cur_cov, base_cov = cov
+        if base_cov and cur_cov < float(cfg["qc_coverage_ratio"]) * base_cov:
+            return _s9_state_low(f"AI QC is incomplete in the current window ({cur_cov * 100:.0f}% of calls vs {base_cov * 100:.0f}% in the baseline), so this is unknown, not good or bad")
+    v, n = cur[0], cur[1]
+    if kind == "count":
+        vals = [b[0] for b in base]
+        med, rob = _s9_robust(vals)
+        if med < float(cfg["min_baseline_calls"]):
+            if med < 1 and v >= float(cfg["min_baseline_calls"]):
+                return {"state": "fired", "direction": "up", "special": "new_activity", "baseline": med, "z": float("inf"), "impact": v, "magnitude": 1.0,
+                        "n": n, "method": "median/MAD on equal windows", "pct": None, "method_detail": "no baseline traffic"}
+            return _s9_state_low(f"baseline median is {med:.0f} call(s) per window; at least {int(cfg['min_baseline_calls'])} are needed for a volume alert")
+        scale = max(rob, math.sqrt(max(med, 1.0)), 1.0)
+        z = (v - med) / scale
+        diff = v - med
+        rel = abs(diff) / med if med else float("inf")
+        direction = "down" if diff < 0 else "up"
+        if abs(z) >= z_thr and abs(diff) >= float(cfg["count_min_abs"]) and rel >= float(cfg["count_rel_threshold"]):
+            if direction == "up" and not cfg["count_alert_increase"]:
+                return {"state": "ok"}
+            return {"state": "fired", "direction": direction, "baseline": med, "z": abs(z), "impact": abs(diff), "magnitude": rel, "n": n,
+                    "method": "robust z (median / MAD, floor sqrt(median))", "pct": _s9_pct(v, med, cfg["pct_min_base"]), "scale": scale}
+        return {"state": "ok", "baseline": med, "z": z}
+    if kind == "rate":
+        if n < float(cfg["min_rate_n"]):
+            return _s9_state_low(f"only {n:.0f} evaluated call(s) in the current window; at least {int(cfg['min_rate_n'])} are needed")
+        N0 = sum(b[1] for b in base)
+        x0 = sum(b[2] for b in base)
+        if N0 < float(cfg["min_rate_base_n"]):
+            return _s9_state_low(f"only {N0:.0f} evaluated call(s) in the baseline; at least {int(cfg['min_rate_base_n'])} are needed")
+        x = cur[2]
+        p, p0 = x / n, x0 / N0
+        pp = (x + x0) / (n + N0)
+        se = math.sqrt(max(pp * (1 - pp) * (1 / n + 1 / N0), 0.0))
+        z = (p - p0) / se if se > 0 else 0.0
+        rates = [b[2] / b[1] for b in base if b[1] >= 10]
+        _, sd_b = _s9_robust(rates) if len(rates) >= 3 else (0.0, 0.0)
+        lo, hi = _s9_wilson(x, n)
+        need = max(float(cfg["rate_min_delta"]), 2 * (sd_b if sd_b == sd_b else 0.0))
+        if z >= z_thr and (p - p0) >= need and lo > p0:
+            return {"state": "fired", "direction": "up", "baseline": p0, "z": z, "impact": (p - p0) * n, "magnitude": (p - p0) / max(p0, 0.05), "n": n,
+                    "method": "two-proportion z-test + Wilson interval + between-window spread", "pct": _s9_pct(p, p0, cfg["pct_min_rate"]),
+                    "ci": (lo, hi), "between_sd": sd_b}
+        return {"state": "ok", "baseline": p0, "z": z, "ci": (lo, hi)}
+    # mean
+    mn = float(cfg["min_mean_n"])
+    if n < mn:
+        return _s9_state_low(f"only {n:.0f} evaluated call(s) in the current window; at least {int(mn)} are needed")
+    nb = sum(b[1] for b in base)
+    if nb < float(cfg["min_mean_base_n"]):
+        return _s9_state_low(f"only {nb:.0f} evaluated call(s) in the baseline; at least {int(cfg['min_mean_base_n'])} are needed")
+    sb, sb2 = sum(b[2] for b in base), sum(b[3] for b in base)
+    mb = sb / nb
+    var_b = max((sb2 - nb * mb * mb) / max(nb - 1, 1), 0.0)
+    m_, s_, s2_ = cur[0], cur[2], cur[3]
+    var_c = max((s2_ - n * m_ * m_) / max(n - 1, 1), 0.0)
+    se = math.sqrt(var_c / n + var_b / nb)
+    z = (m_ - mb) / se if se > 0 else 0.0
+    diff = m_ - mb
+    direction = "down" if diff < 0 else "up"
+    if metric == "qc_score":
+        hit = direction == "down" and -z >= z_thr and -diff >= float(cfg["score_min_delta"])
+        mag = abs(diff) / 20.0
+    else:
+        hit = abs(z) >= z_thr and mb > 0 and abs(diff) / mb >= float(cfg["duration_min_rel"])
+        mag = abs(diff) / mb if mb else 0.0
+    if hit:
+        return {"state": "fired", "direction": direction, "baseline": mb, "z": abs(z), "impact": n, "magnitude": mag, "n": n,
+                "method": "Welch z-test on the evaluated calls", "pct": _s9_pct(m_, mb, 1e-9), "sd_cur": math.sqrt(var_c), "sd_base": math.sqrt(var_b)}
+    return {"state": "ok", "baseline": mb, "z": z}
+
+
+def _s9_entity_label(level, key):
+    if level == "network":
+        return "Whole network"
+    return " | ".join(key) if isinstance(key, tuple) else str(key)
+
+
+def s9_detect(qf, cols, now, cfg=None, mode="day", target_date=None, levels=None, metrics=None):
+    """Run the detectors for ONE mode. Returns a dict:
+      anomalies  list of structured records (see S9 fields below)
+      states     {state_key: 'ok' | 'insufficient' | 'fired:<direction>'}  (used for recovery; insufficient never counts as recovered)
+      notes      plain-language notes (windows dropped, stale feed, unavailable metrics ...)
+      windows    the windows used, run_key, counters"""
+    cfg = cfg or s9_config()
+    levels = levels or cfg["levels"]
+    metrics = metrics or cfg["metrics"]
+    now = pd.Timestamp(now)
+    out = {"anomalies": [], "states": {}, "notes": [], "mode": mode, "ok": True, "evaluated": 0, "insufficient": 0}
+    m = s9_prepare(qf, cols, cfg)
+    if m.empty:
+        out.update(ok=False, message="No call has a readable date, so nothing can be monitored.")
+        return out
+    first_ts, last_ts = m["ts"].min(), m["ts"].max()
+    as_of = min(now, last_ts + pd.Timedelta(seconds=1))
+    if now - last_ts > pd.Timedelta(hours=float(cfg["stale_hours"])):
+        out["notes"].append(f"The newest call in the data is from {last_ts.strftime('%Y-%m-%d %H:%M')}, more than {cfg['stale_hours']:.0f} hours before now. "
+                            "The current window ends at that call, so a stalled feed cannot create a false volume drop; check that the sheet is still updating.")
+    if target_date is not None and pd.Timestamp(target_date).normalize() > as_of.normalize():
+        out.update(ok=False, message="The target date is after the newest data.")
+        return out
+    win = s9_windows(mode, as_of, cfg, target_date)
+    out["windows"] = win
+    cs, ce = win["current"]
+    if ce <= cs:
+        out.update(ok=False, message="The current window is empty (no data yet for that period).")
+        return out
+    # usable baseline windows: fully inside the data history, and the network had calls in them (otherwise: feed outage / no history = unknown, not zero)
+    net = {}
+    use = []
+    dropped = []
+    for (s_, e_) in win["baselines"]:
+        if s_ < first_ts.normalize():
+            dropped.append((s_, e_, "starts before the first call in the sheet (no history)"))
+            continue
+        if e_ > cs and mode != "rolling":
+            dropped.append((s_, e_, "overlaps the current window"))
+            continue
+        tot = _s9_agg(m, s_, e_, [])["_one"].iloc[0]
+        if tot <= 0:
+            dropped.append((s_, e_, "the network had no calls at all (possible feed outage), so it is unknown, not zero"))
+            continue
+        use.append((s_, e_))
+    for s_, e_, why in dropped:
+        out["notes"].append(f"Baseline window {_s9_fmt_win((s_, e_))} was not used: {why}.")
+    out["windows"]["used_baselines"] = use
+    out["windows"]["dropped_baselines"] = len(dropped)
+    if len(use) < int(cfg["min_baseline_windows"]):
+        out["notes"].append(f"Mode '{mode}': only {len(use)} usable baseline window(s) (need {int(cfg['min_baseline_windows'])}). Result: insufficient data, no alerts from this mode.")
+    if mode == "rolling" and int(cfg["rolling_days"]) % 7:
+        out["notes"].append(f"Rolling windows of {int(cfg['rolling_days'])} day(s) mix different weekdays; use the 'day' mode for weekday-sensitive series.")
+    rule_dim = {k: cols.get(k) for k in ("publisher", "buyer", "campaign")}
+    for level in levels:
+        keys = S9_LEVELS[level]
+        if any(not rule_dim.get(k) for k in keys):
+            out["notes"].append(f"Level '{level}' skipped: the sheet has no such column.")
+            continue
+        cur_agg = _s9_agg(m, cs, ce, keys)
+        base_aggs = [_s9_agg(m, s_, e_, keys) for (s_, e_) in use]
+        idx = cur_agg.index
+        for b in base_aggs:
+            idx = idx.union(b.index)
+        if not len(idx):
+            continue
+        cur_agg = cur_agg.reindex(idx).fillna(0.0)
+        base_aggs = [b.reindex(idx).fillna(0.0) for b in base_aggs]
+        if keys:
+            vol = cur_agg["_one"].to_frame("c")
+            for i, b in enumerate(base_aggs):
+                vol[f"b{i}"] = b["_one"]
+            vol["rank"] = vol.max(axis=1)
+            idx = list(vol.sort_values("rank", ascending=False).head(int(cfg["max_entities"])).index)
+        else:
+            idx = list(idx)
+        for key in idx:
+            crow = cur_agg.loc[key]
+            brows = [b.loc[key] for b in base_aggs]
+            cur_cov = float(crow["_qc"]) / float(crow["_one"]) if crow["_one"] else 0.0
+            tb = sum(float(r["_one"]) for r in brows)
+            base_cov = (sum(float(r["_qc"]) for r in brows) / tb) if tb else 0.0
+            for metric in metrics:
+                label, kind, bad, labels = S9_METRICS[metric]
+                if len(use) < int(cfg["min_baseline_windows"]):
+                    out["insufficient"] += 1
+                    continue
+                cur = _s9_value(crow, metric)
+                base = [_s9_value(r, metric) for r in brows]
+                base = [b for b in base if (kind == "count") or (b[1] > 0)]
+                res = s9_eval_metric(metric, cur, base, cfg, cov=(cur_cov, base_cov))
+                skey = f"{mode}|{level}|{_s9_entity_label(level, key)}|{metric}"
+                out["evaluated"] += 1
+                if res["state"] == "insufficient":
+                    out["insufficient"] += 1
+                    out["states"][skey] = "insufficient"
+                    continue
+                if res["state"] == "ok":
+                    out["states"][skey] = "ok"
+                    continue
+                direction = res["direction"]
+                out["states"][skey] = "fired:" + direction
+                out["anomalies"].append(_s9_record(level, keys, key, metric, cur, res, win, cfg, cov=(cur_cov, base_cov), base=base, mode=mode, now=now, skey=skey))
+    return out
+
+
+def _s9_fmt_val(metric, v):
+    kind = S9_METRICS[metric][1]
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "n/a"
+    if kind == "count":
+        return f"{v:,.0f} calls"
+    if kind == "rate":
+        return f"{v * 100:.1f}%"
+    if metric == "avg_duration":
+        return f"{v:.0f} sec"
+    return f"{v:.1f}"
+
+
+def _s9_record(level, keys, key, metric, cur, res, win, cfg, cov, base, mode, now, skey):
+    label, kind, bad, labels = S9_METRICS[metric]
+    direction = res["direction"]
+    ent = _s9_entity_label(level, key)
+    parts = dict(zip(keys, key if isinstance(key, tuple) else (key,))) if keys else {}
+    sev, why = s9_severity(metric, kind, direction, float(res["impact"]), float(res["z"]) if res["z"] != float("inf") else 99.0, float(res["magnitude"]), float(res["n"]), cfg, res.get("special"))
+    v, b = cur[0], res["baseline"]
+    if res.get("special") == "new_activity":
+        title = "New activity (no calls in the baseline windows)"
+    else:
+        title = labels[0 if direction == "up" else 1] or f"{label} {'higher' if direction == 'up' else 'lower'} than usual"
+    diff = (v - b) if v == v and b == b else float("nan")
+    unit_pts = kind == "rate"
+    if unit_pts:
+        change = f"{diff * 100:+.1f} points" + ("" if res.get("pct") is None else f" ({res['pct']:+.0f}% relative)")
+    elif metric == "qc_score":
+        change = f"{diff:+.1f} points" + ("" if res.get("pct") is None else f" ({res['pct']:+.0f}%)")
+    else:
+        change = f"{diff:+,.0f}" + ("" if res.get("pct") is None else f" ({res['pct']:+.0f}%)")
+        if res.get("pct") is None:
+            change += " (percentage hidden: the baseline is too small for a percentage to mean anything)"
+    ev = {
+        "current_windows": _s9_fmt_win(win["current"]), "baseline_windows": [_s9_fmt_win(w) for w in win.get("used_baselines", [])],
+        "baseline_values": [None if x[0] != x[0] else round(float(x[0]), 4) for x in base], "baseline_sample_sizes": [int(x[1]) for x in base],
+        "current_sample": int(cur[1]), "z": None if res["z"] == float("inf") else round(float(res["z"]), 2), "partial_period": bool(win.get("partial")),
+        "current_iso": [str(win["current"][0]), str(win["current"][1])], "baseline_iso": [[str(a), str(b)] for a, b in win.get("used_baselines", [])],
+        "qc_coverage_current": round(cov[0], 3), "qc_coverage_baseline": round(cov[1], 3), "ci_95": [round(x, 4) for x in res.get("ci", ())] if res.get("ci") else None,
+    }
+    complete = "complete"
+    if metric in S9_QC_METRICS and cov[0] < 0.8:
+        complete = f"partial: AI QC completed for {cov[0] * 100:.0f}% of the calls in the current window"
+    if win.get("partial"):
+        complete += "; current period is still in progress (baselines trimmed to the same elapsed time)"
+    explain = (f"{title}: {ent} {label.lower()} is {_s9_fmt_val(metric, v)} in {win['label']} versus {_s9_fmt_val(metric, b)} typically in {win['baseline_label']} "
+               f"({change}). Evidence: {res['method']}, z={ev['z']}, {int(cur[1]):,} evaluated call(s). {S9_DISCLAIMER}")
+    return {
+        "fp": f"{skey}|{direction}", "state_key": skey, "mode": mode, "detected_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "metric": metric, "metric_label": label, "entity_type": level, "entity_key": ent,
+        "publisher": parts.get("publisher", ""), "buyer": parts.get("buyer", ""), "campaign": parts.get("campaign", ""),
+        "direction": direction, "title": title, "current_value": None if v != v else float(v), "baseline_value": float(b),
+        "abs_diff": None if diff != diff else float(diff), "pct_diff": res.get("pct"), "change_text": change,
+        "current_window": _s9_fmt_win(win["current"]), "baseline_window": " ; ".join(ev["baseline_windows"]),
+        "sample_size": int(cur[1]), "min_sample": int(cfg["min_baseline_calls"] if kind == "count" else cfg["min_rate_n"] if kind == "rate" else cfg["min_mean_n"]),
+        "severity": sev, "severity_why": why, "method": res["method"], "threshold": f"|z| >= {cfg['z_threshold']}",
+        "evidence": ev, "completeness": complete, "explanation": explain, "next_step": _s9_next(metric, level, direction),
+        "impact_calls": round(float(res["impact"]), 1), "cfg_note": "thresholds: dashboard / ALERT_CONFIG",
+    }
+
+
+def s9_run_key(qf, cols, now, cfg, mode, target_date, levels, metrics):
+    """Same data + same settings + same windows -> same key, so a repeated run is a no-op."""
+    last = qf["Parsed_Date"].max() if "Parsed_Date" in qf.columns else None
+    h = hashlib.sha1(json.dumps([mode, str(target_date), str(last), len(qf), sorted(levels), sorted(metrics),
+                                 {k: cfg[k] for k in sorted(cfg) if k not in ("modes", "levels", "metrics")},
+                                 str(pd.Timestamp(now).floor("h") if mode == "rolling" else pd.Timestamp(now).date())], default=str).encode()).hexdigest()
+    return h[:20]
+
+
+def s9_detect_all(qf, cols, now, cfg=None, target_date=None):
+    """Every configured mode. Returns a list of s9_detect() results plus their run keys."""
+    cfg = cfg or s9_config()
+    runs = []
+    for mode in cfg["modes"]:
+        r = s9_detect(qf, cols, now, cfg, mode=mode, target_date=target_date)
+        r["run_key"] = s9_run_key(qf, cols, now, cfg, mode, target_date, cfg["levels"], cfg["metrics"])
+        runs.append(r)
+    return runs
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# STEP 9 - alert store (SQLite, versioned schema), lifecycle, audit, notifications queue, optional Google-Sheet backup
+# History is never deleted: there is no DELETE statement anywhere in this block (a test checks that).
+# Streamlit Community Cloud does NOT keep local files across restarts / redeploys. Turn on ALERT_SHEET_SYNC (see the setup notes) to back the
+# store up to a tab of your Google Sheet, or use a platform with a persistent disk.
+# ---------------------------------------------------------------------------------------------------------------------
+S9_MIGRATIONS = {
+    1: [
+        """CREATE TABLE IF NOT EXISTS alerts (
+            id TEXT PRIMARY KEY, fp TEXT NOT NULL, mode TEXT, status TEXT NOT NULL, severity TEXT NOT NULL, severity_rank INTEGER NOT NULL,
+            metric TEXT, entity_type TEXT, entity_key TEXT, publisher TEXT, buyer TEXT, campaign TEXT, direction TEXT, title TEXT,
+            detected_at TEXT, last_seen_at TEXT, acknowledged_at TEXT, acknowledged_by TEXT, resolved_at TEXT, resolved_by TEXT, resolution TEXT,
+            occurrences INTEGER DEFAULT 1, recurrence_of TEXT, ok_streak INTEGER DEFAULT 0, notified_rank INTEGER DEFAULT -1, notified_at TEXT,
+            payload TEXT)""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS one_active_alert_per_fp ON alerts(fp) WHERE status IN ('new','acknowledged','recurring')",
+        "CREATE INDEX IF NOT EXISTS alerts_status ON alerts(status, severity_rank)",
+        """CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, alert_id TEXT, actor TEXT, action TEXT, detail TEXT)""",
+        """CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, kind TEXT, alert_ids TEXT, fps TEXT, severity TEXT, status TEXT, attempts INTEGER DEFAULT 0,
+            next_attempt_at TEXT, sent_at TEXT, last_error TEXT, subject TEXT, claimed_at TEXT)""",
+        """CREATE TABLE IF NOT EXISTS runs (run_key TEXT PRIMARY KEY, ts TEXT, mode TEXT, summary TEXT)""",
+        """CREATE TABLE IF NOT EXISTS forecast_evals (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, entity_type TEXT, entity_key TEXT, metric TEXT,
+            method TEXT, wape REAL, mae REAL, n_test INTEGER, baseline_wape REAL, payload TEXT)""",
+        """CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)""",
+    ],
+}
+S9_TABLES = ["alerts", "audit", "notifications", "runs", "forecast_evals"]
+
+
+def s9_db_path():
+    p = str(_cfg("ALERT_DB_PATH", "") or "").strip()
+    return p or os.path.join(os.getcwd(), "step9_alerts.db")
+
+
+class S9Store:
+    """Thin SQLite wrapper. Each call opens its own short connection (safe for Streamlit reruns / threads); writes use BEGIN IMMEDIATE so two
+    runs can never create two active alerts or send one e-mail twice. ':memory:' keeps one shared connection (tests, read-only disks)."""
+    _lock = threading.RLock()
+
+    def __init__(self, path=None):
+        self.path = path or s9_db_path()
+        self.persistent = self.path != ":memory:"
+        self._mem = None
+        self.warning = ""
+        try:
+            self._migrate()
+        except Exception as exc:                       # read-only disk etc.: fall back to memory and SAY so
+            self.warning = f"Could not open the alert database ({type(exc).__name__}); alerts are kept in memory only and will be lost on restart."
+            self.path, self.persistent, self._mem = ":memory:", False, None
+            self._migrate()
+
+    def _conn(self):
+        if self.path == ":memory:":
+            if self._mem is None:
+                self._mem = sqlite3.connect(":memory:", check_same_thread=False, isolation_level=None)
+                self._mem.row_factory = sqlite3.Row
+            return self._mem
+        c = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        c.row_factory = sqlite3.Row
+        return c
+
+    def _close(self, c):
+        if self.path != ":memory:":
+            c.close()
+
+    def _migrate(self):
+        with self._lock:
+            c = self._conn()
+            try:
+                v = c.execute("PRAGMA user_version").fetchone()[0]
+                for ver in sorted(S9_MIGRATIONS):
+                    if ver > v:
+                        c.execute("BEGIN IMMEDIATE")
+                        for stmt in S9_MIGRATIONS[ver]:
+                            c.execute(stmt)
+                        c.execute(f"PRAGMA user_version = {int(ver)}")
+                        c.execute("COMMIT")
+            finally:
+                self._close(c)
+
+    def schema_version(self):
+        c = self._conn()
+        try:
+            return c.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            self._close(c)
+
+    def _tx(self, fn):
+        with self._lock:
+            c = self._conn()
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                try:
+                    r = fn(c)
+                    c.execute("COMMIT")
+                    return r
+                except BaseException:
+                    c.execute("ROLLBACK")
+                    raise
+            finally:
+                self._close(c)
+
+    def _q(self, sql, args=()):
+        with self._lock:
+            c = self._conn()
+            try:
+                return [dict(r) for r in c.execute(sql, args).fetchall()]
+            finally:
+                self._close(c)
+
+    # ---------- audit ----------
+    @staticmethod
+    def _audit(c, ts, alert_id, actor, action, detail=""):
+        c.execute("INSERT INTO audit(ts, alert_id, actor, action, detail) VALUES (?,?,?,?,?)", (ts, alert_id, actor, action, str(detail)[:1000]))
+
+    def audit_for(self, alert_id):
+        return pd.DataFrame(self._q("SELECT ts, actor, action, detail FROM audit WHERE alert_id = ? ORDER BY id", (alert_id,)))
+
+    # ---------- applying one detection run ----------
+    def apply_run(self, run, now, cfg, force=False):
+        """Create / update alerts from one s9_detect() result. Idempotent per run_key. Returns a summary dict."""
+        now_s = pd.Timestamp(now).strftime("%Y-%m-%d %H:%M:%S")
+        rk = run.get("run_key") or hashlib.sha1(json.dumps(run.get("windows", {}), default=str).encode()).hexdigest()[:20]
+        summ = {"new": 0, "recurring": 0, "updated": 0, "escalated": 0, "auto_resolved": 0, "skipped": False, "run_key": rk}
+
+        def fn(c):
+            if not force and c.execute("SELECT 1 FROM runs WHERE run_key = ?", (rk,)).fetchone():
+                summ["skipped"] = True
+                return summ
+            fired_fps = set()
+            for rec in run.get("anomalies", []):
+                fp = rec["fp"]
+                fired_fps.add(fp)
+                rank = S9_SEVERITIES.index(rec["severity"])
+                row = c.execute("SELECT id, severity_rank, occurrences FROM alerts WHERE fp = ? AND status IN ('new','acknowledged','recurring')", (fp,)).fetchone()
+                if row:
+                    c.execute("UPDATE alerts SET last_seen_at=?, occurrences=occurrences+1, severity=?, severity_rank=?, payload=?, ok_streak=0 WHERE id=?",
+                              (now_s, rec["severity"], rank, json.dumps(rec, default=str), row["id"]))
+                    summ["updated"] += 1
+                    if rank != row["severity_rank"]:
+                        self._audit(c, now_s, row["id"], "system", "severity_changed", f"{S9_SEVERITIES[row['severity_rank']]} -> {rec['severity']}")
+                        if rank > row["severity_rank"]:
+                            summ["escalated"] += 1
+                    continue
+                prior = c.execute("SELECT id FROM alerts WHERE fp = ? AND status = 'resolved' ORDER BY detected_at DESC, rowid DESC LIMIT 1", (fp,)).fetchone()
+                aid = "A" + hashlib.sha1(f"{fp}|{now_s}|{rk}".encode()).hexdigest()[:10]
+                status = "recurring" if prior else "new"
+                c.execute("""INSERT INTO alerts(id, fp, mode, status, severity, severity_rank, metric, entity_type, entity_key, publisher, buyer, campaign, direction, title,
+                             detected_at, last_seen_at, occurrences, recurrence_of, ok_streak, notified_rank, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                          (aid, fp, rec["mode"], status, rec["severity"], rank, rec["metric"], rec["entity_type"], rec["entity_key"], rec["publisher"], rec["buyer"],
+                           rec["campaign"], rec["direction"], rec["title"], now_s, now_s, 1, prior["id"] if prior else None, 0, -1, json.dumps(rec, default=str)))
+                self._audit(c, now_s, aid, "system", "detected" if not prior else "recurred", rec["explanation"][:300])
+                summ["recurring" if prior else "new"] += 1
+            # recovery: an active alert of this mode whose detector ran, did not fire in the same direction, and had enough data, counts one 'normal' run
+            need = int(cfg.get("recovery_runs", 2))
+            for a in c.execute("SELECT id, fp, ok_streak, payload FROM alerts WHERE status IN ('new','acknowledged','recurring') AND mode = ?", (run.get("mode"),)).fetchall():
+                if a["fp"] in fired_fps:
+                    continue
+                try:
+                    skey = json.loads(a["payload"]).get("state_key")
+                except Exception:
+                    skey = None
+                st_ = run.get("states", {}).get(skey)
+                if st_ is None or st_ == "insufficient":
+                    continue                                    # not evaluated / not enough data: neither recovered nor worse
+                streak = int(a["ok_streak"] or 0) + 1
+                if streak >= need:
+                    c.execute("UPDATE alerts SET status='resolved', resolved_at=?, resolved_by='system', resolution=?, ok_streak=? WHERE id=?",
+                              (now_s, f"Automatically resolved: the metric was back within its baseline in {streak} consecutive runs on different data windows", streak, a["id"]))
+                    self._audit(c, now_s, a["id"], "system", "auto_resolved", f"recovery condition met after {streak} normal runs")
+                    summ["auto_resolved"] += 1
+                else:
+                    c.execute("UPDATE alerts SET ok_streak=? WHERE id=?", (streak, a["id"]))
+            c.execute("INSERT OR REPLACE INTO runs(run_key, ts, mode, summary) VALUES (?,?,?,?)", (rk, now_s, run.get("mode"), json.dumps(summ)))
+            return summ
+
+        return self._tx(fn)
+
+    # ---------- manual actions ----------
+    def acknowledge(self, alert_id, actor, note=""):
+        now_s = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def fn(c):
+            r = c.execute("SELECT status FROM alerts WHERE id = ?", (str(alert_id),)).fetchone()
+            if not r:
+                return False, "Alert not found."
+            if r["status"] not in ("new", "recurring"):
+                return False, f"Only a new or recurring alert can be acknowledged (this one is {r['status']})."
+            c.execute("UPDATE alerts SET status='acknowledged', acknowledged_at=?, acknowledged_by=? WHERE id=?", (now_s, str(actor)[:80], str(alert_id)))
+            self._audit(c, now_s, str(alert_id), str(actor)[:80], "acknowledged", note)
+            return True, "Acknowledged."
+        return self._tx(fn)
+
+    def resolve(self, alert_id, actor, note=""):
+        now_s = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def fn(c):
+            r = c.execute("SELECT status FROM alerts WHERE id = ?", (str(alert_id),)).fetchone()
+            if not r:
+                return False, "Alert not found."
+            if r["status"] not in S9_ACTIVE:
+                return False, "That alert is already resolved."
+            c.execute("UPDATE alerts SET status='resolved', resolved_at=?, resolved_by=?, resolution=? WHERE id=?",
+                      (now_s, str(actor)[:80], "Manually resolved" + (": " + str(note)[:300] if note else ""), str(alert_id)))
+            self._audit(c, now_s, str(alert_id), str(actor)[:80], "resolved", note)
+            return True, "Resolved. The history is kept."
+        return self._tx(fn)
+
+    # ---------- queries ----------
+    def get(self, alert_id):
+        r = self._q("SELECT * FROM alerts WHERE id = ?", (str(alert_id),))
+        if not r:
+            return None
+        d = r[0]
+        try:
+            d["record"] = json.loads(d.get("payload") or "{}")
+        except Exception:
+            d["record"] = {}
+        return d
+
+    def list_alerts(self, statuses=None, severities=None, entity_types=None, publisher=None, buyer=None, campaign=None, metric=None, since=None, until=None, limit=2000):
+        """Filters are validated; values are always bound as parameters (never pasted into the SQL)."""
+        where, args = [], []
+
+        def add_in(col, vals, allowed=None):
+            vals = [str(v) for v in (vals or []) if str(v).strip()]
+            if allowed is not None:
+                vals = [v for v in vals if v in allowed]
+                if not vals:
+                    return
+            if vals:
+                where.append(f"{col} IN ({','.join('?' * len(vals))})")
+                args.extend(vals)
+        add_in("status", statuses, S9_STATUSES)
+        add_in("severity", severities, S9_SEVERITIES)
+        add_in("entity_type", entity_types, list(S9_LEVELS))
+        add_in("metric", metric, list(S9_METRICS))
+        for col, v in (("publisher", publisher), ("buyer", buyer), ("campaign", campaign)):
+            add_in(col, v if isinstance(v, (list, tuple, set)) else ([v] if v else []))
+        for col, v, op in (("detected_at", since, ">="), ("detected_at", until, "<=")):
+            if v:
+                try:
+                    t = pd.Timestamp(v)
+                except Exception:
+                    continue
+                if op == "<=" and t == t.normalize() and len(str(v)) <= 10:
+                    t = t + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                where.append(f"{col} {op} ?")
+                args.append(t.strftime("%Y-%m-%d %H:%M:%S"))
+        sql = ("SELECT id, status, severity, severity_rank, detected_at, last_seen_at, entity_type, entity_key, publisher, buyer, campaign, metric, direction, title, occurrences, "
+               "acknowledged_by, acknowledged_at, resolved_at, resolved_by, resolution, notified_rank, payload FROM alerts"
+               + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY severity_rank DESC, detected_at DESC LIMIT ?")
+        rows = self._q(sql, tuple(args) + (int(max(1, min(limit, 10000))),))
+        return pd.DataFrame(rows)
+
+    def counts(self):
+        rows = self._q("SELECT status, severity, COUNT(*) n FROM alerts GROUP BY status, severity")
+        return rows
+
+    def run_count(self):
+        return self._q("SELECT COUNT(*) n FROM runs")[0]["n"]
+
+    # ---------- forecast evaluations ----------
+    def save_forecast_eval(self, ev, now):
+        def fn(c):
+            c.execute("INSERT INTO forecast_evals(ts, entity_type, entity_key, metric, method, wape, mae, n_test, baseline_wape, payload) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                      (pd.Timestamp(now).strftime("%Y-%m-%d %H:%M:%S"), ev.get("entity_type"), ev.get("entity_key"), ev.get("metric"), ev.get("method"), ev.get("wape"),
+                       ev.get("mae"), ev.get("n_test"), ev.get("baseline_wape"), json.dumps(ev, default=str)))
+        self._tx(fn)
+
+    def forecast_evals(self, limit=200):
+        return pd.DataFrame(self._q("SELECT ts, entity_type, entity_key, metric, method, wape, mae, n_test, baseline_wape FROM forecast_evals ORDER BY id DESC LIMIT ?", (int(limit),)))
+
+    # ---------- backup / restore (Google Sheet tab, JSON rows) ----------
+    def export_tables(self):
+        return {t: self._q(f"SELECT * FROM {t}") for t in S9_TABLES}
+
+    def import_tables(self, data):
+        """Restore into an EMPTY store only (never overwrites existing history)."""
+        if self._q("SELECT COUNT(*) n FROM alerts")[0]["n"] or self._q("SELECT COUNT(*) n FROM audit")[0]["n"]:
+            return False
+
+        def fn(c):
+            for t in S9_TABLES:
+                for r in data.get(t, []):
+                    cols_ = list(r)
+                    c.execute(f"INSERT OR IGNORE INTO {t}({','.join(cols_)}) VALUES ({','.join('?' * len(cols_))})", [r[k] for k in cols_])
+        self._tx(fn)
+        return True
+
+
+S9_SYNC_TAB = "S9_Alert_Store"
+
+
+def s9_sheet_push(store, spreadsheet):
+    """Write the whole store to a tab (one JSON row per record). Best effort: needs Editor access for the service account. Returns (ok, message)."""
+    try:
+        try:
+            ws = spreadsheet.worksheet(S9_SYNC_TAB)
+        except Exception:
+            ws = spreadsheet.add_worksheet(title=S9_SYNC_TAB, rows=1000, cols=3)
+        rows = [["table", "json", "version"]]
+        for t, recs in store.export_tables().items():
+            for r in recs:
+                rows.append([t, json.dumps(r, default=str), S9_SCHEMA_VERSION])
+        ws.clear()
+        if hasattr(ws, "update"):
+            ws.update(values=rows, range_name="A1")
+        return True, f"Backed up {len(rows) - 1} record(s) to the '{S9_SYNC_TAB}' tab."
+    except Exception as exc:
+        return False, f"Backup to the sheet failed ({type(exc).__name__}); local data is unaffected."
+
+
+def s9_sheet_pull(store, spreadsheet):
+    """Restore into an empty local store from the backup tab. Returns (restored, message)."""
+    try:
+        ws = spreadsheet.worksheet(S9_SYNC_TAB)
+        vals = ws.get_all_values()
+    except Exception:
+        return False, "No backup tab found."
+    data = {t: [] for t in S9_TABLES}
+    for r in vals[1:]:
+        if len(r) >= 2 and r[0] in data:
+            try:
+                data[r[0]].append(json.loads(r[1]))
+            except Exception:
+                continue
+    ok = store.import_tables(data)
+    return ok, ("Restored from the sheet backup." if ok else "The local store already has data; nothing restored.")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# STEP 9 - e-mail notifications (SMTP). OFF until ALERT_EMAIL_ENABLED is true AND the settings are complete.
+# Secrets are read from Streamlit Secrets / environment only. They are never shown, logged, stored or put in an error text.
+# ---------------------------------------------------------------------------------------------------------------------
+S9_EMAIL_KEYS = ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_SENDER", "SMTP_SECURITY", "ALERT_EMAIL_TO", "ALERT_EMAIL_ENABLED", "ALERT_EMAIL_MIN_SEVERITY",
+                 "ALERT_EMAIL_ENTITY_FILTER", "ALERT_EMAIL_METRIC_FILTER", "ALERT_EMAIL_COOLDOWN_MIN", "ALERT_EMAIL_MAX_ATTEMPTS", "ALERT_EMAIL_DIGEST_AFTER", "APP_PUBLIC_URL")
+
+
+def _s9_truthy(v):
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+def s9_email_config():
+    g = lambda k, d="": str(_cfg(k, d) if _cfg(k, d) is not None else d).strip()
+    sev = g("ALERT_EMAIL_MIN_SEVERITY", "high").lower()
+    to = [x.strip() for x in re.split(r"[,;\s]+", g("ALERT_EMAIL_TO")) if x.strip()]
+    try:
+        port = int(g("SMTP_PORT", "587") or 587)
+    except Exception:
+        port = 587
+    def num(k, d, lo, hi):
+        try:
+            return max(lo, min(hi, int(float(g(k, str(d))))))
+        except Exception:
+            return d
+    return {
+        "enabled": _s9_truthy(g("ALERT_EMAIL_ENABLED", "false")), "host": g("SMTP_HOST"), "port": port, "user": g("SMTP_USER"), "password": _cfg("SMTP_PASSWORD", "") or "",
+        "sender": g("SMTP_SENDER") or g("SMTP_USER"), "security": (g("SMTP_SECURITY", "starttls").lower() or "starttls"), "to": to,
+        "min_severity": sev if sev in S9_SEVERITIES else "high",
+        "entity_filter": [x.strip().lower() for x in g("ALERT_EMAIL_ENTITY_FILTER").split(",") if x.strip()],
+        "metric_filter": [x.strip() for x in g("ALERT_EMAIL_METRIC_FILTER").split(",") if x.strip() in S9_METRICS],
+        "cooldown_min": num("ALERT_EMAIL_COOLDOWN_MIN", 180, 0, 10080), "max_attempts": num("ALERT_EMAIL_MAX_ATTEMPTS", 3, 1, 6),
+        "digest_after": num("ALERT_EMAIL_DIGEST_AFTER", 3, 1, 50), "public_url": s9_valid_url(g("APP_PUBLIC_URL")),
+    }
+
+
+def s9_valid_url(u):
+    """Only a real http(s) address is used in e-mails; anything else is dropped (no invented links)."""
+    u = str(u or "").strip()
+    try:
+        p = urlparse(u)
+    except Exception:
+        return ""
+    if p.scheme in ("http", "https") and p.netloc and "." in p.netloc.split(":")[0] and not re.search(r"\s", u) and p.netloc.split(":")[0] not in ("localhost",):
+        return u
+    return ""
+
+
+def s9_email_problems(ec):
+    """Why e-mail cannot be used right now ([] = ready). Never contains a secret."""
+    p = []
+    if not ec["enabled"]:
+        p.append("E-mail alerts are switched off (ALERT_EMAIL_ENABLED is not true).")
+    if not ec["host"]:
+        p.append("SMTP_HOST is missing.")
+    if not ec["sender"] or "@" not in ec["sender"]:
+        p.append("SMTP_SENDER (or SMTP_USER) must be an e-mail address.")
+    if not ec["to"] or any("@" not in x for x in ec["to"]):
+        p.append("ALERT_EMAIL_TO needs at least one valid recipient.")
+    if ec["security"] not in ("starttls", "ssl", "none"):
+        p.append("SMTP_SECURITY must be starttls, ssl or none.")
+    if bool(ec["user"]) != bool(ec["password"]):
+        p.append("SMTP_USER and SMTP_PASSWORD must be set together.")
+    return p
+
+
+def s9_scrub(text, ec):
+    """Remove anything secret from a message before it is stored, logged or shown."""
+    t = str(text)
+    for secret in (ec.get("password"), ec.get("user")):
+        if secret and len(str(secret)) >= 3:
+            t = t.replace(str(secret), "***")
+    return t[:300]
+
+
+def s9_build_message(alerts, ec, kind="single", now=None):
+    """(subject, plain-text body). `alerts` are alert dicts from S9Store.get()."""
+    now = pd.Timestamp(now) if now is not None else pd.Timestamp.now()
+    top = max(alerts, key=lambda a: a["severity_rank"])
+    if kind == "test":
+        return "[Ringba alerts] Test e-mail", "This is a test message sent because someone pressed the test button in the dashboard. No alert is involved.\n"
+    if len(alerts) == 1:
+        subj = f"[Ringba alert: {top['severity'].upper()}] {top['title']} - {top['entity_key']}"
+    else:
+        subj = f"[Ringba alerts] {len(alerts)} new alerts, highest {top['severity'].upper()}"
+    lines = []
+    for a in sorted(alerts, key=lambda x: (-x["severity_rank"], x["detected_at"])):
+        r = a.get("record") or {}
+        lines += [
+            f"Severity: {a['severity'].upper()}   Status: {a['status']}",
+            f"What: {a['title']}",
+            f"Entity: {a['entity_key']} ({a['entity_type']})   Metric: {r.get('metric_label', a['metric'])}",
+            f"Current: {_s9_fmt_val(a['metric'], r.get('current_value'))}   Baseline: {_s9_fmt_val(a['metric'], r.get('baseline_value'))}   Change: {r.get('change_text', 'n/a')}",
+            f"Comparison period: {r.get('current_window', 'n/a')}",
+            f"Baseline period(s): {r.get('baseline_window', 'n/a')}",
+            f"Sample size: {r.get('sample_size', 'n/a')} evaluated call(s) (minimum {r.get('min_sample', 'n/a')})",
+            f"Detected: {a['detected_at']}",
+            f"Why this severity: {r.get('severity_why', '')}",
+            f"Evidence: {r.get('method', '')}; {r.get('threshold', '')}; data: {r.get('completeness', '')}",
+            f"Suggested next step: {r.get('next_step', '')}",
+            f"Note: {S9_DISCLAIMER}", ""]
+    if ec.get("public_url"):
+        lines.append(f"Open the dashboard: {ec['public_url']}  (section: Step 9 alerts)")
+    else:
+        lines.append("(No APP_PUBLIC_URL is configured, so no link is included.)")
+    return subj, "\n".join(lines)
+
+
+def s9_smtp_send(ec, subject, body):
+    """Real SMTP submission. Returns when the server ACCEPTED the message; raises otherwise. Not used in tests (they pass a fake mailer)."""
+    msg = EmailMessage()
+    msg["Subject"], msg["From"], msg["To"] = subject, ec["sender"], ", ".join(ec["to"])
+    msg.set_content(body)
+    ctx = _ssl.create_default_context()
+    if ec["security"] == "ssl":
+        srv = smtplib.SMTP_SSL(ec["host"], ec["port"], timeout=20, context=ctx)
+    else:
+        srv = smtplib.SMTP(ec["host"], ec["port"], timeout=20)
+    try:
+        if ec["security"] == "starttls":
+            srv.starttls(context=ctx)
+        if ec["user"]:
+            srv.login(ec["user"], ec["password"])
+        refused = srv.send_message(msg)
+        if refused and len(refused) >= len(ec["to"]):
+            raise smtplib.SMTPRecipientsRefused(refused)
+        return len(ec["to"]) - len(refused or {})
+    finally:
+        try:
+            srv.quit()
+        except Exception:
+            pass
+
+
+def _s9_is_temporary(exc):
+    if isinstance(exc, (smtplib.SMTPAuthenticationError, smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPNotSupportedError)):
+        return False
+    if isinstance(exc, smtplib.SMTPResponseException):
+        return 400 <= int(exc.smtp_code) < 500
+    return isinstance(exc, (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, OSError, TimeoutError))
+
+
+def _s9_qualifies(a, ec):
+    if S9_SEVERITIES.index(a["severity"]) < S9_SEVERITIES.index(ec["min_severity"]):
+        return False
+    if ec["metric_filter"] and a["metric"] not in ec["metric_filter"]:
+        return False
+    if ec["entity_filter"]:
+        hay = " ".join([a.get("entity_key", ""), a.get("publisher", ""), a.get("buyer", ""), a.get("campaign", ""), a.get("entity_type", "")]).lower()
+        if not any(f in hay for f in ec["entity_filter"]):
+            return False
+    return True
+
+
+def s9_notify(store, now=None, mailer=None, ec=None):
+    """Queue and send e-mails for qualifying ACTIVE alerts. Detection never depends on this function.
+    Rules: only alerts at/above the minimum severity and passing the filters; an alert is e-mailed once per severity level (re-sent only if it escalates);
+    the same fingerprint is not e-mailed again inside the cooldown; many alerts become one digest; a failed send is retried only for temporary
+    errors, at most `max_attempts` times, with a growing delay (the retry happens on a later call, never in a loop); 'sent' is written only after the
+    server accepted the message. Returns a summary dict. Never raises."""
+    ec = ec or s9_email_config()
+    now = pd.Timestamp(now) if now is not None else pd.Timestamp.now()
+    now_s = now.strftime("%Y-%m-%d %H:%M:%S")
+    summ = {"enabled": False, "sent": 0, "failed": 0, "queued": 0, "retried": 0, "skipped_reason": "", "problems": []}
+    try:
+        problems = s9_email_problems(ec)
+        if problems:
+            summ["problems"] = problems
+            summ["skipped_reason"] = "disabled" if not ec["enabled"] else "incomplete configuration"
+            return summ
+        summ["enabled"] = True
+        mailer = mailer or s9_smtp_send
+        # 1) release claims that were never finished (a crash mid-send): allow a retry
+        def fn_release(c):
+            c.execute("UPDATE notifications SET status='failed', last_error='interrupted before the mail server confirmed', next_attempt_at=? WHERE status='sending' AND claimed_at < ?",
+                      (now_s, (now - pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")))
+        store._tx(fn_release)
+        # 2) new notifications for qualifying alerts
+        active = store.list_alerts(statuses=list(S9_ACTIVE), limit=1000)
+        recent = store._q("SELECT alert_ids, fps, status, sent_at, created_at FROM notifications WHERE kind != 'test' ORDER BY id DESC LIMIT 1000")
+        busy = set()
+        cool = {}
+        for n in recent:
+            try:
+                ids, fps = json.loads(n["alert_ids"]), json.loads(n["fps"])
+            except Exception:
+                continue
+            if n["status"] in ("pending", "sending", "failed", "abandoned"):
+                busy.update(ids)
+            if n["status"] == "sent" and n["sent_at"]:
+                for f in fps:
+                    cool[f] = max(cool.get(f, ""), n["sent_at"])
+        cand = []
+        if len(active):
+            for _, row in active.iterrows():
+                a = store.get(row["id"])
+                if a is None or a["id"] in busy or not _s9_qualifies(a, ec):
+                    continue
+                nr = a.get("notified_rank")
+                nr = -1 if nr is None else int(nr)
+                if nr >= a["severity_rank"]:
+                    continue                                       # already e-mailed at this severity (or higher)
+                last = cool.get(a["fp"])
+                if last and pd.Timestamp(last) + pd.Timedelta(minutes=ec["cooldown_min"]) > now:
+                    continue                                       # same alert fingerprint was e-mailed inside the cooldown
+                cand.append(a)
+        groups = []
+        if cand:
+            if len(cand) > ec["digest_after"]:
+                groups = [("digest", cand)]
+            else:
+                groups = [("single", [a]) for a in cand]
+        for kind, alerts in groups:
+            subj, _ = s9_build_message(alerts, ec, kind, now)
+            def fn_enq(c, kind=kind, alerts=alerts, subj=subj):
+                c.execute("INSERT INTO notifications(created_at, kind, alert_ids, fps, severity, status, attempts, next_attempt_at, subject) VALUES (?,?,?,?,?,'pending',0,?,?)",
+                          (now_s, kind, json.dumps([a["id"] for a in alerts]), json.dumps([a["fp"] for a in alerts]),
+                           max(alerts, key=lambda x: x["severity_rank"])["severity"], now_s, subj))
+            store._tx(fn_enq)
+            summ["queued"] += 1
+        # 3) send everything that is due (new + retries)
+        due = store._q("SELECT * FROM notifications WHERE status IN ('pending','failed') AND attempts < ? AND next_attempt_at <= ? ORDER BY id LIMIT 20", (ec["max_attempts"], now_s))
+        for n in due:
+            def fn_claim(c, nid=n["id"]):
+                r = c.execute("UPDATE notifications SET status='sending', claimed_at=?, attempts=attempts+1 WHERE id=? AND status IN ('pending','failed')", (now_s, nid))
+                return r.rowcount == 1
+            if not store._tx(fn_claim):
+                continue                                           # another run claimed it: it will send it, we must not
+            ids = json.loads(n["alert_ids"])
+            alerts = [a for a in (store.get(i) for i in ids) if a and a["status"] in S9_ACTIVE]
+            if not alerts:
+                store._tx(lambda c, nid=n["id"]: c.execute("UPDATE notifications SET status='cancelled', last_error='alert no longer active' WHERE id=?", (nid,)))
+                continue
+            subj, body = s9_build_message(alerts, ec, n["kind"], now)
+            try:
+                mailer(ec, subj, body)
+                ok, err, temp = True, "", False
+            except Exception as exc:                                # detection and the page must never break because of mail
+                ok, err, temp = False, f"{type(exc).__name__}: {s9_scrub(exc, ec)}", _s9_is_temporary(exc)
+            attempts = int(n["attempts"]) + 1
+            if ok:
+                def fn_ok(c, n=n, alerts=alerts):
+                    c.execute("UPDATE notifications SET status='sent', sent_at=?, last_error='' WHERE id=?", (now_s, n["id"]))
+                    for a in alerts:
+                        c.execute("UPDATE alerts SET notified_rank=?, notified_at=? WHERE id=?", (a["severity_rank"], now_s, a["id"]))
+                        store._audit(c, now_s, a["id"], "system", "notified", f"e-mail accepted by the mail server (notification {n['id']})")
+                store._tx(fn_ok)
+                summ["sent"] += 1
+                if attempts > 1:
+                    summ["retried"] += 1
+            else:
+                final = (not temp) or attempts >= ec["max_attempts"]
+                delay = min(60, 5 * 2 ** (attempts - 1))
+                def fn_fail(c, n=n, err=err, final=final, delay=delay):
+                    c.execute("UPDATE notifications SET status=?, last_error=?, next_attempt_at=? WHERE id=?",
+                              ("abandoned" if final else "failed", err, (now + pd.Timedelta(minutes=delay)).strftime("%Y-%m-%d %H:%M:%S"), n["id"]))
+                store._tx(fn_fail)
+                summ["failed"] += 1
+                summ.setdefault("errors", []).append(err)
+                if temp:                                            # the mail server looks down: do not hammer it with the rest; they wait for the same back-off
+                    later = (now + pd.Timedelta(minutes=delay)).strftime("%Y-%m-%d %H:%M:%S")
+                    store._tx(lambda c, later=later: c.execute("UPDATE notifications SET next_attempt_at=? WHERE status='pending' AND next_attempt_at <= ?", (later, now_s)))
+                    break
+    except Exception as exc:
+        summ["error"] = f"{type(exc).__name__}: {s9_scrub(exc, ec)}"
+    return summ
+
+
+def s9_send_test(store, now=None, mailer=None, ec=None):
+    """Only called from a button. Returns (ok, message)."""
+    ec = ec or s9_email_config()
+    probs = [p for p in s9_email_problems(ec) if "switched off" not in p]
+    if probs:
+        return False, " ".join(probs)
+    now = pd.Timestamp(now) if now is not None else pd.Timestamp.now()
+    subj, body = s9_build_message([{"severity_rank": 0}], ec, "test", now)
+    try:
+        (mailer or s9_smtp_send)(ec, subj, body)
+        ok, err = True, ""
+    except Exception as exc:
+        ok, err = False, f"{type(exc).__name__}: {s9_scrub(exc, ec)}"
+    def fn(c):
+        c.execute("INSERT INTO notifications(created_at, kind, alert_ids, fps, severity, status, attempts, sent_at, last_error, subject) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (now.strftime("%Y-%m-%d %H:%M:%S"), "test", "[]", "[]", "info", "sent" if ok else "failed", 1, now.strftime("%Y-%m-%d %H:%M:%S") if ok else None, err, subj))
+    try:
+        store._tx(fn)
+    except Exception:
+        pass
+    return ok, ("Test e-mail accepted by the mail server." if ok else "Test e-mail failed: " + err)
+
+
+def s9_requeue_abandoned(store):
+    """Button action: give notifications that ran out of retries one more bounded set of attempts."""
+    def fn(c):
+        r = c.execute("UPDATE notifications SET status='failed', attempts=0, next_attempt_at=? WHERE status='abandoned'", (pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),))
+        return r.rowcount
+    return store._tx(fn)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# STEP 9 - forecasting (daily call volume) with a time-based backtest. Simple methods first; the simpler one is kept unless the other wins the backtest.
+# A forecast is a statement about the future based on the past; it is shown separately from observed metrics and anomalies and is never a guarantee.
+# ---------------------------------------------------------------------------------------------------------------------
+S9_FC_DEFAULTS = {"horizon_days": 7, "min_history_days": 14, "min_train_days": 14, "max_origins": 8, "min_daily_mean": 5.0, "interval_min_residuals": 20,
+                  "weekday_weeks": 4, "levels": ["network", "publisher", "campaign", "buyer"], "max_entities": 12}
+
+
+def s9_complete_days(m, now):
+    """(first, last) complete calendar days in the data. The day that is still in progress (or whose feed has not finished) is NOT used for training."""
+    if m.empty:
+        return None, None
+    now = pd.Timestamp(now)
+    last_ts, first_ts = m["ts"].max(), m["ts"].min()
+    last_day = last_ts.normalize()
+    complete_last = last_day - pd.Timedelta(days=1)
+    if now.normalize() > last_day and last_ts.hour >= 20:
+        complete_last = last_day
+    first_day = first_ts.normalize()
+    if first_ts.hour >= 4:                              # the first day was probably cut off
+        first_day = first_day + pd.Timedelta(days=1)
+    if complete_last < first_day:
+        return None, None
+    return first_day, complete_last
+
+
+def s9_daily_counts(m, first, last, filt=None):
+    """Daily call counts per calendar day. A day on which the whole network had no calls is NaN (feed gap / unknown), never 0.
+    A day with no calls for one entity while the network had calls is a real 0."""
+    days = pd.date_range(first, last, freq="D")
+    mm = m[(m["ts"] >= first) & (m["ts"] < last + pd.Timedelta(days=1))]
+    net = mm.groupby(mm["ts"].dt.normalize()).size().reindex(days)
+    sel = mm
+    for k, v in (filt or {}).items():
+        sel = sel[sel[k] == v]
+    y = sel.groupby(sel["ts"].dt.normalize()).size().reindex(days).fillna(0.0)
+    y[net.isna()] = np.nan
+    return y.astype(float)
+
+
+def _s9_fc_seasonal_naive(y, dates):
+    out = []
+    for d in dates:
+        v = np.nan
+        k = d - pd.Timedelta(days=7)
+        while k >= y.index[0]:
+            if k in y.index and not np.isnan(y.loc[k]):
+                v = y.loc[k]
+                break
+            k -= pd.Timedelta(days=7)
+        out.append(v)
+    return np.array(out, dtype=float)
+
+
+def _s9_fc_weekday_mean(y, dates, weeks=4):
+    out = []
+    for d in dates:
+        vals = []
+        k = d - pd.Timedelta(days=7)
+        while k >= y.index[0] and len(vals) < weeks:
+            if k in y.index and not np.isnan(y.loc[k]):
+                vals.append(y.loc[k])
+            k -= pd.Timedelta(days=7)
+        out.append(float(np.mean(vals)) if len(vals) >= 2 else np.nan)
+    return np.array(out, dtype=float)
+
+
+S9_FC_METHODS = {"seasonal_naive": ("Seasonal naive (same weekday last week)", _s9_fc_seasonal_naive),
+                 "weekday_mean": ("Weekday average (same weekday, last 4 weeks)", _s9_fc_weekday_mean)}
+
+
+def s9_forecast_series(y, horizon, method="weekday_mean", fc=None):
+    """Forecast `horizon` days after the LAST index of y using ONLY y (no leakage possible: nothing else is passed in)."""
+    fc = fc or S9_FC_DEFAULTS
+    dates = [y.index[-1] + pd.Timedelta(days=i) for i in range(1, horizon + 1)]
+    fn = S9_FC_METHODS[method][1]
+    pts = fn(y, dates, int(fc["weekday_weeks"])) if method == "weekday_mean" else fn(y, dates)
+    return pd.Series(pts, index=pd.DatetimeIndex(dates))
+
+
+def s9_backtest(y, fc=None):
+    """Rolling-origin, chronological backtest. For each origin, train on data up to the origin ONLY, forecast the next `horizon` days, compare with what
+    really happened. Returns {method: {...}} or None when there is not enough history. WAPE is None when the actuals sum to zero."""
+    fc = fc or S9_FC_DEFAULTS
+    H = int(fc["horizon_days"])
+    n = len(y)
+    first_origin_idx = int(fc["min_train_days"]) - 1
+    origins = list(range(n - H - 1, first_origin_idx - 1, -H))[: int(fc["max_origins"])][::-1]
+    if not origins:
+        return None
+    res = {}
+    for meth in S9_FC_METHODS:
+        errs, acts, wk = [], [], []
+        for o in origins:
+            train = y.iloc[: o + 1]
+            f = s9_forecast_series(train, H, meth, fc)
+            a = y.reindex(f.index)
+            ok = ~(a.isna() | f.isna())
+            if ok.sum():
+                e = (a[ok] - f[ok]).values
+                errs += list(e)
+                acts += list(a[ok].values)
+                if ok.all():
+                    wk.append(float(e.sum()))
+        errs, acts = np.array(errs, dtype=float), np.array(acts, dtype=float)
+        if len(errs) < 7:
+            res[meth] = None
+            continue
+        tot = float(acts.sum())
+        res[meth] = {"mae": float(np.mean(np.abs(errs))), "wape": (float(np.sum(np.abs(errs)) / tot) if tot > 0 else None), "n_test": int(len(errs)),
+                     "errors": errs.tolist(), "weekly_errors": wk, "origins": len(origins), "bias": float(np.mean(errs))}
+    if all(v is None for v in res.values()):
+        return None
+    res["_window"] = (str(y.index[origins[0]].date()), str(y.index[min(origins[-1] + H, n - 1)].date()))
+    return res
+
+
+def s9_forecast_entity(m, level, key, now, fc=None, filt=None):
+    """One entity. Returns a dict that always says what it is, how much history it used and how far to trust it."""
+    fc = fc or S9_FC_DEFAULTS
+    H = int(fc["horizon_days"])
+    first, last = s9_complete_days(m, now)
+    out = {"entity_type": level, "entity_key": key, "metric": "calls", "generated_at": pd.Timestamp(now).strftime("%Y-%m-%d %H:%M:%S"), "horizon_days": H,
+           "available": False, "confidence": "unavailable", "caveats": []}
+    if first is None:
+        out["caveats"].append("No complete day of data yet.")
+        return out
+    y = s9_daily_counts(m, first, last, filt)
+    n_obs = int(y.notna().sum())
+    out["history_days"] = int(len(y))
+    out["observed_days"] = n_obs
+    out["missing_days"] = int(y.isna().sum())
+    out["training_window"] = f"{y.index[0].date()} to {y.index[-1].date()} (complete days only)"
+    if y.isna().sum():
+        out["caveats"].append(f"{int(y.isna().sum())} day(s) had no calls at all in the whole network (feed gap) and are treated as missing, not zero.")
+    if n_obs < int(fc["min_history_days"]):
+        out["caveats"].append(f"Only {n_obs} day(s) of history; at least {int(fc['min_history_days'])} are needed. No forecast is given.")
+        return out
+    mean_daily = float(np.nanmean(y.values))
+    out["mean_daily"] = round(mean_daily, 1)
+    if mean_daily < float(fc["min_daily_mean"]):
+        out["caveats"].append(f"Average of {mean_daily:.1f} call(s) per day is too small for a meaningful forecast. No forecast is given.")
+        return out
+    # trailing NaNs would break "last index": use the last observed day as the forecast origin
+    y_t = y[: y.last_valid_index()]
+    bt = s9_backtest(y_t, fc) if len(y_t) >= int(fc["min_train_days"]) + 7 + 1 else None
+    chosen, note = "weekday_mean", ""
+    if bt:
+        w = {k: (bt[k]["wape"] if bt.get(k) and bt[k]["wape"] is not None else None) for k in S9_FC_METHODS}
+        base_w, prop_w = w.get("seasonal_naive"), w.get("weekday_mean")
+        out["backtest"] = {"window": bt["_window"], "n_test": {k: (bt[k]["n_test"] if bt.get(k) else None) for k in S9_FC_METHODS},
+                           "wape": w, "mae": {k: (round(bt[k]["mae"], 2) if bt.get(k) else None) for k in S9_FC_METHODS}, "baseline": "seasonal_naive", "proposed": "weekday_mean"}
+        if base_w is not None and prop_w is not None:
+            chosen = "weekday_mean" if prop_w < base_w else "seasonal_naive"
+            out["backtest"]["proposed_beats_baseline"] = prop_w < base_w
+            note = (f"Backtest: the weekday average {'beat' if prop_w < base_w else 'did not beat'} the seasonal-naive baseline "
+                    f"(WAPE {prop_w * 100:.1f}% vs {base_w * 100:.1f}%), so '{S9_FC_METHODS[chosen][0]}' is used.")
+        elif prop_w is not None or base_w is not None:
+            chosen = "weekday_mean" if prop_w is not None else "seasonal_naive"
+            note = "Backtest could compute only one method (zero actuals or too few points); that one is used."
+        if note:
+            out["caveats"].append(note)
+    else:
+        out["caveats"].append("Not enough history for a backtest (needs about 3+ weeks), so this forecast has not been evaluated. Treat it as a rough guide.")
+    pts = s9_forecast_series(y_t, H, chosen, fc)
+    if pts.isna().all():
+        out["caveats"].append("The method could not produce values (too many missing days).")
+        return out
+    pts = pts.clip(lower=0)
+    res_ = (bt or {}).get(chosen) if bt else None
+    lo = hi = None
+    resid = res_["errors"] if res_ else []
+    if len(resid) >= int(fc["interval_min_residuals"]):
+        q10, q90 = np.quantile(resid, [0.10, 0.90])
+        lo, hi = (pts + q10).clip(lower=0), (pts + q90).clip(lower=0)
+        out["interval_note"] = f"80% interval from the {len(resid)} errors this method made in the backtest. A guide, not a guarantee."
+    else:
+        out["interval_note"] = (f"No uncertainty interval: the backtest produced only {len(resid)} error(s) (need {int(fc['interval_min_residuals'])}), so any interval would be invented.")
+    wk_interval = None
+    if res_ and len(res_.get("weekly_errors", [])) >= 8 and H == 7:
+        q10, q90 = np.quantile(res_["weekly_errors"], [0.10, 0.90])
+        wk_interval = (max(0.0, float(pts.sum() + q10)), max(0.0, float(pts.sum() + q90)))
+    hist_last7 = float(np.nansum(y_t.iloc[-7:].values)) if len(y_t) >= 7 else None
+    out.update(available=True, method=chosen, method_label=S9_FC_METHODS[chosen][0], baseline_label=S9_FC_METHODS["seasonal_naive"][0],
+               daily=pd.DataFrame({"date": pts.index.date, "forecast": pts.round(1).values, "low (10%)": None if lo is None else lo.round(1).values,
+                                   "high (90%)": None if hi is None else hi.round(1).values}),
+               total=float(np.nansum(pts.values)), total_interval=wk_interval, history_last7=hist_last7,
+               horizon_text=f"{pts.index[0].date()} to {pts.index[-1].date()}")
+    w = out.get("backtest", {}).get("wape", {}).get(chosen) if out.get("backtest") else None
+    nt = (res_ or {}).get("n_test", 0)
+    if w is None:
+        conf = "low"
+    elif w <= 0.20 and nt >= 28 and mean_daily >= 15:
+        conf = "high"
+    elif w <= 0.35 and mean_daily >= 15:
+        conf = "medium"
+    else:
+        conf = "low"
+    out["confidence"] = conf
+    out["confidence_rule"] = "Rule of thumb: high = backtest WAPE <= 20% with >= 28 test days and >= 15 calls/day; medium = WAPE <= 35%; otherwise low or not evaluated."
+    return out
+
+
+def s9_forecast_all(qf, cols, now, cfg=None, fc=None, store=None):
+    fc = {**S9_FC_DEFAULTS, **(fc or {})}
+    cfg = cfg or s9_config()
+    m = s9_prepare(qf, cols, cfg)
+    results = []
+    if m.empty:
+        return results
+    first, last = s9_complete_days(m, now)
+    for level in fc["levels"]:
+        keys = S9_LEVELS[level]
+        if level == "network":
+            results.append(s9_forecast_entity(m, "network", "Whole network", now, fc))
+            continue
+        k = keys[0]
+        if not cols.get(k):
+            continue
+        recent = m[m["ts"] >= (last - pd.Timedelta(days=27))] if last is not None else m
+        top = recent[k].value_counts().head(int(fc["max_entities"])).index
+        for name in top:
+            results.append(s9_forecast_entity(m, level, str(name), now, fc, {k: name}))
+    if store is not None:
+        for r in results:
+            b = r.get("backtest")
+            if r.get("available") and b:
+                try:
+                    store.save_forecast_eval({"entity_type": r["entity_type"], "entity_key": r["entity_key"], "metric": "calls", "method": r["method"],
+                                              "wape": b["wape"].get(r["method"]), "mae": b["mae"].get(r["method"]), "n_test": b["n_test"].get(r["method"]),
+                                              "baseline_wape": b["wape"].get("seasonal_naive")}, now)
+                except Exception:
+                    pass
+    return results
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# STEP 9 - root-cause investigation. Reuses the Step 8 read-only tools (agent_run_tool); no second analytics engine and no AI is needed.
+# Output is split into: confirmed observations / possible contributing factors / unknowns / recommended next checks.
+# Nothing here changes Ringba, publishers, buyers or campaigns.
+# ---------------------------------------------------------------------------------------------------------------------
+S9_UNKNOWNS = [
+    "Whether routing, caps, targeting, tracking or buyer availability changed outside this sheet (it holds calls only).",
+    "Whether the publisher changed its traffic source, creative or schedule.",
+    "Why the QC fields are blank where they are: an AI QC delay and a real change in traffic look the same in the sheet.",
+]
+
+
+def _s9_verify(record, qf, cols, cfg):
+    """Recompute the alert's current and baseline values from the raw calls over the stored windows and compare with the stored numbers."""
+    ev = record.get("evidence", {})
+    if not ev.get("current_iso"):
+        return None, "The alert has no stored windows to re-check."
+    m = s9_prepare(qf, cols, cfg)
+    for k in ("publisher", "buyer", "campaign"):
+        if record.get(k):
+            m = m[m[k] == record[k]]
+    metric = record["metric"]
+    cs, ce = [pd.Timestamp(x) for x in ev["current_iso"]]
+    cur = _s9_value(_s9_agg(m, cs, ce, []).iloc[0], metric)
+    base = [_s9_value(_s9_agg(m, pd.Timestamp(a), pd.Timestamp(b), []).iloc[0], metric) for a, b in ev.get("baseline_iso", [])]
+    kind = S9_METRICS[metric][1]
+    if kind == "count":
+        bv = _s9_robust([b[0] for b in base])[0]
+    elif kind == "rate":
+        n0 = sum(b[1] for b in base)
+        bv = sum(b[2] for b in base) / n0 if n0 else float("nan")
+    else:
+        n0 = sum(b[1] for b in base)
+        bv = sum(b[2] for b in base) / n0 if n0 else float("nan")
+    ok = (abs(cur[0] - float(record["current_value"])) < 1e-6 * max(1, abs(cur[0]))) and (abs(bv - float(record["baseline_value"])) < 1e-6 * max(1, abs(bv)))
+    return ok, f"Recomputed from the raw calls: current {_s9_fmt_val(metric, cur[0])}, baseline {_s9_fmt_val(metric, bv)} - " + ("matches the alert." if ok else "DOES NOT match the stored alert (the data may have changed since detection).")
+
+
+def s9_investigate(record, qf, cols, today, tz=None, include_samples=False, cfg=None):
+    cfg = cfg or s9_config()
+    out = {"confirmed": [], "possible": [], "unknown": list(S9_UNKNOWNS), "next": [], "tables": [], "tools": [], "verified": None}
+    ok, msg = _s9_verify(record, qf, cols, cfg)
+    out["verified"] = ok
+    out["confirmed"].append(("Verification: " if ok else "Verification problem: ") + msg)
+    ev = record.get("evidence", {})
+    try:
+        s_, e_ = [pd.Timestamp(x) for x in ev["current_iso"]]
+        start_d, end_d = s_.date(), max(s_, e_ - pd.Timedelta(seconds=1)).date()
+    except Exception:
+        out["unknown"].append("The alert's period could not be read, so the breakdown tools were not run.")
+        return out
+    filt = {k: record[k] for k in ("publisher", "buyer", "campaign") if record.get(k) and not str(record[k]).startswith("(")}
+    env = AgentEnv(qf, cols, today, None, tz or DEFAULT_TIMEZONE, AgentAliases(qf, cols))
+    period = {"start": str(start_d), "end": str(end_d)}
+    metric = record["metric"]
+    level = record["entity_type"]
+
+    def run(tool, args):
+        r = agent_run_tool(tool, args, env)
+        out["tools"].append(f"{tool} {json.dumps({k: v for k, v in args.items() if k != 'filters'}, default=str)}" + (f" filters={filt}" if args.get("filters") else ""))
+        return r
+    metric_col = {"calls": ("Volume change", "Calls (now)", "Calls (before)"), "short_rate": None, "qc_score": ("Avg Score change", "Avg Score (now)", "Avg Score (before)"),
+                  "spam_rate": ("Spam % change", "Spam % (now)", "Spam % (before)"), "voip_rate": ("VoIP % change", "VoIP % (now)", "VoIP % (before)"),
+                  "poor_rate": ("Avg Score change", "Avg Score (now)", "Avg Score (before)"), "fake_rate": None, "avg_duration": None}.get(metric)
+    st_res = run("group_stats", {"period": period, "filters": filt} if filt else {"period": period})
+    if st_res.ok and st_res.table is not None and len(st_res.table):
+        r0 = st_res.table.iloc[0]
+        out["confirmed"].append("Same scope, same period (Step 8 group_stats): " + ", ".join(f"{k} {r0[k]}" for k in ("Calls", "Qualification %", "Spam %", "VoIP %", "Avg Score") if k in r0.index) + ".")
+        out["tables"].append(("Scope statistics for the alert period", st_res.table))
+    dims = []
+    for d in ("campaign", "buyer", "publisher", "hangup"):
+        if d in ("campaign", "buyer", "publisher") and level in S9_LEVELS and d in S9_LEVELS[level]:
+            continue
+        if d in filt and d != "hangup":
+            continue
+        dims.append(d)
+    for d in dims:
+        r = run("compare_periods", {"period": period, "by": [d], **({"filters": filt} if filt else {})})
+        if not r.ok:
+            out["unknown"].append(f"Breakdown by {QUERY_LABELS.get(d, d)} was not possible: {r.error}")
+            continue
+        t = r.table
+        if t is None or not len(t):
+            continue
+        out["tables"].append((f"{r.title} ({r.scope})", t))
+        for note in (r.notes or [])[:2]:
+            out["confirmed"].append(note)
+        if metric_col and metric_col[0] in t.columns and d != "hangup":
+            gcol = t.columns[0]
+            chg = pd.to_numeric(t[metric_col[0]], errors="coerce")
+            if metric == "calls" and chg.notna().any():
+                total = float(chg.sum())
+                top = chg.abs().idxmax()
+                tv = float(chg.loc[top])
+                if total != 0 and abs(tv) >= 0.5 * abs(total) and abs(tv) >= 5 and np.sign(tv) == np.sign(total):
+                    out["possible"].append(f"{abs(tv):,.0f} of the {abs(total):,.0f}-call change is in {QUERY_LABELS.get(d, d)} '{t.loc[top, gcol]}' ({abs(tv) / abs(total) * 100:.0f}%). "
+                                           "This shows where the change is concentrated, not why it happened.")
+                    out["confirmed"].append(f"By {QUERY_LABELS.get(d, d)}: the largest volume change is '{t.loc[top, gcol]}' ({tv:+,.0f} calls).")
+            elif metric in ("spam_rate", "voip_rate", "qc_score", "poor_rate") and chg.notna().any():
+                nowc = "Calls (now)" if "Calls (now)" in t.columns else None
+                tt = t.copy()
+                tt["_chg"] = chg
+                if nowc:
+                    tt = tt[pd.to_numeric(tt[nowc], errors="coerce") >= 10]
+                if len(tt):
+                    worst = tt["_chg"].idxmin() if metric in ("qc_score", "poor_rate") else tt["_chg"].idxmax()
+                    out["possible"].append(f"The biggest move in {metric_col[0]} is in {QUERY_LABELS.get(d, d)} '{tt.loc[worst, gcol]}' ({tt.loc[worst, '_chg']:+.1f}, at least 10 calls now). "
+                                           "A correlation inside the data; the sheet cannot show the cause.")
+    if record["metric"] in ("calls",) and record["direction"] == "down":
+        out["possible"].append("A volume drop can come from the publisher pausing or throttling, a cap or routing change, a tracking gap, or a data-feed delay; the sheet alone cannot tell these apart.")
+    if record["metric"] in S9_QC_METRICS and "partial" in str(record.get("completeness", "")):
+        out["possible"].append("AI QC is incomplete in this window, so the indicator may reflect which calls were reviewed rather than a real change.")
+    if include_samples and metric in S9_QC_METRICS | {"short_rate"}:
+        r = run("call_samples", {"period": period, "n": 5, **({"filters": filt} if filt else {})})
+        if r.ok and r.table is not None and len(r.table):
+            out["tables"].append(("Sample of the lowest-scored calls (caller IDs shortened; no recordings or transcripts were fetched or sent anywhere)", r.table))
+    elif metric in S9_QC_METRICS | {"short_rate"}:
+        out["unknown"].append("Call-level samples were not pulled (turn on 'include call samples' if you want to look at individual calls).")
+    out["next"] = [record.get("next_step", ""), "Compare the same breakdown against the previous period in the Step 8 assistant (ask for the question below).",
+                   "Confirm outside the sheet whether anything changed in routing, caps or the publisher's traffic."]
+    out["question"] = f"Investigate {record['entity_key']} {metric.replace('_', ' ')} for {start_d} to {end_d}"
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# STEP 9 - run orchestration + Streamlit section. A run = detect (Python) -> store (dedupe / lifecycle) -> e-mail (optional, can fail safely) -> backup (optional).
+# ---------------------------------------------------------------------------------------------------------------------
+def s9_run_detection(store, qf, cols, now, cfg=None, force=False, mailer=None, target_date=None):
+    """Detection never depends on e-mail or on any AI. Returns a summary dict for the page."""
+    cfg = cfg or s9_config()
+    summary = {"modes": [], "new": 0, "recurring": 0, "updated": 0, "auto_resolved": 0, "skipped_runs": 0, "notes": [], "email": None}
+    for run in s9_detect_all(qf, cols, now, cfg, target_date):
+        if not run.get("ok", True):
+            summary["notes"].append(f"{run['mode']}: {run.get('message', 'not run')}")
+            continue
+        s = store.apply_run(run, now, cfg, force=force)
+        summary["modes"].append({"mode": run["mode"], "evaluated": run["evaluated"], "insufficient": run["insufficient"], "fired": len(run["anomalies"]),
+                                 "window": run["windows"]["label"], "baseline": run["windows"]["baseline_label"], "usable_baselines": len(run["windows"].get("used_baselines", []))})
+        for k in ("new", "recurring", "updated", "auto_resolved"):
+            summary[k] += s.get(k, 0)
+        summary["skipped_runs"] += 1 if s.get("skipped") else 0
+        summary["notes"] += [f"{run['mode']}: {n}" for n in run["notes"]]
+    try:
+        summary["email"] = s9_notify(store, now, mailer=mailer)
+    except Exception as exc:                                   # s9_notify never raises, this is belt and braces
+        summary["email"] = {"error": type(exc).__name__}
+    return summary
+
+
+def s9_action_password():
+    return str(_cfg("ALERT_ACTION_PASSWORD", "") or "")
+
+
+def s9_action_allowed(entered):
+    """True when no action password is configured, or the entered one matches (constant-time compare)."""
+    import hmac
+    pw = s9_action_password()
+    if not pw:
+        return True
+    return hmac.compare_digest(str(entered or "").encode(), pw.encode())
+
+
+def s9_get_store():
+    s = st.session_state.get("s9_store")
+    if s is None:
+        s = S9Store()
+        st.session_state["s9_store"] = s
+    return s
+
+
+def s9_sync_enabled():
+    return _s9_truthy(_cfg("ALERT_SHEET_SYNC", "false"))
+
+
+def _s9_open_spreadsheet():
+    meta = st.session_state.get("meta", {}) or {}
+    if not meta.get("url"):
+        return None
+    return get_client().open_by_url(meta["url"])
+
+
+def _s9_say(ok, msg, info=False):
+    if ok:
+        st.success(msg)
+    elif info:
+        st.info(msg)
+    else:
+        st.error(msg)
+
+
+def _s9_sev_icon(sev):
+    return {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}.get(sev, "")
+
+
+def _s9_alert_table(df):
+    if df is None or not len(df):
+        return pd.DataFrame()
+    rows = []
+    for _, r in df.iterrows():
+        try:
+            rec = json.loads(r["payload"]) if r.get("payload") else {}
+        except Exception:
+            rec = {}
+        m = r["metric"]
+        rows.append({"ID": r["id"], "Detected": r["detected_at"], "Severity": _s9_sev_icon(r["severity"]) + " " + r["severity"],
+                     "Entity": r["entity_key"], "Level": r["entity_type"], "Metric": S9_METRICS.get(m, (m,))[0], "Current": _s9_fmt_val(m, rec.get("current_value")),
+                     "Baseline": _s9_fmt_val(m, rec.get("baseline_value")), "Change": rec.get("change_text", ""), "Sample": rec.get("sample_size"),
+                     "Status": r["status"], "Times seen": r["occurrences"], "Explanation": r["title"]})
+    return pd.DataFrame(rows)
+
+
+def _s9_reset_settings():
+    st.session_state["s9_cfg_over"] = {}
+    for k in ("s9_z", "s9_bw", "s9_mbw", "s9_rd", "s9_mbc", "s9_mrn", "s9_rmd", "s9_sc", "s9_modes", "s9_levels", "s9_inc"):
+        st.session_state.pop(k, None)
+
+
+def render_step9(df, available_columns, overrides, sidebar_timeline):
+    st.markdown("---")
+    st.markdown("### 🚨 Step 9 — Alerts, Investigation & Forecasts")
+    cols = resolve_query_columns(available_columns, overrides)
+    st.caption("Python calculates everything here (no AI is used for detection, severity, e-mail or forecasts). An alert means a metric differs from its baseline; "
+               "it does not prove fraud, publisher misconduct or an outage. Nothing on this page changes Ringba, publishers, buyers or campaigns.")
+    if not cols.get("date"):
+        st.info("Step 9 needs a readable Call Date column.")
+        return
+    qf = get_query_frame(df, cols)
+    tz = st.session_state.get("date_tz", DEFAULT_TIMEZONE)
+    try:
+        now = pd.Timestamp.now(tz=tz).tz_localize(None)
+    except Exception:
+        now = pd.Timestamp.now()
+    store = s9_get_store()
+    if store.warning:
+        st.warning(store.warning)
+    elif not store.persistent:
+        st.warning("Alerts are kept in memory only (not persistent).")
+    over = st.session_state.get("s9_cfg_over", {})
+    cfg = s9_config(over)
+    t_alerts, t_fc, t_set = st.tabs(["🚨 Alerts", "📈 Forecasts", "⚙️ Settings, e-mail & storage"])
+
+    # ---------------- settings ----------------
+    with t_set:
+        st.markdown("**Detection settings** (defaults are conventional starting points, not statistical truths; change them and press *Run detection*).")
+        c1 = st.columns(4)
+        new = dict(over)
+        new["z_threshold"] = c1[0].number_input("Evidence threshold (z)", min_value=1.5, max_value=10.0, value=float(cfg["z_threshold"]), step=0.5, key="s9_z", help="Higher = fewer, stronger alerts.")
+        new["baseline_windows"] = int(c1[1].number_input("Baseline windows", min_value=2, max_value=12, value=int(cfg["baseline_windows"]), step=1, key="s9_bw"))
+        new["min_baseline_windows"] = int(c1[2].number_input("Minimum usable windows", min_value=2, max_value=12, value=int(cfg["min_baseline_windows"]), step=1, key="s9_mbw"))
+        new["rolling_days"] = int(c1[3].number_input("Rolling window (days)", min_value=1, max_value=30, value=int(cfg["rolling_days"]), step=1, key="s9_rd"))
+        c2 = st.columns(4)
+        new["min_baseline_calls"] = int(c2[0].number_input("Min baseline calls (volume alerts)", min_value=1, max_value=5000, value=int(cfg["min_baseline_calls"]), step=5, key="s9_mbc"))
+        new["min_rate_n"] = int(c2[1].number_input("Min calls (rate alerts)", min_value=5, max_value=5000, value=int(cfg["min_rate_n"]), step=5, key="s9_mrn"))
+        new["rate_min_delta"] = c2[2].number_input("Min rate change (0.05 = 5 points)", min_value=0.01, max_value=0.5, value=float(cfg["rate_min_delta"]), step=0.01, key="s9_rmd")
+        new["short_call_sec"] = int(c2[3].number_input("Short call below (sec)", min_value=1, max_value=600, value=int(cfg["short_call_sec"]), step=5, key="s9_sc"))
+        c3 = st.columns(3)
+        new["modes"] = c3[0].multiselect("Comparison modes", ["day", "week", "rolling"], default=list(cfg["modes"]), key="s9_modes",
+                                         help="day: today so far vs the same weekday; week: week to date; rolling: last N days vs earlier windows") or ["day"]
+        new["levels"] = c3[1].multiselect("Levels", list(S9_LEVELS), default=list(cfg["levels"]), key="s9_levels") or ["network"]
+        new["count_alert_increase"] = c3[2].checkbox("Report volume increases", value=bool(cfg["count_alert_increase"]), key="s9_inc")
+        st.session_state["s9_cfg_over"] = new
+        st.button("Reset detection settings to defaults", key="s9_reset", on_click=_s9_reset_settings)
+        st.caption("Not monitored (no source field): " + " ".join(S9_UNAVAILABLE_METRICS))
+        st.markdown("**Resolution policy:** an alert is auto-resolved only after the same detector reports the metric back within its baseline in "
+                    f"{int(cfg['recovery_runs'])} consecutive runs on different data windows (runs with too little data do not count). It can also be resolved manually. History is never deleted.")
+        st.markdown("---")
+        st.markdown("**E-mail notifications**")
+        ec = s9_email_config()
+        probs = s9_email_problems(ec)
+        if ec["enabled"] and not probs:
+            st.success(f"E-mail is enabled: minimum severity {ec['min_severity']}, {len(ec['to'])} recipient(s), cooldown {ec['cooldown_min']} min. Credentials are never shown here.")
+        else:
+            st.info("E-mail is OFF. " + " ".join(probs))
+        st.caption("Set the values in Streamlit Secrets or environment variables (see the setup notes). Public link in e-mails: "
+                   + ("configured." if ec["public_url"] else "none configured, so no link is added."))
+        auth_ok = True
+        if s9_action_password():
+            pw = st.text_input("Action password (needed to acknowledge / resolve / send a test e-mail):", type="password", key="s9_pw")
+            auth_ok = s9_action_allowed(pw)
+            if pw and not auth_ok:
+                st.error("Wrong password.")
+        else:
+            st.warning("No ALERT_ACTION_PASSWORD is set: anyone who can open this app can acknowledge / resolve alerts and press the test-e-mail button.")
+        if st.button("Send a test e-mail now", key="s9_test_mail", disabled=not (ec["enabled"] and not probs)):
+            if not auth_ok:
+                st.error("Enter the action password first.")
+            else:
+                ok, msg = s9_send_test(store, now, ec=ec)
+                _s9_say(ok, msg)
+        nt = store._q("SELECT created_at, kind, severity, status, attempts, next_attempt_at, last_error, subject FROM notifications ORDER BY id DESC LIMIT 50")
+        if nt:
+            st.dataframe(pd.DataFrame(nt), hide_index=True, width="stretch")
+            if any(x["status"] == "abandoned" for x in nt) and st.button("Retry abandoned notifications (one more bounded round)", key="s9_requeue"):
+                if auth_ok:
+                    st.info(f"{s9_requeue_abandoned(store)} notification(s) re-queued; they are sent on the next run.")
+        st.markdown("---")
+        st.markdown("**Storage**")
+        st.caption(f"Database: `{store.path}` (schema v{store.schema_version()}). "
+                   + ("Local file: Streamlit Community Cloud does NOT keep it across restarts or redeploys. " if store.persistent else "")
+                   + ("Sheet backup is ON." if s9_sync_enabled() else "Sheet backup is OFF (set ALERT_SHEET_SYNC=true and give the service account Editor access to enable it)."))
+        if s9_sync_enabled():
+            b = st.columns(2)
+            if b[0].button("Back up now to the sheet tab", key="s9_push"):
+                ok, msg = s9_sheet_push(store, _s9_open_spreadsheet())
+                _s9_say(ok, msg)
+            if b[1].button("Restore from the sheet backup (empty store only)", key="s9_pull"):
+                ok, msg = s9_sheet_pull(store, _s9_open_spreadsheet())
+                _s9_say(ok, msg, info=True)
+
+    # ---------------- alerts ----------------
+    with t_alerts:
+        last_ts = qf["Parsed_Date"].max() if "Parsed_Date" in qf.columns else None
+        if last_ts is not None and pd.notna(last_ts):
+            age_h = (now - last_ts).total_seconds() / 3600
+            st.caption(f"Newest call in the loaded data: {last_ts.strftime('%Y-%m-%d %H:%M')} ({age_h:.1f} h ago). Data is only as fresh as the last sheet load.")
+        auto_key = (len(df), str(last_ts), json.dumps(st.session_state.get('s9_cfg_over', {}), sort_keys=True, default=str))
+        cA, cB = st.columns([1, 3])
+        run_clicked = cA.button("▶ Run detection now", key="s9_run", help="Safe to press repeatedly: the same data window never creates duplicates.")
+        auto = cB.checkbox("Also check once whenever new data is loaded (runs only while someone has the app open; Streamlit is not a scheduler)", value=True, key="s9_auto")
+        do_run = run_clicked or (auto and st.session_state.get("s9_last_auto") != auto_key)
+        if do_run:
+            st.session_state["s9_last_auto"] = auto_key
+            with st.spinner("Checking the data against its baselines ..."):
+                summ = s9_run_detection(store, qf, cols, now, s9_config(st.session_state.get("s9_cfg_over", {})))
+            st.session_state["s9_last_summary"] = summ
+            if s9_sync_enabled():
+                try:
+                    s9_sheet_push(store, _s9_open_spreadsheet())
+                except Exception:
+                    pass
+        summ = st.session_state.get("s9_last_summary")
+        if summ:
+            ms = " | ".join(f"{x['mode']}: {x['fired']} fired, {x['insufficient']} low-data of {x['evaluated']} checks ({x['usable_baselines']} usable baseline window(s))" for x in summ["modes"])
+            st.caption(f"Last run: {summ['new']} new, {summ['recurring']} recurring, {summ['updated']} updated, {summ['auto_resolved']} auto-resolved"
+                       + (f", {summ['skipped_runs']} mode(s) already processed for this data" if summ["skipped_runs"] else "") + (". " + ms if ms else "."))
+            for n in dict.fromkeys(summ["notes"]):
+                st.caption("ℹ️ " + n)
+            em = summ.get("email") or {}
+            if em.get("failed"):
+                st.warning(f"{em['failed']} e-mail attempt(s) failed (alerts are unaffected): " + "; ".join(em.get("errors", [])[:2]))
+            elif em.get("sent"):
+                st.caption(f"{em['sent']} e-mail(s) sent.")
+        allr = store.list_alerts()
+        act = allr[allr["status"].isin(S9_ACTIVE)] if len(allr) else allr
+        m = st.columns(6)
+        n_ = lambda d, f: int(f(d)) if len(d) else 0
+        m[0].metric("Active critical", n_(act, lambda d: (d["severity"] == "critical").sum()))
+        m[1].metric("Active high", n_(act, lambda d: (d["severity"] == "high").sum()))
+        m[2].metric("Total active", len(act))
+        m[3].metric("New (not yet acknowledged)", n_(act, lambda d: d["status"].isin(["new", "recurring"]).sum()))
+        m[4].metric("Unresolved", len(act))
+        rec_cut = (now - pd.Timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        m[5].metric("Resolved (7 days)", n_(allr, lambda d: ((d["status"] == "resolved") & (d["resolved_at"].fillna("") >= rec_cut)).sum()))
+        if not len(allr):
+            st.info("No alerts yet. With too little history the detectors report 'insufficient data' instead of guessing; they need at least "
+                    f"{int(cfg['min_baseline_windows'])} comparable earlier windows.")
+        else:
+            f = st.columns(4)
+            sev = f[0].multiselect("Severity", S9_SEVERITIES[::-1], key="s9_f_sev")
+            stat = f[1].multiselect("Status", list(S9_STATUSES), default=list(S9_ACTIVE), key="s9_f_stat")
+            et = f[2].multiselect("Entity type", list(S9_LEVELS), key="s9_f_et")
+            met = f[3].multiselect("Metric", list(S9_METRICS), format_func=lambda k: S9_METRICS[k][0], key="s9_f_met")
+            g = st.columns(4)
+            pubs = g[0].multiselect("Publisher", sorted(x for x in allr["publisher"].dropna().unique() if x), key="s9_f_pub")
+            buys = g[1].multiselect("Buyer", sorted(x for x in allr["buyer"].dropna().unique() if x), key="s9_f_buy")
+            camps = g[2].multiselect("Campaign", sorted(x for x in allr["campaign"].dropna().unique() if x), key="s9_f_camp")
+            rng = g[3].text_input("Detected between (YYYY-MM-DD to YYYY-MM-DD, optional)", "", key="s9_f_rng")
+            since = until = None
+            if "to" in rng:
+                a_, b_ = [x.strip() for x in rng.split("to", 1)]
+                since, until = a_ or None, b_ or None
+            shown = store.list_alerts(statuses=stat, severities=sev, entity_types=et, publisher=pubs, buyer=buys, campaign=camps, metric=met, since=since, until=until)
+            tbl = _s9_alert_table(shown)
+            st.markdown(f"**{len(tbl)} alert(s)** match the filters.")
+            if len(tbl):
+                st.dataframe(tbl, hide_index=True, width="stretch")
+                ids = list(tbl["ID"])
+                pick = st.selectbox("Open an alert:", ids, format_func=lambda i: f"{i} — {tbl.loc[tbl['ID'] == i, 'Severity'].iloc[0]} — {tbl.loc[tbl['ID'] == i, 'Entity'].iloc[0]} — {tbl.loc[tbl['ID'] == i, 'Metric'].iloc[0]}", key="s9_pick")
+                a = store.get(pick)
+                if a:
+                    r = a["record"]
+                    st.markdown(f"#### {_s9_sev_icon(a['severity'])} {a['title']} — {a['entity_key']}")
+                    d1 = st.columns(4)
+                    d1[0].metric("Current", _s9_fmt_val(a["metric"], r.get("current_value")))
+                    d1[1].metric("Baseline", _s9_fmt_val(a["metric"], r.get("baseline_value")))
+                    d1[2].write(f"**Change:** {r.get('change_text', '')}")
+                    d1[3].write(f"**Status:** {a['status']}  \n**Seen:** {a['occurrences']} run(s)")
+                    st.write(f"**Why it fired:** {r.get('method', '')}; threshold {r.get('threshold', '')}; z = {r.get('evidence', {}).get('z')}.")
+                    st.write(f"**Why this severity:** {r.get('severity_why', '')}")
+                    st.write(f"**Current window:** {r.get('current_window', '')}")
+                    st.write("**Baseline windows:** " + (r.get("baseline_window", "") or "n/a"))
+                    st.write(f"**Sample size:** {r.get('sample_size')} evaluated call(s) (minimum {r.get('min_sample')}).  **Data completeness:** {r.get('completeness', '')}")
+                    st.write(f"**Suggested next investigation:** {r.get('next_step', '')}")
+                    st.caption(S9_DISCLAIMER)
+                    with st.expander("Evidence details"):
+                        st.json(r.get("evidence", {}))
+                    related = allr[(allr["entity_key"] == a["entity_key"]) & (allr["id"] != a["id"]) & (allr["status"].isin(S9_ACTIVE))]
+                    if len(related):
+                        st.write("**Related active alerts for the same entity:**")
+                        st.dataframe(_s9_alert_table(related)[["ID", "Severity", "Metric", "Current", "Baseline", "Change"]], hide_index=True, width="stretch")
+                    st.write("**Audit history**")
+                    st.dataframe(store.audit_for(a["id"]), hide_index=True, width="stretch")
+                    act_c = st.columns([2, 2, 1, 1])
+                    actor = act_c[0].text_input("Your name (for the audit log)", key="s9_actor")
+                    note = act_c[1].text_input("Note (optional)", key="s9_note")
+                    pw_ok = s9_action_allowed(st.session_state.get("s9_pw", ""))
+                    if act_c[2].button("Acknowledge", key="s9_ack", disabled=a["status"] not in ("new", "recurring")):
+                        if not pw_ok:
+                            st.error("Enter the action password (Settings tab) first.")
+                        elif not actor.strip():
+                            st.error("Enter your name first.")
+                        else:
+                            ok, msg = store.acknowledge(a["id"], actor.strip(), note)
+                            _s9_say(ok, msg)
+                    if act_c[3].button("Resolve", key="s9_res", disabled=a["status"] not in S9_ACTIVE):
+                        if not pw_ok:
+                            st.error("Enter the action password (Settings tab) first.")
+                        elif not actor.strip():
+                            st.error("Enter your name first.")
+                        else:
+                            ok, msg = store.resolve(a["id"], actor.strip(), note)
+                            _s9_say(ok, msg)
+                    st.caption("Acknowledging or resolving only changes this alert's status in the alert log. It never touches Ringba routing or publisher status.")
+                    st.markdown("**🔎 Root-cause investigation** (uses the Step 8 read-only tools; no recordings are fetched or sent anywhere)")
+                    smp = st.checkbox("Include a small sample of the lowest-scored calls (caller IDs shortened)", value=False, key="s9_smp")
+                    if st.button("Investigate this alert", key="s9_inv"):
+                        today_, _ = get_today(tz)
+                        with st.spinner("Running the checks ..."):
+                            st.session_state["s9_inv_result"] = (a["id"], s9_investigate(r, qf, cols, today_, tz, include_samples=smp, cfg=cfg))
+                    iv = st.session_state.get("s9_inv_result")
+                    if iv and iv[0] == a["id"]:
+                        res = iv[1]
+                        for title, items in (("Confirmed observations", res["confirmed"]), ("Possible contributing factors (not proven causes)", res["possible"]),
+                                             ("Unknowns", res["unknown"]), ("Recommended next checks", res["next"])):
+                            st.markdown(f"**{title}**")
+                            for it in items:
+                                if it:
+                                    st.write("- " + it)
+                        for title, t in res["tables"]:
+                            st.caption(title)
+                            st.dataframe(t, hide_index=True, width="stretch")
+                        st.caption("Checks used: " + "; ".join(res["tools"]) + f". To go further, ask the assistant above: “{res.get('question', '')}”.")
+
+    # ---------------- forecasts ----------------
+    with t_fc:
+        st.markdown("**Forecasts are estimates about the future**, shown separately from observed metrics and alerts. Only daily call volume is forecast: "
+                    "duration and QC scores are not, because their history is too incomplete to justify it.")
+        fh = st.selectbox("Horizon (days)", [7, 14], key="s9_fh")
+        if st.button("Generate forecasts", key="s9_fgo"):
+            with st.spinner("Forecasting and back-testing ..."):
+                st.session_state["s9_fc"] = s9_forecast_all(qf, cols, now, cfg, {"horizon_days": int(fh)}, store)
+        fcs = st.session_state.get("s9_fc")
+        if fcs:
+            rows = []
+            for x in fcs:
+                b = x.get("backtest") or {}
+                rows.append({"Entity": x["entity_key"], "Level": x["entity_type"], "Available": x["available"], "Confidence": x["confidence"],
+                             "Horizon": x.get("horizon_text", ""), "Forecast (total calls)": None if not x["available"] else round(x["total"]),
+                             "Last 7 days (actual)": x.get("history_last7"), "Method": x.get("method_label", ""),
+                             "WAPE (method)": (None if not b else (None if b["wape"].get(x.get("method")) is None else round(b["wape"][x["method"]] * 100, 1))),
+                             "WAPE (baseline)": (None if not b or b["wape"].get("seasonal_naive") is None else round(b["wape"]["seasonal_naive"] * 100, 1)),
+                             "History (days)": x.get("history_days")})
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            names = [f"{x['entity_type']}: {x['entity_key']}" for x in fcs]
+            sel = st.selectbox("Details for:", names, key="s9_fsel")
+            x = fcs[names.index(sel)]
+            st.write(f"**Generated:** {x['generated_at']}  **Training window:** {x.get('training_window', 'n/a')}  **Confidence:** {x['confidence']}")
+            if x["available"]:
+                st.dataframe(x["daily"], hide_index=True, width="stretch")
+                st.line_chart(x["daily"].set_index("date")[["forecast"]])
+                st.write(f"**Model:** {x['method_label']} (baseline for comparison: {x['baseline_label']}).")
+                if x.get("total_interval"):
+                    st.write(f"**Weekly total, 80% interval:** {x['total_interval'][0]:.0f} to {x['total_interval'][1]:.0f}")
+                st.caption(x.get("interval_note", ""))
+                st.caption(x.get("confidence_rule", ""))
+            for c_ in x["caveats"]:
+                st.caption("ℹ️ " + c_)
+            ev = store.forecast_evals(20)
+            if len(ev):
+                with st.expander("Stored forecast evaluations"):
+                    st.dataframe(ev, hide_index=True, width="stretch")
+
+
 # ---------------------------------------------------------------
 # Main flow
 # ---------------------------------------------------------------
@@ -9038,6 +10992,15 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
         {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
         timeline,
     )
+    # Step 9: alerts, investigation and forecasts (Python only; advisory; never changes Ringba)
+    try:
+        render_step9(
+            df, available_columns,
+            {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
+            timeline,
+        )
+    except Exception as exc:                      # Step 9 must never take the rest of the dashboard down
+        st.warning(f"Step 9 could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
     top_issues_slot = st.container()  # filled further down, once the group-by choice is known
     st.markdown("### 📈 Network Overview & Key Metrics")
     if len(work_df) == 0:
