@@ -264,26 +264,28 @@ def describe_period(start_d, end_d):
     return f"{start_d:%a %b %d, %Y} to {end_d:%a %b %d, %Y}"
 
 
+def canonical_flags(frame, qc_col, voip_col):
+    """THE one definition of the per-call flags (Qualified, Spam, VoIP, QC done, Line Type known). Every step (dashboard, 5A, 5B, 6, 7, 8, 9, 10)
+    takes its counts from here, so the same calls always give the same counts. qc_col / voip_col are column names or the string "None"."""
+    has_qc = qc_col not in (None, "None") and qc_col in frame.columns
+    has_vo = voip_col not in (None, "None") and voip_col in frame.columns
+    flags = pd.DataFrame(index=frame.index)
+    qs = frame[qc_col].astype(str) if has_qc else None
+    vs = frame[voip_col].astype(str) if has_vo else None
+    flags["_is_qual"] = qs.str.contains(QUAL_PAT, case=False, na=False, regex=True) if has_qc else False
+    flags["_is_spam"] = qs.str.contains(SPAM_PAT, case=False, na=False, regex=True) if has_qc else False
+    flags["_is_voip"] = vs.str.contains(VOIP_PAT, case=False, na=False, regex=True) if has_vo else False
+    flags["_qc_done"] = qs.str.contains(QC_DONE_PAT, case=False, na=False, regex=True) if has_qc else False
+    flags["_line_done"] = (vs.str.strip() != "") if has_vo else False
+    return flags
+
+
 def period_stats(frame, cols, qc_col, voip_col):
     f = frame.copy()
     f["_row"] = 1
-    f["_is_qual"] = (
-        f[qc_col].astype(str).str.contains(QUAL_PAT, case=False, na=False, regex=True)
-        if qc_col != "None" else False
-    )
-    f["_is_spam"] = (
-        f[qc_col].astype(str).str.contains(SPAM_PAT, case=False, na=False, regex=True)
-        if qc_col != "None" else False
-    )
-    f["_is_voip"] = (
-        f[voip_col].astype(str).str.contains(VOIP_PAT, case=False, na=False, regex=True)
-        if voip_col != "None" else False
-    )
-    f["_qc_done"] = (
-        f[qc_col].astype(str).str.contains(QC_DONE_PAT, case=False, na=False, regex=True)
-        if qc_col != "None" else False
-    )
-    f["_line_done"] = (f[voip_col].astype(str).str.strip() != "") if voip_col != "None" else False
+    fl = canonical_flags(f, qc_col, voip_col)
+    for c in fl.columns:
+        f[c] = fl[c]
     return f.groupby(cols).agg(
         **{
             "Calls": ("_row", "sum"),
@@ -558,6 +560,9 @@ def add_percentages(stats):
     out["VoIP %"] = safe_pct(out["VoIP"], out["Calls"])
     out["QC Completion %"] = safe_pct(out["QC Done"], out["Calls"])
     out["Line Type Completion %"] = safe_pct(out["Line Done"], out["Calls"])  # used by trend guards
+    # The SAME counts over a different denominator (Step 9 uses these): only calls that were actually reviewed / have a Line Type.
+    out["Spam % (of QC-reviewed)"] = safe_pct(out["Spam"], out["QC Done"].where(out["QC Done"] > 0))
+    out["VoIP % (of Line-Type known)"] = safe_pct(out["VoIP"], out["Line Done"].where(out["Line Done"] > 0))
     return out
 
 
@@ -2788,6 +2793,18 @@ NL_CUES = {"which", "what", "each", "per", "every", "by", "across", "top", "best
            "lowest", "most", "least", "share", "breakdown", "distribution", "of", "all", "improved", "declined"}
 
 
+def _nl_resolve_fallback(name, qf, cols, dim=None):
+    """Consolidation: when the 5B exact / substring match finds nothing, the SAME resolver the assistant uses (entity_match_phrase: configured aliases,
+    legal-suffix and spacing differences, close spelling) is asked. Returns [(dim, exact sheet value)]; several entries = ambiguous (never merged)."""
+    try:
+        cat = entity_catalog(qf, cols)
+        amap, _ = entity_resolve_alias_map(cat)
+        tier, cands = entity_match_phrase(name, cat, amap, dim)
+        return list(cands) if cands else []
+    except Exception:
+        return []
+
+
 def _nl_entities(qn, qf, cols, nlq, focus, previous):
     values = {k: _nl_values(qf, cols, k) for k in NL_ENTITY_FIELDS}
     norm = {k: {} for k in NL_ENTITY_FIELDS}
@@ -2848,6 +2865,15 @@ def _nl_entities(qn, qf, cols, nlq, focus, previous):
                         nlq.notes.append(f"{NL_DIM_LABEL[k]} '{name}' was matched to '{cands[0]}' (partial match).")
                     elif len(cands) > 1:
                         nlq.ambiguities.append(f"{NL_DIM_LABEL[k]} '{name}' matches several values: {', '.join(cands[:8])}. Which one do you mean?")
+                    elif _nl_resolve_fallback(name, qf, cols, k):
+                        fb = _nl_resolve_fallback(name, qf, cols, k)
+                        if len(fb) == 1:
+                            nlq.entities.setdefault(k, [])
+                            if fb[0][1] not in nlq.entities[k]:
+                                nlq.entities[k].append(fb[0][1])
+                            nlq.notes.append(f"{NL_DIM_LABEL[k]} '{name}' was understood as '{fb[0][1]}' (alias or close spelling).")
+                        else:
+                            nlq.ambiguities.append(f"{NL_DIM_LABEL[k]} '{name}' matches several values: {', '.join(v for _, v in fb[:8])}. Which one do you mean?")
                     else:
                         close = difflib.get_close_matches(name, list(norm[k]), n=3, cutoff=0.6)
                         nlq.unavailable.append(
@@ -2884,6 +2910,13 @@ def _nl_entities(qn, qf, cols, nlq, focus, previous):
                 nlq.notes.append(f"'{tok}' was matched to {NL_DIM_LABEL[found[0][0]]} '{found[0][1]}' (partial match).")
             elif len(found) > 1:
                 nlq.ambiguities.append(f"'{tok}' matches several values: " + ", ".join(f"{NL_DIM_LABEL[k]} {r}" for k, r in found[:8]) + ". Which one do you mean?")
+            elif _nl_resolve_fallback(tok, qf, cols):
+                fb = _nl_resolve_fallback(tok, qf, cols)
+                if len(fb) == 1:
+                    nlq.entities.setdefault(fb[0][0], []).append(fb[0][1])
+                    nlq.notes.append(f"'{tok}' was understood as {NL_DIM_LABEL[fb[0][0]]} '{fb[0][1]}' (alias or close spelling).")
+                else:
+                    nlq.ambiguities.append(f"'{tok}' matches several values: " + ", ".join(f"{NL_DIM_LABEL[k]} {r}" for k, r in fb[:8]) + ". Which one do you mean?")
             else:
                 nlq.unavailable.append(f"Data unavailable: '{tok}' was not found as a Publisher, Buyer or Campaign in the loaded data.")
             if not compare_cue:
@@ -3868,36 +3901,32 @@ def run_ai_system(nlq, out, cols, provider, model, max_rows):
                 "rows_sent": 0, "rows_total": n}
     if "call_type" in plan["columns"] and QC_PREFIX + "Call Type" not in out.calls.columns:
         return {"ok": False, "error": "The call type could not be read from the AI QC Report, so the AI comparison was skipped.", "rows_sent": 0, "rows_total": n}
-    keys = _secret_keys(provider)
-    if not keys:
-        return {"ok": False, "error": f"No {provider} API key found in Streamlit Secrets ({' / '.join(AI_PROVIDERS[provider]['secrets'])}).",
-                "rows_sent": 0, "rows_total": n}
+    if not ai_any_configured():
+        return {"ok": False, "error": "No AI provider is configured (a local router or a Groq / Gemini key in Streamlit Secrets).", "rows_sent": 0, "rows_total": n}
     rows, rev = build_ai_rows(out.calls, cols, plan)
     if rows is None:
         return {"ok": False, "error": "The grouping column is not available, so the AI comparison was skipped.", "rows_sent": 0, "rows_total": n}
     user = (f"Task: {plan['task']}\nColumns: {list(rows.columns)}\n"
             f"Rows ({len(rows)} rows, CSV, already filtered):\n" + rows.to_csv(index=False))
-    last_err = "unknown error"
-    for key in keys:
-        try:
-            raw = call_ai_provider(provider, key, model, AI_SYSTEM_PROMPT, user)
-            text = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
-            data = json.loads(text)
-            for b in data.get("breakdown") or []:       # aliases back to the real names (locally)
-                if isinstance(b, dict):
-                    b["label"] = rev.get(str(b.get("label")), b.get("label"))
-            if data.get("top_label") is not None:
-                data["top_label"] = rev.get(str(data["top_label"]), data["top_label"])
-            return {"ok": True, "data": data, "rows_sent": len(rows), "rows_total": n,
-                    "sent": {"task": plan["task"], "columns": list(rows.columns), "preview": rows.head(5)}}
-        except urllib.error.HTTPError as exc:
-            last_err = f"HTTP {exc.code}"
-            if exc.code not in (401, 403, 429):
-                break
-        except Exception as exc:
-            last_err = str(exc).replace(key, "***")[:200]
-            break
-    return {"ok": False, "error": f"AI request failed ({last_err}).", "rows_sent": len(rows), "rows_total": n}
+    # Consolidation: the ONE provider route (ai_complete: local first, cloud fallback, cooldowns, no key ever shown) is used here too.
+    res = ai_complete(AI_SYSTEM_PROMPT, user, json_mode=True)
+    if not res.ok:
+        return {"ok": False, "error": "AI request failed: " + (res.error or res.banner()), "rows_sent": 0, "rows_total": n}
+    try:
+        text = re.sub(r"^```(?:json)?|```$", "", res.text.strip(), flags=re.MULTILINE).strip()
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except Exception:
+        return {"ok": False, "error": "The AI answer was not valid JSON, so it was ignored.", "rows_sent": len(rows), "rows_total": n}
+    for b_ in data.get("breakdown") or []:       # aliases back to the real names (locally)
+        if isinstance(b_, dict):
+            b_["label"] = rev.get(str(b_.get("label")), b_.get("label"))
+    if data.get("top_label") is not None:
+        data["top_label"] = rev.get(str(data["top_label"]), data["top_label"])
+    return {"ok": True, "data": data, "rows_sent": len(rows), "rows_total": n, "provider": res.provider, "model": res.model,
+            "sent": {"task": plan["task"], "columns": list(rows.columns), "preview": rows.head(5)}}
+
 
 
 # ---------------- agreement ----------------
@@ -3995,17 +4024,15 @@ def render_query_assistant(qf, cols, df):
                  "publisher / buyer / campaign names replaced by aliases.",
         )
         if use_ai:
-            o = st.columns(3)
-            provider = o[0].selectbox("AI provider:", list(AI_PROVIDERS), key="nl_provider")
-            model = o[1].text_input("Model:", AI_PROVIDERS[provider]["model"], key=f"nl_model_{provider}")
-            max_rows = o[2].number_input("Max matched calls to send:", min_value=20, max_value=2000, value=300, step=50, key="nl_rows")
+            max_rows = st.number_input("Max matched calls to send:", min_value=20, max_value=2000, value=300, step=50, key="nl_rows")
+            provider = "router"
             st.caption(
-                f"🔒 Sent to {provider}: only the calls that matched your question, a few columns (for example the call type) and a neutral "
+                "🔒 Sent through the assistant's AI route (your local router first when set up, otherwise Groq / Gemini): only the calls that matched your question, a few columns (for example the call type) and a neutral "
                 "task. Caller IDs and publisher / buyer / campaign names are replaced by aliases such as publisher_001. Your question text, "
                 "dates, phone numbers, recordings, notes and summaries are never sent. If more calls match than the limit, nothing is sent."
             )
-            if not _secret_keys(provider):
-                st.caption(f"ℹ️ No {provider} key in Streamlit Secrets ({' / '.join(AI_PROVIDERS[provider]['secrets'])}); the AI column will be skipped.")
+            if not ai_any_configured():
+                st.caption("ℹ️ No AI provider is configured; the AI column will be skipped.")
 
     if ask and question.strip():
         today, _ = get_today(st.session_state.get("date_tz", DEFAULT_TIMEZONE))
@@ -6086,6 +6113,7 @@ BN_WORDS = {   # Banglish (lowercase) -> English ("" = particle, dropped)
     "camp": "campaign", "kampen": "campaign", "campaign": "campaign", "campaigns": "campaigns",
     "perfomance": "performance", "parformance": "performance", "performance": "performance", "porformance": "performance",
 }
+BN_WORDS.update({"hobe": "will be", "hobey": "will be", "porer": "next", "poroborti": "next"})   # Step 9 chat: "porer shoptaho koyta call hobe?"
 BN_PHRASES = [   # multi-word Banglish, matched on lowercase tokens before the single-word table
     (("er", "cheye"), "<<THAN>>"), (("theke", "beshi"), "<<THAN>>"), (("cheye",), "<<THAN>>"),
     (("sobcheye", "kharap"), "worst"), (("shobcheye", "kharap"), "worst"), (("sobcheye", "valo"), "best"), (("shobcheye", "valo"), "best"), (("shobcheye", "bhalo"), "best"),
@@ -6605,6 +6633,172 @@ def ops_unknown_name(question, qf, cols, today):
     return None
 
 
+# ---------------- Step 9 in the chat: alerts and call-volume forecasts ----------------
+# The chat READS what the Step 9 engines already calculated (stored alerts) or asks the Step 9 forecast engine to calculate (daily calls). It never
+# runs detection, never changes an alert, never e-mails, and no AI is involved in the numbers.
+_S9C_MONEY = re.compile(r"\b(revenue|payouts?|profit\w*|margins?|roi|spend|earn\w*|commissions?|rpc|ltv|costs?|invoices?|billing|paid|pay)\b", re.I)
+_S9C_ALERT = re.compile(r"\b(alerts?|alarms?|unresolved|notifications?)\b", re.I)
+_S9C_FORECAST = re.compile(r"\b(forecast\w*|predict\w*|projections?|projected|expected (?:calls|volume|call volume)|how many calls (?:will|can we expect|should we expect)"
+                           r"|calls? (?:will|are expected)|will (?:we|the (?:network|publisher|buyer|campaign)|[\w .&-]{2,30}?) (?:get|receive|have|send|do)\b)"
+                           r"|\bnext (?:week|month|\d+ days?)\b.*\b(?:calls?|volume)\b|\b(?:calls?|volume)\b.*\bnext (?:week|month|\d+ days?)\b|\btomorrow\b.*\b(?:expect\w*|calls?)\b.*\b(?:will|expect\w*)\b", re.I)
+_S9C_OTHER_METRIC = re.compile(r"\b(spam|qualif\w*|voip|duration|score|quality|fake|short[- ]calls?|connect\w*|answer\w*|conversion)\b", re.I)
+S9C_SEV_ORDER = ["info", "low", "medium", "high", "critical"]
+
+
+def _s9c_horizon(q):
+    ql = q.lower()
+    m = re.search(r"next\s+(\d{1,3})\s+days?", ql)
+    if m:
+        return int(m.group(1)), None
+    if re.search(r"\bnext month\b|\b30 days\b|\b(?:this|next) quarter\b|\bnext year\b", ql):
+        return 30, None
+    if "tomorrow" in ql:
+        return 7, "tomorrow"
+    return 7, None
+
+
+def ops_s9_is_alert_question(q):
+    return bool(_S9C_ALERT.search(q)) and not _S9C_MONEY.search(q) and not re.search(r"\b(e-?mail|smtp|cooldown)\b.*\b(setup|set up|config\w*|password|settings?)\b", q, re.I)
+
+
+def ops_s9_is_forecast_question(q):
+    return bool(_S9C_FORECAST.search(q)) and not _S9C_MONEY.search(q)
+
+
+def _s9c_alert_rows(df):
+    rows = []
+    for _, r in df.iterrows():
+        try:
+            p = json.loads(r.get("payload") or "{}")
+        except Exception:
+            p = {}
+        rows.append({"Severity": str(r["severity"]).upper(), "Status": r["status"], "Detected": r["detected_at"], "Entity": r["entity_key"], "Metric": p.get("metric_label", r["metric"]),
+                     "What": r["title"], "Current": p.get("current_text") or p.get("current_value"), "Baseline": p.get("baseline_text") or p.get("baseline_value"),
+                     "Change": p.get("change_text", ""), "Sample": p.get("sample_size"), "Times seen": r.get("occurrences")})
+    return pd.DataFrame(rows)
+
+
+def ops_s9_alert_answer(question, qf, cols, today, tz=DEFAULT_TIMEZONE):
+    """Stored alerts (read only). Filters: severity words, resolved / active, one named publisher / buyer / campaign."""
+    ql = question.lower()
+    try:
+        store = s9_get_store()
+        runs = store.run_count()
+    except Exception as exc:
+        return OpsAnswer(status="unavailable", kind="s9_alerts", answer=f"The alert store could not be read ({type(exc).__name__}), so I cannot list alerts.", scope="Step 9 alert store")
+    last = None
+    try:
+        last = store._q("SELECT MAX(ts) t FROM runs")[0]["t"]
+    except Exception:
+        pass
+    if runs == 0:
+        return OpsAnswer(status="unavailable", kind="s9_alerts", scope="Step 9 alert store (read only)",
+                         answer="No detection run has been saved yet, so there are no alerts to show. Open the Step 9 section below and press “Run detection now”. "
+                                "I do not run detection from the chat, and I will not guess alerts.")
+    statuses = ["resolved"] if re.search(r"\b(resolved|closed|past|recent(?:ly)? resolved)\b", ql) else list(S9_ACTIVE)
+    sev = None
+    for s_ in reversed(S9C_SEV_ORDER):
+        if re.search(rf"\b{s_}\b", ql):
+            sev = S9C_SEV_ORDER[S9C_SEV_ORDER.index(s_):] if s_ in ("high", "medium") else [s_]
+            break
+    ent = ops_named_entity(question, qf, cols, today)
+    kw = {}
+    if ent:
+        kw[ent[0]] = ent[1]
+    df = store.list_alerts(statuses=statuses, severities=sev, **kw)
+    scope = "Step 9 alert store (read only) | " + ("resolved alerts" if statuses == ["resolved"] else "active alerts (new, acknowledged, recurring)")
+    if sev:
+        scope += " | severity: " + ", ".join(sev)
+    if ent:
+        scope += f" | {QUERY_LABELS[ent[0]]}: {ent[1]}"
+    if last:
+        scope += f" | last detection run: {last}"
+    a = OpsAnswer(kind="s9_alerts", scope=scope, sources=["S9Store.list_alerts (Step 9)"], names=[ent[1]] if ent else [])
+    a.caveats.append("These are the alerts saved by the last detection run, which may be older than your newest data. Press “Run detection now” in Step 9 to refresh.")
+    a.caveats.append(S9_DISCLAIMER)
+    if df.empty:
+        what = "resolved alerts" if statuses == ["resolved"] else "active alerts"
+        a.answer = f"No {what} match" + (f" for {ent[1]}" if ent else "") + (f" at severity {', '.join(sev)}" if sev else "") + "."
+        return a
+    tbl = _s9c_alert_rows(df)
+    counts = df["severity"].value_counts()
+    parts = [f"{int(counts[s_])} {s_}" for s_ in reversed(S9C_SEV_ORDER) if s_ in counts.index]
+    a.answer = f"{len(df)} {'resolved' if statuses == ['resolved'] else 'active'} alert(s)" + (f" for {ent[1]}" if ent else "") + f": {', '.join(parts)}."
+    top = tbl.head(5)
+    for _, r in top.iterrows():
+        a.observed.append(f"[{r['Severity']}] {r['Entity']} — {r['What']}" + (f" ({r['Change']})" if r["Change"] else "") + f", detected {r['Detected']}.")
+    a.evidence.append(("Alerts (from the Step 9 store)", tbl))
+    a.steps.append("Open the alert in the Step 9 section for the exact windows, evidence and the investigation button.")
+    return a
+
+
+def ops_s9_forecast_answer(question, qf, cols, today, tz=DEFAULT_TIMEZONE):
+    """Daily CALL VOLUME forecast from the Step 9 engine (seasonal baseline + backtest). Nothing else is forecast."""
+    if _S9C_OTHER_METRIC.search(re.sub(r"\bcalls?\b", " ", question)) and not re.search(r"\bcalls?\b.*\b(?:volume|how many)\b|\bhow many calls\b|\bcalls? (?:will|volume)\b", question, re.I):
+        return OpsAnswer(status="unsupported", kind="s9_forecast", scope="Step 9 forecast",
+                         answer="I can forecast only daily call volume (network, publisher, buyer or campaign). Rates, scores and durations are not forecast: their history is too incomplete to justify it.")
+    H, only = _s9c_horizon(question)
+    if H > 14:
+        return OpsAnswer(status="unsupported", kind="s9_forecast", scope="Step 9 forecast",
+                         answer="Forecasts are limited to 14 days ahead; a month-long forecast from this little history would be too uncertain to be useful. Ask for the next 7 or 14 days.")
+    ent = ops_named_entity(question, qf, cols, today)
+    try:
+        cfg = s9_config()
+        m = s9_prepare(qf, cols, cfg)
+        now = pd.Timestamp(today) + pd.Timedelta(hours=12)
+        fc = {**S9_FC_DEFAULTS, "horizon_days": int(H)}
+        if ent:
+            res = s9_forecast_entity(m, ent[0], ent[1], now, fc, {ent[0]: ent[1]})
+        else:
+            res = s9_forecast_entity(m, "network", "Whole network", now, fc)
+    except Exception as exc:
+        return OpsAnswer(status="unavailable", kind="s9_forecast", scope="Step 9 forecast", answer=f"The forecast could not be calculated ({type(exc).__name__}).")
+    label = ent[1] if ent else "the whole network"
+    scope = f"Step 9 forecast (calls only) | {label} | horizon {H} day(s) | generated {res['generated_at']}"
+    a = OpsAnswer(kind="s9_forecast", scope=scope, sources=["s9_forecast_entity (Step 9)"], names=[ent[1]] if ent else [])
+    a.caveats += list(res.get("caveats", []))
+    if not res.get("available"):
+        a.status = "unavailable"
+        a.answer = f"No forecast for {label}: " + (res["caveats"][-1] if res.get("caveats") else "not enough history.")
+        return a
+    d = res["daily"]
+    if only == "tomorrow":
+        tom = (pd.Timestamp(today) + pd.Timedelta(days=1)).date()
+        row = d[d["date"] == tom]
+        if row.empty:
+            row = d.head(1)
+        v = float(row["forecast"].iloc[0])
+        lo, hi = row["low (10%)"].iloc[0], row["high (90%)"].iloc[0]
+        rng = f", likely range {lo:.0f}–{hi:.0f}" if lo is not None and lo == lo and hi == hi else ""
+        a.answer = f"Estimate: about {v:.0f} calls for {label} on {row['date'].iloc[0]}{rng}. This is a forecast, not a guarantee."
+    else:
+        tot = res["total"]
+        iv = res.get("total_interval")
+        rng = f", likely range {iv[0]:.0f}–{iv[1]:.0f}" if iv else ""
+        a.answer = f"Estimate: about {tot:,.0f} calls for {label} over {res['horizon_text']}{rng}. This is a forecast, not a guarantee."
+    if res.get("history_last7") is not None and only != "tomorrow":
+        a.observed.append(f"The last 7 complete days had {res['history_last7']:,.0f} calls (observed).")
+    a.observed.append(f"Method: {res['method_label']}; training window {res['training_window']}; confidence: {res['confidence']}.")
+    a.possible.append("Traffic can change quickly (publisher caps, buyer capacity, campaign changes); the forecast assumes recent weekly patterns continue.")
+    a.caveats.append(res.get("interval_note", ""))
+    a.caveats.append(res.get("confidence_rule", ""))
+    a.caveats[:] = [c for c in a.caveats if c]
+    a.evidence.append(("Forecast by day (estimate)", d))
+    a.charts.append(("Forecast calls per day", d.assign(date=d["date"].astype(str)), {"kind": "line", "x": "date", "ys": ["forecast"]}))
+    a.steps.append("Generate the full forecast with its backtest in the Step 9 → Forecasts tab.")
+    return a
+
+
+def ops_s9_answer(question, qf, cols, today, tz=DEFAULT_TIMEZONE):
+    """OpsAnswer for an alert or forecast question, else None (the normal assistant continues)."""
+    q = str(question or "")
+    if ops_s9_is_forecast_question(q):
+        return ops_s9_forecast_answer(q, qf, cols, today, tz)
+    if ops_s9_is_alert_question(q):
+        return ops_s9_alert_answer(q, qf, cols, today, tz)
+    return None
+
+
 def ops_respond(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_TIMEZONE, use_ai=None, history=None, mode=None, memory=None, _depth=0):
     """Step 8 review wrapper: Banglish / Bengali / mixed questions are read as English with a fixed dictionary, short / misspelled / alias names are
     resolved to the exact sheet value (ambiguous ones are asked back, never guessed), 'A then B' questions are answered step by step, a named
@@ -6617,6 +6811,11 @@ def ops_respond(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_
         if translated:
             a.caveats.append(f"I read your question as: “{english}”.")
         return a, ctx, nl_prev
+    s9a = ops_s9_answer(resolved, qf, cols, today, tz) if _depth == 0 else None
+    if s9a is not None:                              # Step 9: stored alerts / call-volume forecast (Python only, read only)
+        if translated:
+            s9a.caveats.insert(0, f"I read your question as: “{resolved}”.")
+        return s9a, ctx, nl_prev
     unk = ops_unknown_name(resolved, qf, cols, today) if ops_message_kind(resolved, qf, cols, ctx, nl_prev) == "data" else None
     if unk:
         a = OpsAnswer(status="unavailable", kind="entity_unknown", answer=unk, scope="Name check (nothing was calculated)")
@@ -8312,6 +8511,8 @@ GOLDEN_QUESTIONS = [   # (question, expected): ok = answered from the data | ok*
     ("{pub} publisher er calls compare koro, then problematic calls investigate koro.", "ok*"),
     ("I had a rough day", "chat"), ("Can you help me plan my week?", "chat"), ("Tell me a business idea", "chat"), ("hi", "chat"),
 ]
+GOLDEN_QUESTIONS += [("Forecast next week's calls", "ok*"), ("Forecast the spam rate next week", "refuse"), ("Which alerts are active?", "ok*"),
+                     ("Any critical alerts for publisher {pub}?", "ok*"), ("porer shoptaho koyta call hobe?", "ok*")]
 
 
 def ops_run_golden(qf, cols, today, sidebar_tl, tz=DEFAULT_TIMEZONE):
@@ -8893,8 +9094,8 @@ S9_METRICS = {
     "short_rate": ("Short-call rate", "rate", "up", ("Higher-than-usual short-call rate", "")),
     "qc_score": ("AI QC score", "mean", "down", ("", "QC score deterioration")),
     "poor_rate": ("Poor-quality call rate", "rate", "up", ("Unusual suspicious-call indicator increase (poor-quality calls)", "")),
-    "spam_rate": ("Spam / robot rate", "rate", "up", ("Unusual suspicious-call indicator increase (spam / robot)", "")),
-    "voip_rate": ("VoIP rate", "rate", "up", ("Unusual suspicious-call indicator increase (VoIP)", "")),
+    "spam_rate": ("Spam / robot rate (% of QC-reviewed calls)", "rate", "up", ("Unusual suspicious-call indicator increase (spam / robot)", "")),
+    "voip_rate": ("VoIP rate (% of calls with a Line Type)", "rate", "up", ("Unusual suspicious-call indicator increase (VoIP)", "")),
     "fake_rate": ("Fake-number rate", "rate", "up", ("Unusual suspicious-call indicator increase (fake number)", "")),
 }
 S9_QC_METRICS = {"qc_score", "poor_rate", "spam_rate", "voip_rate", "fake_rate"}      # need a completed AI QC: missing QC is "unknown", never zero
@@ -9035,22 +9236,11 @@ def s9_prepare(qf, cols, cfg):
     m["_sc"] = sc.fillna(0.0)
     m["_sc2"] = sc.fillna(0.0) ** 2
     m["_poor"] = ((sc < float(cfg["poor_score"])) & sc.notna()).astype(int)
-    qcc = cols.get("qc")
-    if qcc and qcc in qf.columns:
-        txt = qf[qcc].astype(str)
-        m["_qc"] = txt.str.contains(QC_DONE_PAT, case=False, na=False, regex=True).astype(int)
-        m["_spam"] = (txt.str.contains(SPAM_PAT, case=False, na=False, regex=True) & (m["_qc"] == 1)).astype(int)
-    else:
-        m["_qc"] = 0
-        m["_spam"] = 0
-    lt = cols.get("line_type")
-    if lt and lt in qf.columns:
-        ls = qf[lt].astype(str).str.strip()
-        m["_line_ok"] = (ls != "").astype(int)
-        m["_voip"] = (ls.str.contains(VOIP_PAT, case=False, na=False, regex=True) & (ls != "")).astype(int)
-    else:
-        m["_line_ok"] = 0
-        m["_voip"] = 0
+    fl = canonical_flags(qf, cols.get("qc") or "None", cols.get("line_type") or "None")     # the same definition as the dashboard / Steps 5-8
+    m["_qc"] = (fl["_qc_done"] | fl["_is_spam"]).astype(int)      # a spam flag always implies a reviewed call, so the rate can never exceed 100 %
+    m["_spam"] = fl["_is_spam"].astype(int)
+    m["_line_ok"] = (fl["_line_done"] | fl["_is_voip"]).astype(int)
+    m["_voip"] = fl["_is_voip"].astype(int)
     if "Fake_Known" in qf.columns:
         m["_fk_ok"] = qf["Fake_Known"].astype(int)
         m["_fake"] = qf["Fake_Flag"].astype(int)
