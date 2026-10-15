@@ -6816,6 +6816,11 @@ def ops_respond(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_
         if translated:
             s9a.caveats.insert(0, f"I read your question as: “{resolved}”.")
         return s9a, ctx, nl_prev
+    s16a = ops_s16_answer(resolved, qf, cols, today, tz) if _depth == 0 else None
+    if s16a is not None:                             # Steps 10-16: tasks, approvals, data health, briefing, call-quality questions (Python only, read only)
+        if translated:
+            s16a.caveats.insert(0, f"I read your question as: “{resolved}”.")
+        return s16a, ctx, nl_prev
     unk = ops_unknown_name(resolved, qf, cols, today) if ops_message_kind(resolved, qf, cols, ctx, nl_prev) == "data" else None
     if unk:
         a = OpsAnswer(status="unavailable", kind="entity_unknown", answer=unk, scope="Name check (nothing was calculated)")
@@ -7746,12 +7751,15 @@ def tool_health_by_group(args, env):
     if not res.available:
         return _agent_err("health_by_group", res.message, args)
     t = res.data
+    if "Health" not in t.columns:
+        return _agent_err("health_by_group", "health status needs QC results (Spam / QC Completion) that this selection does not have.", args)
     g = [c for c in t.columns if c == QUERY_LABELS[by[0]]] or [t.columns[0]]
     order = {"HIGH RISK": 0, "WATCH": 1, "HEALTHY": 2}
     key = t["Health"].astype(str).map(lambda x: next((v for k, v in order.items() if k in x.upper()), 3))
     t = t.assign(_o=key).sort_values(["_o", "Calls"], ascending=[True, False]).drop(columns="_o")
     out = ToolResult(tool="health_by_group", args=args, title=f"Health status by {QUERY_LABELS[by[0]]}", scope=scope, notes=list(notes) + list(res.notes))
-    out.table = t[g + ["Calls", "Health", "Health_Reason", "Qualification %", "Spam %", "VoIP %", "QC Completion %"]].head(AGENT_TABLE_ROWS).reset_index(drop=True)
+    show = g + [c for c in ["Calls", "Health", "Health_Reason", "Qualification %", "Spam %", "VoIP %", "QC Completion %"] if c in t.columns and c not in g]   # a column the sheet cannot support is skipped, not an error
+    out.table = t[show].head(AGENT_TABLE_ROWS).reset_index(drop=True)
     cnt = t["Health"].astype(str).str.upper().map(lambda x: next((k for k in order if k in x), "INSUFFICIENT DATA")).value_counts()
     out.facts = [f"Health counts: " + ", ".join(f"{int(v)} {k.title()}" for k, v in cnt.items()) + f" (of {len(t)} groups)."]
     if cnt.get("HIGH RISK", 0):
@@ -11009,6 +11017,2695 @@ def render_step9(df, available_columns, overrides, sidebar_timeline):
                     st.dataframe(ev, hide_index=True, width="stretch")
 
 
+# =====================================================================================================================
+# STEPS 10-16 - Recommendations (minimal Step 10), data-reliability monitor (15), operations tasks (11), call-quality and partner
+# performance intelligence (12), review advisor (13), daily briefing (14), governance with dry-run approvals (16).   (ADDED; nothing above was changed.)
+#
+# Rules this block follows (they match the real 15-column sheet):
+#  * Python computes every number. No AI is used for any figure, status, threshold or decision in this block.
+#  * The sheet has NO revenue, payout, cost, profit, billable, conversion, buyer-acceptance, cap, schedule or eligibility field. Nothing here
+#    estimates or infers any of them from Duration, Hangup By, Quality Score, QC text, Line Type or Fake Number.
+#  * Missing is not zero: blank QC / score / line type / fake / hangup are "unknown" and are left out of that metric's denominator (shown next to it).
+#  * Nothing here changes Ringba, publishers, buyers, campaigns, caps, bids or routing. The only "execution" is a labelled dry run.
+#  * Note / ShortSummary / QC text are untrusted data. Caller IDs are masked (last 4 digits). Recording URLs are never read, stored or shown.
+#  * Storage = the Step 9 SQLite store (migration v2, additive, no DELETE anywhere). History is never removed.
+# =====================================================================================================================
+import uuid
+
+S16_NOTE = ("Observation only: these figures show how calls differ from a baseline. They do not prove fraud, publisher misconduct, buyer rejection, "
+            "revenue impact or cause. Nothing here changes Ringba or any routing.")
+S16_DRY = "dry run — nothing was changed"
+
+S9_MIGRATIONS[2] = [
+    """CREATE TABLE IF NOT EXISTS recommendations (
+        id TEXT PRIMARY KEY, idem TEXT NOT NULL UNIQUE, source TEXT, entity_type TEXT, entity_key TEXT, rule TEXT, title TEXT, evidence TEXT, confidence TEXT,
+        status TEXT NOT NULL, decided_by TEXT, decided_verified INTEGER DEFAULT 0, decided_at TEXT, decision_note TEXT, created_at TEXT, last_seen_at TEXT,
+        times_seen INTEGER DEFAULT 1, baseline TEXT, outcome TEXT)""",
+    "CREATE INDEX IF NOT EXISTS rec_status ON recommendations(status, created_at)",
+    """CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY, idem TEXT NOT NULL UNIQUE, title TEXT, description TEXT, type TEXT, source TEXT, source_id TEXT, publisher TEXT, buyer TEXT, campaign TEXT,
+        priority INTEGER, severity TEXT, evidence TEXT, owner TEXT, created_at TEXT, due_at TEXT, updated_at TEXT, status TEXT NOT NULL, result TEXT,
+        created_by TEXT, updated_by TEXT, identity_verified INTEGER DEFAULT 0, escalated_at TEXT, escalations INTEGER DEFAULT 0)""",
+    "CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, due_at)",
+    """CREATE TABLE IF NOT EXISTS task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, ts TEXT, actor TEXT, verified INTEGER DEFAULT 0, kind TEXT,
+        from_status TEXT, to_status TEXT, detail TEXT)""",
+    "CREATE INDEX IF NOT EXISTS task_events_task ON task_events(task_id, id)",
+    """CREATE TABLE IF NOT EXISTS briefings (id TEXT PRIMARY KEY, idem TEXT NOT NULL UNIQUE, ts TEXT, period TEXT, content TEXT)""",
+    """CREATE TABLE IF NOT EXISTS briefing_deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, idem TEXT NOT NULL UNIQUE, briefing_id TEXT, recipient TEXT, kind TEXT,
+        status TEXT, attempts INTEGER DEFAULT 0, ts TEXT, error TEXT)""",
+    """CREATE TABLE IF NOT EXISTS health_checks (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, ts TEXT, name TEXT, status TEXT, detail TEXT, value TEXT,
+        duration_ms INTEGER, records_read INTEGER, last_data_ts TEXT)""",
+    "CREATE INDEX IF NOT EXISTS health_checks_name ON health_checks(name, id)",
+    """CREATE TABLE IF NOT EXISTS health_incidents (id TEXT PRIMARY KEY, fp TEXT NOT NULL, name TEXT, status TEXT NOT NULL, severity TEXT, opened_at TEXT, last_seen_at TEXT,
+        recovered_at TEXT, occurrences INTEGER DEFAULT 1, detail TEXT, alert_id TEXT, task_id TEXT, last_success_at TEXT, error_class TEXT, retry_count INTEGER DEFAULT 0)""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS one_open_incident_per_fp ON health_incidents(fp) WHERE status = 'open'",
+    """CREATE TABLE IF NOT EXISTS approvals (
+        id TEXT PRIMARY KEY, idem TEXT NOT NULL UNIQUE, action_type TEXT, target TEXT, scope TEXT, reason TEXT, evidence TEXT, preconditions TEXT, expected TEXT, risks TEXT,
+        requested_by TEXT, requested_verified INTEGER DEFAULT 0, status TEXT NOT NULL, decided_by TEXT, decided_verified INTEGER DEFAULT 0, decided_at TEXT, decision_note TEXT,
+        created_at TEXT, expires_at TEXT, execution_status TEXT, result TEXT, audit_ref INTEGER)""",
+    "CREATE INDEX IF NOT EXISTS approvals_status ON approvals(status, created_at)",
+    """CREATE TABLE IF NOT EXISTS action_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, approval_id TEXT, ts TEXT, actor TEXT, outcome TEXT, detail TEXT)""",
+    """CREATE TABLE IF NOT EXISTS audit_chain (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, actor TEXT, verified INTEGER DEFAULT 0, action TEXT, ref TEXT, detail TEXT,
+        prev_hash TEXT, row_hash TEXT)""",
+]
+S9_SCHEMA_VERSION = max(S9_MIGRATIONS)
+S9_TABLES.extend(["recommendations", "tasks", "task_events", "briefings", "briefing_deliveries", "health_checks", "health_incidents", "approvals", "action_attempts", "audit_chain"])
+
+_s9_fmt_val_step9 = _s9_fmt_val
+
+
+def _s9_fmt_val(metric, v):
+    """Step 9 formatter, extended so a data-health alert (metric 'data_health', no number) never breaks alert tables or e-mails."""
+    if metric not in S9_METRICS:
+        return "n/a"
+    return _s9_fmt_val_step9(metric, v)
+
+
+# ---------------- small shared helpers ----------------
+def s16_ts(now=None):
+    return (pd.Timestamp(now) if now is not None else pd.Timestamp.now()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def s16_mask_phone(v):
+    d = re.sub(r"\D", "", str(v or ""))
+    return ("***" + d[-4:]) if len(d) >= 4 else ("***" if d else "")
+
+
+_S16_URL = re.compile(r"https?://\S+|www\.\S+", re.I)
+_S16_MAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_S16_NUM = re.compile(r"(?<![\w*])\+?\d[\d\s().-]{6,}\d")
+
+
+def s16_scrub(text, limit=1000):
+    """Anything stored in evidence, audit, tasks, e-mails or briefings goes through this: URLs, e-mail addresses and phone numbers are masked."""
+    t = str(text if text is not None else "")
+    t = _S16_URL.sub("[link removed]", t)
+    t = _S16_MAIL.sub("[e-mail removed]", t)
+    t = _S16_NUM.sub(lambda m: s16_mask_phone(m.group(0)), t)
+    return t[:limit]
+
+
+def s16_json(obj, limit=6000):
+    """JSON text of an evidence dict with every string scrubbed (bounded size)."""
+    def clean(o):
+        if isinstance(o, dict):
+            return {str(k): clean(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [clean(v) for v in o]
+        if isinstance(o, str):
+            return s16_scrub(o, 400)
+        if isinstance(o, (np.integer,)):
+            return int(o)
+        if isinstance(o, (np.floating, float)):
+            return None if (isinstance(o, float) and math.isnan(o)) else float(o)
+        return o
+    return json.dumps(clean(obj), default=str)[:limit]
+
+
+def s16_id(prefix, *parts):
+    return prefix + hashlib.sha1(("|".join(str(p) for p in parts) + "|" + uuid.uuid4().hex).encode()).hexdigest()[:10]
+
+
+def s16_idem(*parts):
+    return hashlib.sha1("|".join(str(p) for p in parts).encode()).hexdigest()[:24]
+
+
+# ---------------- identity and permissions (a shared-secret gate, NOT user accounts) ----------------
+S16_PERMS = {"view_records": "viewer", "view_audit": "viewer", "manage_tasks": "open", "decide_recommendation": "open", "request_action": "open",
+             "run_health_check": "open", "approve_action": "strict", "execute_action": "strict", "change_config": "strict"}
+
+
+def s16_identity(label="", entered_password=""):
+    """{label, verified, via, level}. level: viewer (an action password is configured and not supplied) | open (no password configured) | operator (password supplied).
+    'verified' is True only when Streamlit viewer login (st.user) supplies an e-mail; a typed name is just a label and is never treated as proof of identity."""
+    email = None
+    try:
+        u = getattr(st, "user", None)
+        e = u.get("email") if hasattr(u, "get") else getattr(u, "email", None)
+        email = e if isinstance(e, str) and "@" in e else None
+    except Exception:
+        email = None
+    pw_set = bool(s9_action_password())
+    if not pw_set:
+        level = "open"
+    else:
+        level = "operator" if s9_action_allowed(entered_password) else "viewer"
+    lab = (email or str(label or "").strip() or "unnamed")[:60]
+    via = "Streamlit viewer login" if email else ("typed label (unverified)" + (" + shared action password" if level == "operator" else ""))
+    return {"label": lab, "verified": bool(email), "via": via, "level": level, "gate": "shared-secret gate, not user identity" if not email else "viewer login"}
+
+
+def s16_allowed(perm, ident):
+    need = S16_PERMS.get(perm, "strict")
+    lvl = (ident or {}).get("level", "viewer")
+    if need == "viewer":
+        return True
+    if need == "open":
+        return lvl in ("open", "operator")
+    return lvl == "operator"
+
+
+def s16_require(perm, ident):
+    if not s16_allowed(perm, ident):
+        raise PermissionError(f"Not permitted: '{perm}' needs the operator level (the action password is configured and was not supplied).")
+
+
+# ---------------- hash-chained audit (each row stores the hash of the previous row) ----------------
+def s16_audit(c, ts, actor, verified, action, ref="", detail=""):
+    """Append one row inside the caller's transaction. There is no UPDATE or DELETE on this table anywhere in the application."""
+    last = c.execute("SELECT row_hash FROM audit_chain ORDER BY id DESC LIMIT 1").fetchone()
+    prev = last["row_hash"] if last and last["row_hash"] else "GENESIS"
+    detail = s16_scrub(detail, 600)
+    actor = s16_scrub(actor, 80)
+    h = hashlib.sha256("|".join([prev, str(ts), actor, str(int(bool(verified))), str(action), str(ref), detail]).encode()).hexdigest()
+    cur = c.execute("INSERT INTO audit_chain(ts, actor, verified, action, ref, detail, prev_hash, row_hash) VALUES (?,?,?,?,?,?,?,?)",
+                    (str(ts), actor, int(bool(verified)), str(action), str(ref), detail, prev, h))
+    return cur.lastrowid
+
+
+def s16_verify_chain(store):
+    """(ok, rows checked, first bad row id). Detects edits and deletions made through the application or by a careless hand;
+    it cannot stop someone who can replace the whole database file (SQLite on Streamlit Cloud / a PC is not tamper-proof)."""
+    rows = store._q("SELECT id, ts, actor, verified, action, ref, detail, prev_hash, row_hash FROM audit_chain ORDER BY id")
+    prev = "GENESIS"
+    for r in rows:
+        h = hashlib.sha256("|".join([prev, str(r["ts"]), r["actor"] or "", str(int(r["verified"] or 0)), str(r["action"]), str(r["ref"]), r["detail"] or ""]).encode()).hexdigest()
+        if r["prev_hash"] != prev or r["row_hash"] != h:
+            return False, len(rows), r["id"]
+        prev = r["row_hash"]
+    return True, len(rows), None
+
+
+def s16_audit_rows(store, limit=200, ref=None):
+    sql = "SELECT id, ts, actor, verified, action, ref, detail FROM audit_chain" + (" WHERE ref = ?" if ref else "") + " ORDER BY id DESC LIMIT ?"
+    args = ((str(ref),) if ref else ()) + (int(max(1, min(limit, 2000))),)
+    return pd.DataFrame(store._q(sql, args))
+
+
+# =====================================================================================================================
+# STEP 10 (minimal) - recommendation lifecycle: stored, decided, superseded, and measured afterwards.  Evidence is always attached.
+# =====================================================================================================================
+S10_STATUSES = ("new", "accepted", "rejected", "superseded")
+S10_TRANSITIONS = {"new": ("accepted", "rejected", "superseded"), "accepted": ("superseded",), "rejected": (), "superseded": ()}
+
+
+def s10_upsert(store, source, entity_type, entity_key, rule, title, evidence, confidence="low", now=None, period_key="", baseline=None):
+    """Store one recommendation. Idempotent: the same (source, entity, rule, period) updates last_seen / times_seen instead of creating a second row.
+    Returns (id, created). A rejected / superseded recommendation is never silently re-opened."""
+    now_s = s16_ts(now)
+    idem = s16_idem("rec", source, entity_type, entity_key, rule, period_key)
+    ev = s16_json(evidence)
+    bl = s16_json(baseline) if baseline else None
+
+    def fn(c):
+        row = c.execute("SELECT id, status FROM recommendations WHERE idem = ?", (idem,)).fetchone()
+        if row:
+            try:
+                old = json.loads(c.execute("SELECT evidence FROM recommendations WHERE id=?", (row["id"],)).fetchone()[0] or "{}")
+            except Exception:
+                old = {}
+            new = dict(evidence) if isinstance(evidence, dict) else {}
+            merged = s16_json({**old, **new}) if isinstance(old, dict) else ev   # keep earlier fields (e.g. the measurable metric); newer values win
+            c.execute("UPDATE recommendations SET last_seen_at=?, times_seen=times_seen+1, evidence=? WHERE id=?", (now_s, merged, row["id"]))
+            return row["id"], False
+        rid = s16_id("R", idem)
+        c.execute("""INSERT INTO recommendations(id, idem, source, entity_type, entity_key, rule, title, evidence, confidence, status, created_at, last_seen_at, times_seen, baseline)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (rid, idem, str(source), str(entity_type), s16_scrub(entity_key, 200), str(rule), s16_scrub(title, 300), ev, str(confidence),
+                                                               "new", now_s, now_s, 1, bl))
+        s16_audit(c, now_s, "system", False, "recommendation_created", rid, f"{rule} / {entity_type}: {entity_key}")
+        return rid, True
+    return store._tx(fn)
+
+
+def s10_get(store, rid):
+    r = store._q("SELECT * FROM recommendations WHERE id = ?", (str(rid),))
+    if not r:
+        return None
+    d = r[0]
+    for k in ("evidence", "baseline", "outcome"):
+        try:
+            d[k] = json.loads(d[k]) if d.get(k) else None
+        except Exception:
+            d[k] = None
+    return d
+
+
+def s10_list(store, statuses=None, limit=200):
+    where, args = "", []
+    sts = [s for s in (statuses or []) if s in S10_STATUSES]
+    if sts:
+        where = " WHERE status IN (" + ",".join("?" * len(sts)) + ")"
+        args = sts
+    return pd.DataFrame(store._q("SELECT id, status, confidence, entity_type, entity_key, rule, title, source, created_at, last_seen_at, times_seen, decided_by, decided_at "
+                                 "FROM recommendations" + where + " ORDER BY created_at DESC LIMIT ?", tuple(args) + (int(max(1, min(limit, 2000))),)))
+
+
+def s10_decide(store, rid, status, ident, note="", now=None):
+    """new -> accepted | rejected | superseded; accepted -> superseded. Enforced here, not only in the UI. Returns (ok, message)."""
+    try:
+        s16_require("decide_recommendation", ident)
+    except PermissionError as exc:
+        return False, str(exc)
+    if status not in S10_STATUSES:
+        return False, "Unknown status."
+    now_s = s16_ts(now)
+
+    def fn(c):
+        row = c.execute("SELECT status FROM recommendations WHERE id = ?", (str(rid),)).fetchone()
+        if not row:
+            return False, "Unknown recommendation."
+        if status not in S10_TRANSITIONS[row["status"]]:
+            return False, f"A {row['status']} recommendation cannot become {status}."
+        c.execute("UPDATE recommendations SET status=?, decided_by=?, decided_verified=?, decided_at=?, decision_note=? WHERE id=?",
+                  (status, ident["label"], int(ident["verified"]), now_s, s16_scrub(note, 400), str(rid)))
+        s16_audit(c, now_s, ident["label"], ident["verified"], f"recommendation_{status}", rid, note)
+        return True, f"Recommendation {rid} is now {status}. Nothing was changed in Ringba."
+    return store._tx(fn)
+
+
+def s10_outcome(store, rid, qf, cols, now, days=7, cfg=None):
+    """Measure what happened after a recommendation was ACCEPTED: the same entity and metric, the `days` before acceptance versus the `days` after.
+    An observed before / after difference, not proof that the recommendation caused it. Stored on the row. Returns a dict (or {'available': False, 'why': ...})."""
+    rec = s10_get(store, rid)
+    if not rec or rec["status"] != "accepted" or not rec.get("decided_at"):
+        return {"available": False, "why": "Only accepted recommendations are measured."}
+    ev = rec.get("evidence") or {}
+    metric, etype, ekey = ev.get("metric"), rec["entity_type"], rec["entity_key"]
+    if metric not in S9_METRICS or etype not in ("publisher", "buyer", "campaign", "network"):
+        return {"available": False, "why": "This recommendation has no measurable single metric."}
+    cfg = cfg or s9_config()
+    t0 = pd.Timestamp(rec["decided_at"])
+    t1 = min(pd.Timestamp(now), t0 + pd.Timedelta(days=days))
+    if t1 - t0 < pd.Timedelta(hours=24):
+        return {"available": False, "why": "Less than one day of data since the decision; too early to measure."}
+    m = s9_prepare(qf, cols, cfg)
+    if etype != "network":
+        m = m[m[etype].str.lower() == str(ekey).lower()]
+    span = t1 - t0
+    b = _s9_value(_s9_agg(m, t0 - span, t0, []).iloc[0], metric)
+    a = _s9_value(_s9_agg(m, t0, t1, []).iloc[0], metric)
+    out = {"available": True, "metric": metric, "before": None if b[0] != b[0] else float(b[0]), "before_n": float(b[1]), "after": None if a[0] != a[0] else float(a[0]),
+           "after_n": float(a[1]), "window_days": round(span.total_seconds() / 86400, 1), "measured_at": s16_ts(now),
+           "note": "Observed before / after difference. It is not proof that the recommendation caused the change."}
+    minn = float(cfg["min_rate_n"] if S9_METRICS[metric][1] == "rate" else 1)
+    if out["before_n"] < minn or out["after_n"] < minn:
+        out["available"] = False
+        out["why"] = f"Too few evaluated calls (before {out['before_n']:.0f}, after {out['after_n']:.0f}; minimum {minn:.0f})."
+    store._tx(lambda c: c.execute("UPDATE recommendations SET outcome=? WHERE id=?", (s16_json(out), str(rid))))
+    return out
+
+
+def s10_from_step6(store, qf, cols, timeline, now=None):
+    """Store the existing Step 6 recommendations (build_recommendations) as lifecycle records. Returns the number created."""
+    try:
+        brief = compute_step6(qf, {**cols}, timeline)
+        recs = build_recommendations(brief)
+    except Exception:
+        return 0
+    n = 0
+    pk = pd.Timestamp(now if now is not None else pd.Timestamp.now()).strftime("%Y-%m-%d")
+    for r in recs:
+        _, created = s10_upsert(store, "rule:step6", str(r.get("Type", "")).lower(), r.get("Name", ""), r.get("Rule", ""), r.get("Suggestion", ""),
+                                {"why": r.get("Why", ""), "rule": r.get("Rule", ""), "calls": r.get("Calls", 0), "priority": r.get("Priority", "")},
+                                confidence="medium" if r.get("Priority") == "High" else "low", now=now, period_key=pk)
+        n += int(created)
+    return n
+
+
+# =====================================================================================================================
+# STEP 15 - Integration and data-reliability monitor (only what really exists in this app).
+# Not monitorable from here, and shown as such instead of a green light: Ringba API connectivity, transcription jobs (no transcript column),
+# Ringba-to-Sheet writer failures (visible only through freshness and duplicates), external scheduler runs (no scheduler exists).
+# =====================================================================================================================
+S15_DEFAULTS = {"fresh_warn_h": 6.0, "fresh_crit_h": 24.0, "quiet_weekends": False, "qc_warn": 0.80, "qc_crit": 0.30, "gap_warn": 0.25, "gap_crit": 0.60,
+                "dup_warn": 1, "dup_crit_share": 0.05, "date_fail_warn": 1, "recent_days": 7, "runs_overdue_h": 24.0, "min_rows": 20}
+S15_NOT_MONITORABLE = [
+    ("Ringba API connectivity", "The app never calls Ringba; data arrives in the Google Sheet from an external flow."),
+    ("Transcription jobs", "There is no transcript column; only the AI QC Report text exists."),
+    ("Ringba-to-Sheet writer failures", "Visible only indirectly, through the freshness and duplicate checks below."),
+    ("External scheduler runs", "No scheduler exists yet; detection and briefings run when someone opens the app or presses a button."),
+]
+S15_EXPECTED = ["date", "buyer", "publisher", "campaign", "caller_id", "duration", "note", "summary", "recording", "hangup", "qc", "score", "line_type", "phone_company", "fake"]
+
+
+def s15_config(over=None):
+    cfg = dict(S15_DEFAULTS)
+    raw = _cfg("HEALTH_CONFIG", "")
+    try:
+        extra = dict(raw) if hasattr(raw, "items") else (json.loads(str(raw)) if str(raw).strip() else {})
+    except Exception:
+        extra = {}
+    for src in (extra, over or {}):
+        for k, v in dict(src).items():
+            if k in cfg:
+                try:
+                    cfg[k] = bool(v) if isinstance(cfg[k], bool) else (int(float(v)) if isinstance(cfg[k], int) else float(v))
+                except Exception:
+                    pass
+    return cfg
+
+
+def _s15_chk(name, status, detail, value=None, n=None, last_data=None):
+    return {"name": name, "status": status, "detail": s16_scrub(detail, 500), "value": value, "n": n, "last_data": last_data}
+
+
+def _s15_sev(rate, warn, crit):
+    return "critical" if rate >= crit else ("warn" if rate >= warn else "ok")
+
+
+class _S15Rollback(Exception):
+    pass
+
+
+def s15_read_probe(opener, attempts=3, backoff=1.0, sleep=None):
+    """Bounded, read-only probe of the Google Sheet: open it and read its header row. Never retries forever; error text is scrubbed.
+    `opener()` returns a gspread spreadsheet. Returns {ok, seconds, attempts, error_class, detail}."""
+    import time as _t
+    sleep = sleep or _t.sleep
+    t0 = _t.time()
+    err = ""
+    for i in range(1, int(max(1, min(attempts, 5))) + 1):
+        try:
+            ss = opener()
+            if ss is None:
+                return {"ok": False, "seconds": 0.0, "attempts": i, "error_class": "NotLoaded", "detail": "No spreadsheet URL is known yet; load the sheet first."}
+            ws = ss.get_worksheet(0) if hasattr(ss, "get_worksheet") else ss.worksheets()[0]
+            ws.row_values(1)
+            return {"ok": True, "seconds": round(_t.time() - t0, 2), "attempts": i, "error_class": "", "detail": "Sheet opened and header row read."}
+        except Exception as exc:
+            err = type(exc).__name__
+            if i < attempts:
+                sleep(min(backoff * (2 ** (i - 1)), 8.0))
+    return {"ok": False, "seconds": round(_t.time() - t0, 2), "attempts": int(attempts), "error_class": err or "Error",
+            "detail": f"The Google Sheet could not be read after {int(attempts)} attempt(s) ({err or 'error'})."}
+
+
+def s15_run_checks(df, qf, cols, now, store=None, meta=None, cfg=None, probe=None):
+    """List of check dicts {name, status ok|warn|critical|info, detail, value, n, last_data}. Reads only; nothing is changed."""
+    cfg = cfg or s15_config()
+    now = pd.Timestamp(now)
+    out = []
+    rd = int(cfg["recent_days"])
+    n_rows = int(len(qf))
+    # 1) sheet read
+    if probe is not None:
+        out.append(_s15_chk("Google Sheets access", "ok" if probe["ok"] else "critical", probe["detail"] + f" ({probe['seconds']}s, {probe['attempts']} attempt(s))", value=probe["seconds"]))
+        out[-1]["error_class"] = probe.get("error_class", "")
+    else:
+        tabs = (meta or {}).get("counts", "") or "tab info not available"
+        out.append(_s15_chk("Google Sheets access", "ok" if n_rows >= int(cfg["min_rows"]) else "warn",
+                            f"{n_rows:,} row(s) loaded ({tabs}). Use 'Re-check Google Sheet access' for a timed read test.", n=n_rows))
+    for note in (meta or {}).get("notes", []) or []:
+        out.append(_s15_chk("Sheet tab notes", "warn", note))
+    # 2) freshness
+    ts = qf["Parsed_Date"].dropna() if "Parsed_Date" in qf.columns else pd.Series(dtype="datetime64[ns]")
+    if ts.empty:
+        out.append(_s15_chk("Data freshness", "critical", "No readable Call Date in the loaded data."))
+        last = None
+    else:
+        last = pd.Timestamp(ts.max())
+        age_h = max(0.0, (now - last).total_seconds() / 3600.0)
+        quiet = bool(cfg["quiet_weekends"]) and now.weekday() >= 5
+        st_ = "ok" if age_h < cfg["fresh_warn_h"] else ("warn" if age_h < cfg["fresh_crit_h"] else "critical")
+        if quiet and st_ != "ok":
+            st_ = "info"
+        out.append(_s15_chk("Data freshness", st_, f"Newest call: {last.strftime('%Y-%m-%d %H:%M')} ({age_h:.1f} h ago)" + (" - weekend quiet mode is on" if quiet else "")
+                            + f". Warning after {cfg['fresh_warn_h']:g} h, critical after {cfg['fresh_crit_h']:g} h.", value=round(age_h, 1), n=n_rows, last_data=last.strftime("%Y-%m-%d %H:%M:%S")))
+    # 3) duplicates (never deleted)
+    dkeys = [c for c in (cols.get("date"), cols.get("caller_id"), cols.get("publisher"), cols.get("buyer"), cols.get("duration")) if c and c in df.columns]
+    if len(dkeys) >= 3 and n_rows:
+        dup = df.duplicated(subset=dkeys, keep="first")
+        nd = int(dup.sum())
+        ex = []
+        if nd and cols.get("caller_id") in df.columns:
+            for v in df.loc[dup, cols["caller_id"]].astype(str).head(3):
+                ex.append(s16_mask_phone(v) or "(blank Caller ID)")
+        share = nd / n_rows
+        out.append(_s15_chk("Duplicated records", "ok" if nd < cfg["dup_warn"] else ("critical" if share >= cfg["dup_crit_share"] else "warn"),
+                            f"{nd:,} extra copy row(s) with the same Call Date + Caller ID + Publisher + Buyer + Duration ({share * 100:.1f}% of rows). Rows are never deleted." + (f" Examples: {', '.join(ex)}." if ex else ""),
+                            value=nd, n=n_rows))
+    else:
+        out.append(_s15_chk("Duplicated records", "info", "Needs Call Date, Caller ID and two more of Publisher / Buyer / Duration to be checked."))
+    # 4) date parse failures
+    if cols.get("date") and cols["date"] in df.columns:
+        raw = df[cols["date"]].astype(str).str.strip()
+        bad = int(((raw != "") & (qf["Parsed_Date"].isna())).sum())
+        out.append(_s15_chk("Date parse failures", "ok" if bad < cfg["date_fail_warn"] else "warn", f"{bad:,} Call Date cell(s) could not be read (rows are kept, just not placed in time).", value=bad, n=n_rows))
+    # 5) header / schema drift
+    missing = [QUERY_LABELS[k] for k in S15_EXPECTED if not cols.get(k)]
+    known = {str(v).lower() for v in cols.values() if v}
+    extra = [c for c in df.columns if not str(c).startswith("Unnamed_") and str(c).lower() not in known and not str(c).startswith("QC:")]
+    msg = ("Missing expected column(s): " + ", ".join(missing) + ". ") if missing else "All 15 expected columns were found. "
+    if extra:
+        msg += "Unrecognised column(s): " + ", ".join(map(str, extra[:6])) + ". "
+    out.append(_s15_chk("Header / schema drift", "critical" if cols.get("date") is None or cols.get("publisher") is None else ("warn" if missing or extra else "ok"), msg.strip(), value=len(missing)))
+    # recent window for the by-day checks
+    base = qf[qf["Parsed_Date"].notna()].copy() if "Parsed_Date" in qf.columns else qf.iloc[0:0].copy()
+    ref_end = (last if last is not None else now)
+    rec = base[base["Parsed_Date"] >= (ref_end.normalize() - pd.Timedelta(days=rd - 1))].copy()
+    n_rec = len(rec)
+    rec["_day"] = rec["Parsed_Date"].dt.strftime("%Y-%m-%d")
+
+    def blank_rate(colname):
+        if not colname or colname not in rec.columns or n_rec == 0:
+            return None, 0
+        v = rec[colname].astype(str).map(lambda x: is_unavailable(x))
+        return float(v.mean()), int(v.sum())
+
+    # 6) recording URLs (never printed)
+    r, k = blank_rate(cols.get("recording"))
+    out.append(_s15_chk("Missing recording URLs", "info" if r is None else _s15_sev(r, cfg["gap_warn"], cfg["gap_crit"]),
+                        "No Recording column or no recent calls." if r is None else f"{k:,} of {n_rec:,} calls in the last {rd} day(s) have no recording link ({r * 100:.1f}%). Links are never shown or logged.", value=None if r is None else round(r, 3), n=n_rec))
+    # 7) QC backlog
+    qcol = cols.get("qc")
+    if qcol and qcol in rec.columns and n_rec:
+        done = ~rec[qcol].astype(str).map(is_unavailable)
+        cov = float(done.mean())
+        sc_blank = float(rec["Quality_Score_Num"].isna().mean()) if "Quality_Score_Num" in rec.columns else None
+        parsed_bad = 0
+        sample = rec.loc[done, qcol].astype(str).head(2000)
+        for t in sample:
+            if len(parse_qc_text(t)) < 2:
+                parsed_bad += 1
+        st_ = "ok" if cov >= cfg["qc_warn"] else ("critical" if cov < cfg["qc_crit"] else "warn")
+        out.append(_s15_chk("AI QC backlog", st_, f"QC completed for {int(done.sum()):,} of {n_rec:,} calls in the last {rd} day(s) ({cov * 100:.1f}%); {n_rec - int(done.sum()):,} call(s) still have no QC report (the measurable backlog)."
+                            + (f" Quality Score is blank on {sc_blank * 100:.1f}%." if sc_blank is not None else "")
+                            + (f" {parsed_bad:,} of {len(sample):,} reports did not parse into fields." if parsed_bad else "") + " Quality figures are based on completed QC only.", value=round(cov, 3), n=n_rec))
+    else:
+        out.append(_s15_chk("AI QC backlog", "info", "No AI QC Report column or no recent calls."))
+    # 8) lookup gaps and fake unknown
+    for nm, cname in (("Line Type lookup gaps", cols.get("line_type")), ("Phone Company lookup gaps", cols.get("phone_company"))):
+        r, k = blank_rate(cname)
+        out.append(_s15_chk(nm, "info" if r is None else _s15_sev(r, cfg["gap_warn"], cfg["gap_crit"]),
+                            "Column missing or no recent calls." if r is None else f"{k:,} of {n_rec:,} recent calls have no value ({r * 100:.1f}%): a missing or failed lookup, not a measurement.", value=None if r is None else round(r, 3), n=n_rec))
+    if "Fake_Known" in rec.columns and n_rec:
+        r = float((~rec["Fake_Known"]).mean())
+        out.append(_s15_chk("Fake Number unknown rate", _s15_sev(r, cfg["gap_warn"], cfg["gap_crit"]), f"{r * 100:.1f}% of calls in the last {rd} day(s) have no Yes / No answer (Unknown is never counted as No).", value=round(r, 3), n=n_rec))
+    # 9) AI provider (no keys, no URLs)
+    try:
+        rows = ai_status()
+        cfgd = [x for x in rows if x["Configured"] == "yes"]
+        ready = [x for x in cfgd if x["State"] == "ready"]
+        out.append(_s15_chk("AI provider health", "info" if not cfgd else ("ok" if ready else "warn"),
+                            "No AI provider is configured (the dashboard works without one)." if not cfgd else f"{len(ready)} of {len(cfgd)} configured provider(s) ready: " + "; ".join(f"{x['Provider']}: {x['State']}" for x in cfgd)))
+    except Exception as exc:
+        out.append(_s15_chk("AI provider health", "info", f"Provider status could not be read ({type(exc).__name__})."))
+    # 10) e-mail, alert store
+    if store is not None:
+        try:
+            nrows = store._q("SELECT status, COUNT(*) n FROM notifications WHERE kind != 'test' AND created_at >= ? GROUP BY status", ((now - pd.Timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),))
+            cnt = {r["status"]: r["n"] for r in nrows}
+            bad = cnt.get("failed", 0) + cnt.get("abandoned", 0)
+            out.append(_s15_chk("E-mail delivery", "warn" if bad else "ok", f"Last 7 days: sent {cnt.get('sent', 0)}, pending {cnt.get('pending', 0)}, failed {cnt.get('failed', 0)}, abandoned {cnt.get('abandoned', 0)}.", value=bad))
+        except Exception as exc:
+            out.append(_s15_chk("E-mail delivery", "warn", f"Notification table could not be read ({type(exc).__name__})."))
+        try:
+            def probe_fn(c):
+                c.execute("INSERT INTO meta(key, value) VALUES ('s15_probe', ?)", (s16_ts(now),))
+                raise _S15Rollback()
+            try:
+                store._tx(probe_fn)
+            except _S15Rollback:
+                pass
+            lastrun = store._q("SELECT MAX(ts) t FROM runs")[0]["t"]
+            od = None if not lastrun else (now - pd.Timestamp(lastrun)).total_seconds() / 3600
+            st_ = "ok" if (od is not None and od <= cfg["runs_overdue_h"]) else "info"
+            if od is not None and od > cfg["runs_overdue_h"]:
+                st_ = "warn"
+            out.append(_s15_chk("Alert store / database", st_ if store.persistent else "warn",
+                                f"Open, schema version {store.schema_version()}, write test passed (rolled back). " + ("Last detection run: " + lastrun + f" ({od:.1f} h ago)." if lastrun else "No detection run saved yet.")
+                                + ("" if store.persistent else " The store is in memory only and is lost on restart."), value=None if od is None else round(od, 1)))
+        except Exception as exc:
+            out.append(_s15_chk("Alert store / database", "critical", f"The alert database failed its test ({type(exc).__name__})."))
+    for nm, why in S15_NOT_MONITORABLE:
+        out.append(_s15_chk("Not monitorable: " + nm, "info", why))
+    return out
+
+
+def s15_by_day(qf, cols, days=14):
+    """QC completion and blank rates by day (a table for the page; nothing is changed)."""
+    if "Parsed_Date" not in qf.columns or qf["Parsed_Date"].notna().sum() == 0:
+        return pd.DataFrame()
+    q = qf[qf["Parsed_Date"].notna()].copy()
+    last = q["Parsed_Date"].max().normalize()
+    q = q[q["Parsed_Date"] >= last - pd.Timedelta(days=days - 1)]
+    q["Day"] = q["Parsed_Date"].dt.strftime("%Y-%m-%d")
+    g = q.groupby("Day")
+    rows = []
+    for d, w in g:
+        row = {"Day": d, "Calls": len(w)}
+        for lab, key in (("QC done %", "qc"), ("Line Type blank %", "line_type"), ("Phone Company blank %", "phone_company"), ("Recording blank %", "recording")):
+            c = cols.get(key)
+            if c and c in w.columns:
+                blank = w[c].astype(str).map(is_unavailable)
+                row[lab] = round((100 * (1 - blank.mean())) if key == "qc" else 100 * blank.mean(), 1)
+        if "Fake_Known" in w.columns:
+            row["Fake unknown %"] = round(100 * (1 - w["Fake_Known"].mean()), 1)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def s15_persist(store, checks, now, run_id=None, records_read=None):
+    """Save the check results; one incident per ongoing problem (fingerprint), updated not repeated; critical incidents also become a Step 9-style
+    alert (so the existing e-mail path, severity and cooldown apply); an incident that returns to ok is marked recovered and its alert resolved.
+    Returns {'incidents_opened', 'incidents_updated', 'recovered', 'alerts'}."""
+    now_s = s16_ts(now)
+    run_id = run_id or s16_id("H", now_s)
+    summ = {"run_id": run_id, "incidents_opened": 0, "incidents_updated": 0, "recovered": 0, "alerts": 0}
+
+    def fn(c):
+        for ck in checks:
+            if ck["name"].startswith("Not monitorable"):
+                continue
+            c.execute("INSERT INTO health_checks(run_id, ts, name, status, detail, value, duration_ms, records_read, last_data_ts) VALUES (?,?,?,?,?,?,?,?,?)",
+                      (run_id, now_s, ck["name"], ck["status"], ck["detail"], None if ck.get("value") is None else str(ck["value"]), None, records_read, ck.get("last_data")))
+            fp = "health:" + ck["name"]
+            inc = c.execute("SELECT id, severity, alert_id FROM health_incidents WHERE fp = ? AND status = 'open'", (fp,)).fetchone()
+            if ck["status"] in ("warn", "critical"):
+                sev = "critical" if ck["status"] == "critical" else "warn"
+                if inc:
+                    c.execute("UPDATE health_incidents SET last_seen_at=?, occurrences=occurrences+1, detail=?, severity=? WHERE id=?", (now_s, ck["detail"], sev, inc["id"]))
+                    summ["incidents_updated"] += 1
+                    iid, alert_id = inc["id"], inc["alert_id"]
+                else:
+                    iid, alert_id = s16_id("I", fp), None
+                    last_ok = c.execute("SELECT ts FROM health_checks WHERE name = ? AND status = 'ok' ORDER BY id DESC LIMIT 1", (ck["name"],)).fetchone()
+                    c.execute("INSERT INTO health_incidents(id, fp, name, status, severity, opened_at, last_seen_at, detail, last_success_at, error_class) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                              (iid, fp, ck["name"], "open", sev, now_s, now_s, ck["detail"], last_ok["ts"] if last_ok else None, ck.get("error_class", "")))
+                    s16_audit(c, now_s, "system", False, "health_incident_opened", iid, f"{ck['name']}: {ck['detail']}")
+                    summ["incidents_opened"] += 1
+                if sev == "critical" and not alert_id:
+                    ex = c.execute("SELECT id FROM alerts WHERE fp = ? AND status IN ('new','acknowledged','recurring')", (fp,)).fetchone()
+                    if ex:
+                        alert_id = ex["id"]
+                    else:
+                        alert_id = s16_id("A", fp)
+                        rec = {"metric_label": "Data health", "current_value": None, "baseline_value": None, "change_text": ck["detail"], "current_window": "now", "baseline_window": "n/a",
+                               "sample_size": ck.get("n"), "min_sample": "n/a", "severity_why": "A data-reliability check is critical; figures elsewhere may be incomplete.",
+                               "method": "Step 15 data-health check", "threshold": "see the Step 15 table", "completeness": "n/a", "next_step": "Open Step 15 and check the sheet feed.",
+                               "explanation": ck["detail"], "mode": "health", "state_key": None}
+                        c.execute("""INSERT INTO alerts(id, fp, mode, status, severity, severity_rank, metric, entity_type, entity_key, publisher, buyer, campaign, direction, title,
+                                     detected_at, last_seen_at, occurrences, ok_streak, notified_rank, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                  (alert_id, fp, "health", "new", "high", S9_SEVERITIES.index("high"), "data_health", "system", ck["name"], "", "", "", "data", "Data health: " + ck["name"],
+                                   now_s, now_s, 1, 0, -1, json.dumps(rec, default=str)))
+                        summ["alerts"] += 1
+                    c.execute("UPDATE health_incidents SET alert_id = ? WHERE id = ?", (alert_id, iid))
+            elif ck["status"] == "ok" and inc:
+                c.execute("UPDATE health_incidents SET status='recovered', recovered_at=?, last_seen_at=? WHERE id=?", (now_s, now_s, inc["id"]))
+                if inc["alert_id"]:
+                    c.execute("UPDATE alerts SET status='resolved', resolved_at=?, resolved_by='system', resolution='data-health check back to normal' WHERE id=? AND status IN ('new','acknowledged','recurring')",
+                              (now_s, inc["alert_id"]))
+                s16_audit(c, now_s, "system", False, "health_incident_recovered", inc["id"], ck["name"])
+                summ["recovered"] += 1
+    store._tx(fn)
+    return summ
+
+
+def s15_incidents(store, status=None, limit=100):
+    where = " WHERE status = ?" if status in ("open", "recovered") else ""
+    return pd.DataFrame(store._q("SELECT id, name, status, severity, opened_at, last_seen_at, recovered_at, occurrences, detail, alert_id, task_id, last_success_at FROM health_incidents" + where +
+                                 " ORDER BY opened_at DESC LIMIT ?", ((status,) if where else ()) + (int(max(1, min(limit, 1000))),)))
+
+
+def s15_recent_checks(store, limit=200):
+    return pd.DataFrame(store._q("SELECT ts, name, status, detail FROM health_checks ORDER BY id DESC LIMIT ?", (int(max(1, min(limit, 2000))),)))
+
+
+# =====================================================================================================================
+# STEP 11 - Operations workflow: tasks created from alerts, health incidents and recommendations. A task never implies that anything was blocked or changed.
+# Identity: there are no user accounts. `owner` is free text; `updated_by` is the label typed (or the Streamlit viewer-login e-mail when configured) and
+# every row records whether that identity was verified.
+# =====================================================================================================================
+S11_STATUSES = ("New", "Open", "In Progress", "Waiting for Approval", "Waiting for External Action", "Completed", "Cancelled", "Reopened")
+S11_CLOSED = ("Completed", "Cancelled")
+_S11_ACTIVE = ("Open", "In Progress", "Waiting for Approval", "Waiting for External Action", "Reopened")
+S11_TRANSITIONS = {
+    "New": ("Open", "In Progress", "Waiting for Approval", "Waiting for External Action", "Completed", "Cancelled"),
+    "Open": ("In Progress", "Waiting for Approval", "Waiting for External Action", "Completed", "Cancelled"),
+    "In Progress": ("Open", "Waiting for Approval", "Waiting for External Action", "Completed", "Cancelled"),
+    "Waiting for Approval": ("Open", "In Progress", "Completed", "Cancelled"),
+    "Waiting for External Action": ("Open", "In Progress", "Completed", "Cancelled"),
+    "Completed": ("Reopened",),
+    "Cancelled": ("Reopened",),
+    "Reopened": ("Open", "In Progress", "Waiting for Approval", "Waiting for External Action", "Completed", "Cancelled"),
+}
+S11_TYPES = ("investigate", "review", "data_quality", "follow_up", "approval", "other")
+S11_DEFAULTS = {"due_hours": {"critical": 4, "high": 24, "medium": 72, "low": 168, "info": 168}, "escalate_after_h": 24.0, "critical_unresolved_h": 4.0, "reopen_on_recurrence": True,
+                "max_escalations": 3, "page_size": 100}
+_S11_PRIO = {"critical": 1, "high": 2, "medium": 3, "low": 4, "info": 4}
+
+
+def s11_config():
+    cfg = json.loads(json.dumps(S11_DEFAULTS))
+    raw = _cfg("TASK_CONFIG", "")
+    try:
+        extra = dict(raw) if hasattr(raw, "items") else (json.loads(str(raw)) if str(raw).strip() else {})
+    except Exception:
+        extra = {}
+    for k, v in extra.items():
+        if k in ("escalate_after_h", "critical_unresolved_h"):
+            try:
+                cfg[k] = max(0.5, float(v))
+            except Exception:
+                pass
+        elif k in ("max_escalations", "page_size"):
+            try:
+                cfg[k] = max(1, int(v))
+            except Exception:
+                pass
+        elif k == "reopen_on_recurrence":
+            cfg[k] = bool(v)
+    return cfg
+
+
+def _s11_event(c, task_id, now_s, ident, kind, frm="", to="", detail=""):
+    c.execute("INSERT INTO task_events(task_id, ts, actor, verified, kind, from_status, to_status, detail) VALUES (?,?,?,?,?,?,?,?)",
+              (task_id, now_s, s16_scrub(ident["label"], 80), int(ident["verified"]), kind, frm, to, s16_scrub(detail, 500)))
+
+
+def s11_create(store, title, ident, description="", type_="investigate", source="manual", source_id="", purpose="", publisher="", buyer="", campaign="", severity="medium",
+               evidence=None, owner="", due_hours=None, now=None, status="New", cfg=None):
+    """Create a task. Idempotent on (source, source_id, purpose): processing the same alert / incident / recommendation again returns the same task
+    (a CLOSED task is re-opened when the source recurs and `reopen_on_recurrence` is on). Returns (task_id, 'created' | 'existing' | 'reopened')."""
+    s16_require("manage_tasks", ident)
+    cfg = cfg or s11_config()
+    now_s = s16_ts(now)
+    title = s16_scrub(title, 200).strip()
+    if not title:
+        raise ValueError("A task needs a title.")
+    sev = severity if severity in _S11_PRIO else "medium"
+    idem = s16_idem("task", source, source_id or title, purpose)
+    hours = float(due_hours if due_hours is not None else cfg["due_hours"].get(sev, 72))
+    due = (pd.Timestamp(now_s) + pd.Timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    type_ = type_ if type_ in S11_TYPES else "other"
+
+    def fn(c):
+        row = c.execute("SELECT id, status FROM tasks WHERE idem = ?", (idem,)).fetchone()
+        if row:
+            if row["status"] in S11_CLOSED and cfg["reopen_on_recurrence"] and source != "manual":
+                c.execute("UPDATE tasks SET status='Reopened', updated_at=?, updated_by=?, identity_verified=?, due_at=?, result=NULL WHERE id=?",
+                          (now_s, ident["label"], int(ident["verified"]), due, row["id"]))
+                _s11_event(c, row["id"], now_s, ident, "reopened", row["status"], "Reopened", "The source recurred.")
+                s16_audit(c, now_s, ident["label"], ident["verified"], "task_reopened", row["id"], "source recurred")
+                return row["id"], "reopened"
+            _s11_event(c, row["id"], now_s, ident, "linked", "", "", "The same source was processed again; no second task was created.")
+            return row["id"], "existing"
+        tid = s16_id("T", idem)
+        c.execute("""INSERT INTO tasks(id, idem, title, description, type, source, source_id, publisher, buyer, campaign, priority, severity, evidence, owner, created_at, due_at, updated_at,
+                     status, created_by, updated_by, identity_verified) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (tid, idem, title, s16_scrub(description, 1500), type_, str(source), s16_scrub(source_id, 120), s16_scrub(publisher, 120), s16_scrub(buyer, 120), s16_scrub(campaign, 120),
+                   _S11_PRIO[sev], sev, s16_json(evidence or {}), s16_scrub(owner, 80), now_s, due, now_s, status if status in S11_STATUSES else "New", ident["label"], ident["label"], int(ident["verified"])))
+        _s11_event(c, tid, now_s, ident, "created", "", status, f"source={source} {source_id}")
+        s16_audit(c, now_s, ident["label"], ident["verified"], "task_created", tid, title)
+        return tid, "created"
+    return store._tx(fn)
+
+
+def s11_get(store, tid):
+    r = store._q("SELECT * FROM tasks WHERE id = ?", (str(tid),))
+    if not r:
+        return None
+    d = r[0]
+    try:
+        d["evidence"] = json.loads(d.get("evidence") or "{}")
+    except Exception:
+        d["evidence"] = {}
+    return d
+
+
+def s11_events(store, tid):
+    return pd.DataFrame(store._q("SELECT ts, actor, verified, kind, from_status, to_status, detail FROM task_events WHERE task_id = ? ORDER BY id", (str(tid),)))
+
+
+def s11_transition(store, tid, to_status, ident, result="", comment="", now=None):
+    """Enforced in the store (the UI cannot bypass it). Completing needs a result. Returns (ok, message)."""
+    try:
+        s16_require("manage_tasks", ident)
+    except PermissionError as exc:
+        return False, str(exc)
+    if to_status not in S11_STATUSES:
+        return False, "Unknown status."
+    now_s = s16_ts(now)
+
+    def fn(c):
+        row = c.execute("SELECT status FROM tasks WHERE id = ?", (str(tid),)).fetchone()
+        if not row:
+            return False, "Unknown task."
+        if to_status not in S11_TRANSITIONS.get(row["status"], ()):
+            return False, f"A task that is '{row['status']}' cannot move to '{to_status}'."
+        if to_status == "Completed" and not str(result or "").strip():
+            return False, "Completing a task needs a result (what was found or done)."
+        c.execute("UPDATE tasks SET status=?, updated_at=?, updated_by=?, identity_verified=?, result=COALESCE(?, result) WHERE id=?",
+                  (to_status, now_s, ident["label"], int(ident["verified"]), s16_scrub(result, 800) if str(result or "").strip() else None, str(tid)))
+        _s11_event(c, str(tid), now_s, ident, "status", row["status"], to_status, (result or comment))
+        s16_audit(c, now_s, ident["label"], ident["verified"], "task_" + to_status.lower().replace(" ", "_"), tid, (result or comment))
+        return True, f"Task {tid}: {row['status']} -> {to_status}. (A task records work; it changes nothing in Ringba.)"
+    return store._tx(fn)
+
+
+def s11_update(store, tid, ident, owner=None, priority=None, due_at=None, comment="", now=None):
+    try:
+        s16_require("manage_tasks", ident)
+    except PermissionError as exc:
+        return False, str(exc)
+    now_s = s16_ts(now)
+
+    def fn(c):
+        row = c.execute("SELECT id, status FROM tasks WHERE id = ?", (str(tid),)).fetchone()
+        if not row:
+            return False, "Unknown task."
+        sets, args, notes = [], [], []
+        if owner is not None:
+            sets.append("owner=?")
+            args.append(s16_scrub(owner, 80))
+            notes.append(f"owner={s16_scrub(owner, 80)}")
+        if priority is not None and int(priority) in (1, 2, 3, 4):
+            sets.append("priority=?")
+            args.append(int(priority))
+            notes.append(f"priority={int(priority)}")
+        if due_at:
+            try:
+                d = pd.Timestamp(due_at).strftime("%Y-%m-%d %H:%M:%S")
+                sets.append("due_at=?")
+                args.append(d)
+                notes.append(f"due={d}")
+            except Exception:
+                return False, "The due date could not be read."
+        if not sets and not str(comment).strip():
+            return False, "Nothing to update."
+        if sets:
+            c.execute("UPDATE tasks SET " + ", ".join(sets) + ", updated_at=?, updated_by=?, identity_verified=? WHERE id=?", tuple(args) + (now_s, ident["label"], int(ident["verified"]), str(tid)))
+        _s11_event(c, str(tid), now_s, ident, "assigned" if owner is not None else "updated", "", "", "; ".join(notes) + (" | " if notes and comment else "") + str(comment))
+        s16_audit(c, now_s, ident["label"], ident["verified"], "task_updated", tid, "; ".join(notes) + " " + str(comment))
+        return True, "Task updated."
+    return store._tx(fn)
+
+
+def s11_list(store, now, statuses=None, owner=None, overdue_only=False, priority=None, limit=100, offset=0):
+    """Bounded, paged, validated filters (always bound parameters)."""
+    where, args = [], []
+    sts = [s for s in (statuses or []) if s in S11_STATUSES]
+    if sts:
+        where.append("status IN (" + ",".join("?" * len(sts)) + ")")
+        args += sts
+    if owner:
+        where.append("LOWER(owner) = ?")
+        args.append(str(owner).strip().lower())
+    if priority in (1, 2, 3, 4):
+        where.append("priority = ?")
+        args.append(int(priority))
+    if overdue_only:
+        where.append("due_at < ? AND status NOT IN ('Completed','Cancelled')")
+        args.append(s16_ts(now))
+    sql = ("SELECT id, status, priority, severity, title, type, source, source_id, publisher, buyer, campaign, owner, created_at, due_at, updated_at, updated_by, identity_verified, escalations "
+           "FROM tasks" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY (status IN ('Completed','Cancelled')), priority, due_at LIMIT ? OFFSET ?")
+    df = pd.DataFrame(store._q(sql, tuple(args) + (int(max(1, min(limit, 500))), int(max(0, offset)))),
+                      columns=["id", "status", "priority", "severity", "title", "type", "source", "source_id", "publisher", "buyer", "campaign", "owner", "created_at", "due_at",
+                               "updated_at", "updated_by", "identity_verified", "escalations"])
+    df["overdue"] = False
+    if len(df):
+        df["overdue"] = (df["due_at"] < s16_ts(now)) & (~df["status"].isin(S11_CLOSED))
+    return df
+
+
+def s11_counts(store, now):
+    rows = store._q("SELECT status, COUNT(*) n FROM tasks GROUP BY status")
+    c = {r["status"]: r["n"] for r in rows}
+    od = store._q("SELECT COUNT(*) n FROM tasks WHERE due_at < ? AND status NOT IN ('Completed','Cancelled')", (s16_ts(now),))[0]["n"]
+    return {"by_status": c, "overdue": od, "open_total": sum(v for k, v in c.items() if k not in S11_CLOSED)}
+
+
+def s11_from_alert(store, alert_id, ident, now=None, owner=""):
+    a = store.get(alert_id)
+    if not a:
+        return None, "Unknown alert."
+    rec = a.get("record") or {}
+    tid, how = s11_create(store, f"Investigate: {a['title']} ({a['entity_key']})", ident, description=rec.get("explanation", "") or a["title"], type_="investigate", source="alert",
+                          source_id=a["fp"], purpose="investigate", publisher=a.get("publisher") or "", buyer=a.get("buyer") or "", campaign=a.get("campaign") or "",
+                          severity=a["severity"], evidence={"alert_id": a["id"], "metric": a["metric"], "current": rec.get("current_value"), "baseline": rec.get("baseline_value"),
+                                                           "sample_size": rec.get("sample_size"), "window": rec.get("current_window")}, owner=owner, now=now)
+    return tid, how
+
+
+def s11_from_incident(store, incident_id, ident, now=None):
+    r = store._q("SELECT * FROM health_incidents WHERE id = ?", (str(incident_id),))
+    if not r:
+        return None, "Unknown incident."
+    r = r[0]
+    tid, how = s11_create(store, f"Data health: {r['name']}", ident, description=r["detail"], type_="data_quality", source="incident", source_id=r["fp"], purpose="fix",
+                          severity="high" if r["severity"] == "critical" else "medium", evidence={"incident_id": r["id"], "detail": r["detail"]}, now=now)
+    store._tx(lambda c: c.execute("UPDATE health_incidents SET task_id=? WHERE id=?", (tid, r["id"])))
+    return tid, how
+
+
+def s11_from_recommendation(store, rid, ident, now=None):
+    r = s10_get(store, rid)
+    if not r:
+        return None, "Unknown recommendation."
+    return s11_create(store, f"Review: {r['title']}", ident, description=(r.get("evidence") or {}).get("why", "") or r["title"], type_="review", source="recommendation", source_id=r["id"],
+                      purpose="review", severity="high" if r["confidence"] == "high" else "medium", evidence={"recommendation_id": r["id"], "rule": r["rule"], "entity": r["entity_key"]}, now=now)
+
+
+def s11_escalate(store, now, ident=None, mailer=None, ec=None, cfg=None):
+    """Escalation is a message only. A task qualifies when it is overdue by escalate_after_h, or is a critical task still New after critical_unresolved_h.
+    Per task: at most max_escalations messages, never twice inside the e-mail cooldown, a failed send is recorded and retried only on a later call.
+    Returns {'candidates', 'sent', 'failed', 'skipped', 'reason'}."""
+    cfg = cfg or s11_config()
+    ec = ec or s9_email_config()
+    ident = ident or {"label": "system", "verified": False, "level": "operator"}
+    now = pd.Timestamp(now)
+    now_s = s16_ts(now)
+    out = {"candidates": 0, "sent": 0, "failed": 0, "skipped": 0, "reason": ""}
+    rows = store._q("SELECT id, title, severity, status, due_at, created_at, escalated_at, escalations, owner FROM tasks WHERE status NOT IN ('Completed','Cancelled')")
+    cand = []
+    for r in rows:
+        overdue_h = (now - pd.Timestamp(r["due_at"])).total_seconds() / 3600 if r["due_at"] else -1
+        crit_h = (now - pd.Timestamp(r["created_at"])).total_seconds() / 3600
+        if overdue_h >= cfg["escalate_after_h"] or (r["severity"] == "critical" and r["status"] == "New" and crit_h >= cfg["critical_unresolved_h"]):
+            if int(r["escalations"] or 0) >= cfg["max_escalations"]:
+                out["skipped"] += 1
+                continue
+            if r["escalated_at"] and pd.Timestamp(r["escalated_at"]) + pd.Timedelta(minutes=ec["cooldown_min"]) > now:
+                out["skipped"] += 1
+                continue
+            cand.append(r)
+    out["candidates"] = len(cand)
+    if not cand:
+        return out
+    probs = s9_email_problems(ec)
+    if probs:
+        out["reason"] = "E-mail is not ready (" + probs[0] + "); the tasks stay visible on the page."
+        return out
+    body = ["These operations tasks need attention (message only; nothing in Ringba was changed):", ""]
+    for r in cand:
+        body.append(f"- [{r['severity'].upper()}] {r['id']}  {s16_scrub(r['title'], 120)}  status: {r['status']}  due: {r['due_at']}  owner: {r['owner'] or '(none)'}")
+    if ec.get("public_url"):
+        body += ["", f"Open the dashboard: {ec['public_url']}"]
+    try:
+        (mailer or s9_smtp_send)(ec, f"[Ringba tasks] {len(cand)} task(s) need attention", "\n".join(body))
+        def ok_fn(c):
+            for r in cand:
+                c.execute("UPDATE tasks SET escalated_at=?, escalations=escalations+1 WHERE id=?", (now_s, r["id"]))
+                _s11_event(c, r["id"], now_s, ident, "escalated", "", "", "escalation message sent")
+            s16_audit(c, now_s, "system", False, "task_escalation_sent", ",".join(r["id"] for r in cand)[:300], f"{len(cand)} task(s)")
+        store._tx(ok_fn)
+        out["sent"] = len(cand)
+    except Exception as exc:
+        def bad_fn(c):
+            for r in cand:
+                c.execute("UPDATE tasks SET escalations=escalations+1 WHERE id=?", (r["id"],))
+                _s11_event(c, r["id"], now_s, ident, "escalation_failed", "", "", s9_scrub(f"{type(exc).__name__}", ec))
+        store._tx(bad_fn)
+        out["failed"] = len(cand)
+        out["reason"] = f"The escalation e-mail could not be sent ({type(exc).__name__}); it will be retried later (at most {cfg['max_escalations']} times per task)."
+    return out
+
+
+# =====================================================================================================================
+# STEP 12 - Call Quality, Publisher & Buyer Performance Intelligence (replaces any revenue / profit idea: the sheet has no money, billable, conversion
+# or buyer-acceptance field). Built on the SAME per-call frame as Step 9 (s9_prepare -> canonical_flags), so every count and rate agrees with Steps 5-9.
+# Rates use only calls where the value is KNOWN; the denominator is always returned next to the rate. Groups below the minimum sample are listed as
+# "insufficient evidence" and are never ranked. Rates carry Wilson 95 % intervals and ranking uses the interval, not the raw rate.
+# =====================================================================================================================
+S12_DEFAULTS = {"min_calls": 30, "min_qc": 20, "duration_buckets": [30, 60, 180, 600], "qc_cov_diff": 0.20, "burst_calls": 5, "rate_min_delta": 0.05, "min_base_calls": 30,
+                "vol_ratio": 2.0, "vol_min_abs": 30, "mix_delta": 0.15, "hangup_tvd": 0.20, "company_share": 0.50, "company_delta": 0.20, "persist_windows": 3, "top": 15,
+                "max_distinct_qc_values": 25}
+S12_WORDING = "unusual compared with this entity's own baseline"
+S12_DISCLAIMER = "This is an observation about the data, not a finding of fraud or misconduct; one signal alone is never a verdict."
+S12_VERBS = ("Review", "Investigate", "Compare", "Monitor", "Collect more QC")
+S12_RATES = {"short": ("_short", "_dur_ok", "Short-call rate"), "poor": ("_poor", "_sc_ok", "Poor-score rate"), "spam": ("_spam", "_qc", "QC spam rate"),
+             "fake": ("_fake", "_fk_ok", "Fake Number rate"), "voip": ("_voip", "_line_ok", "VoIP rate")}
+S12_METRIC_OF = {"short": "short_rate", "poor": "poor_rate", "spam": "spam_rate", "fake": "fake_rate", "voip": "voip_rate"}
+
+
+def s12_config(over=None):
+    cfg = json.loads(json.dumps(S12_DEFAULTS))
+    raw = _cfg("QUALITY_CONFIG", "")
+    try:
+        extra = dict(raw) if hasattr(raw, "items") else (json.loads(str(raw)) if str(raw).strip() else {})
+    except Exception:
+        extra = {}
+    for src in (extra, over or {}):
+        for k, v in dict(src).items():
+            if k not in cfg:
+                continue
+            try:
+                if isinstance(cfg[k], list):
+                    vv = sorted({float(x) for x in v})
+                    if vv:
+                        cfg[k] = [int(x) if float(x).is_integer() else x for x in vv]
+                elif isinstance(cfg[k], int):
+                    cfg[k] = max(1, int(float(v)))
+                else:
+                    cfg[k] = float(v)
+            except Exception:
+                continue
+    return cfg
+
+
+def s12_prepare(qf, cols, cfg9=None):
+    """Per-call frame: everything Step 9 needs (s9_prepare) plus the extra categorical fields. Unknown stays unknown (NaN / '')."""
+    cfg9 = cfg9 or s9_config()
+    m = s9_prepare(qf, cols, cfg9)
+    q = qf.loc[m.index]
+
+    def cat(key):
+        c = cols.get(key)
+        if c and c in q.columns:
+            v = q[c].astype(str).str.strip()
+            return v.where(~v.map(is_unavailable), "")
+        return pd.Series("", index=m.index)
+    m["_hang"] = cat("hangup")
+    m["_line"] = cat("line_type")
+    m["_pc"] = cat("phone_company")
+    m["_dur_s"] = pd.to_numeric(q["Duration_Num"], errors="coerce") if "Duration_Num" in q.columns else np.nan
+    m["_score"] = pd.to_numeric(q["Quality_Score_Num"], errors="coerce") if "Quality_Score_Num" in q.columns else np.nan
+    cid = q["Caller_ID_Norm"].astype(str) if "Caller_ID_Norm" in q.columns else pd.Series("", index=m.index)
+    m["_caller"] = cid.where(cid.str.len() >= 7, "")
+    return m
+
+
+def s12_win(m, w):
+    return m[(m["ts"] >= pd.Timestamp(w[0])) & (m["ts"] < pd.Timestamp(w[1]))]
+
+
+def s12_windows(m, days=7, as_of=None):
+    """(current, previous) equal-length rolling windows ending just after the last call in the data (never a partial window against a full one)."""
+    last = pd.Timestamp(as_of) if as_of is not None else (m["ts"].max() if len(m) else pd.Timestamp.now())
+    end = last + pd.Timedelta(seconds=1)
+    d = pd.Timedelta(days=int(days))
+    return (end - d, end), (end - 2 * d, end - d)
+
+
+def _s12_stats(g, cfg):
+    n = int(len(g))
+    r = {"Calls": n}
+    dur = g["_dur_s"].dropna()
+    r["Duration n"] = int(len(dur))
+    r["Median duration (s)"] = float(dur.median()) if len(dur) else None
+    sc = g["_score"].dropna()
+    r["Scored n"] = int(len(sc))
+    r["Avg score"] = float(sc.mean()) if len(sc) else None
+    r["Score Q1"], r["Score median"], r["Score Q3"] = ((float(sc.quantile(.25)), float(sc.median()), float(sc.quantile(.75))) if len(sc) else (None, None, None))
+    r["QC completed n"] = int(g["_qc"].sum())
+    r["QC completion"] = (r["QC completed n"] / n) if n else None
+    for k, (xc, nc, _lab) in S12_RATES.items():
+        x, dn = int(g[xc].sum()), int(g[nc].sum())
+        lo, hi = _s9_wilson(x, dn) if dn else (None, None)
+        r[k + "_x"], r[k + "_n"] = x, dn
+        r[k + "_rate"] = (x / dn) if dn else None
+        r[k + "_lo"], r[k + "_hi"] = (None if lo is None or lo != lo else lo), (None if hi is None or hi != hi else hi)
+    r["Fake unknown share"] = (1 - r["fake_n"] / n) if n else None
+    r["Line unknown share"] = (1 - r["voip_n"] / n) if n else None
+    ca = g["_caller"]
+    ca = ca[ca != ""]
+    r["Caller known n"] = int(len(ca))
+    if len(ca):
+        vc = ca.value_counts()
+        r["Repeat caller share"] = float(vc[vc > 1].sum() / len(ca))
+        r["Distinct callers"] = int(len(vc))
+    else:
+        r["Repeat caller share"], r["Distinct callers"] = None, 0
+    return r
+
+
+def s12_entity_stats(w, keys, cfg):
+    """One row per entity (keys = ['publisher'] / ['publisher','campaign'] ...; [] = whole network). Also flags 'Sufficient' against the minimum calls."""
+    if not len(w):
+        return pd.DataFrame()
+    if not keys:
+        d = _s12_stats(w, cfg)
+        d["Entity"] = "ALL"
+        out = pd.DataFrame([d])
+    else:
+        rows = []
+        for key, g in w.groupby(keys):
+            key = key if isinstance(key, tuple) else (key,)
+            d = _s12_stats(g, cfg)
+            for kk, vv in zip(keys, key):
+                d[kk] = vv
+            d["Entity"] = " | ".join(map(str, key))
+            rows.append(d)
+        out = pd.DataFrame(rows)
+    out["Sufficient"] = out["Calls"] >= int(cfg["min_calls"])
+    return out
+
+
+def s12_rank(stats, metric, cfg, worst=True):
+    """(ranked, insufficient). Ranking uses the Wilson interval bound, not the raw rate: highest LOWER bound first for bad rates, so a 3-call 100 % group cannot lead.
+    A group needs `min_calls` calls AND `min_qc` evaluated calls for this metric."""
+    if stats is None or not len(stats) or metric not in S12_RATES:
+        return pd.DataFrame(), pd.DataFrame()
+    ok = (stats["Calls"] >= int(cfg["min_calls"])) & (stats[metric + "_n"] >= int(cfg["min_qc"]))
+    ranked = stats[ok].copy()
+    if len(ranked):
+        ranked["Rank bound"] = ranked[metric + ("_lo" if worst else "_hi")]
+        ranked = ranked.sort_values("Rank bound", ascending=not worst)
+    bad = stats[~ok].copy()
+    if len(bad):
+        bad["Why"] = np.where(bad["Calls"] < int(cfg["min_calls"]), f"fewer than {int(cfg['min_calls'])} calls", f"fewer than {int(cfg['min_qc'])} calls with a known value")
+    return ranked, bad
+
+
+def _s12_dist(series, order=None):
+    """(table, unknown_count). Shares are over calls with a KNOWN value only."""
+    s = series.astype(str).str.strip()
+    unk = int(s.map(lambda x: x == "" or is_unavailable(x)).sum())
+    k = s[~s.map(lambda x: x == "" or is_unavailable(x))]
+    vc = k.value_counts()
+    t = pd.DataFrame({"Value": vc.index, "Calls": vc.values})
+    t["Share of known"] = (t["Calls"] / max(int(vc.sum()), 1)) if len(t) else []
+    return t, unk
+
+
+def s12_distributions(w, cfg):
+    """Distribution tables for one window / entity: duration buckets, score quartiles, Fake Number, Line Type, Phone Company, Hangup By ('who ended the call', nothing more)."""
+    out = {}
+    edges = [float(x) for x in cfg["duration_buckets"]]
+    dur = w["_dur_s"].dropna()
+    labels = [f"under {edges[0]:g} s"] + [f"{edges[i]:g}-{edges[i + 1]:g} s" for i in range(len(edges) - 1)] + [f"over {edges[-1]:g} s"]
+    if len(dur):
+        b = pd.cut(dur, [-np.inf] + edges + [np.inf], labels=labels, right=False)
+        t = b.value_counts().reindex(labels).fillna(0).astype(int).reset_index()
+        t.columns = ["Duration", "Calls"]
+        t["Share of known"] = t["Calls"] / max(int(t["Calls"].sum()), 1)
+    else:
+        t = pd.DataFrame(columns=["Duration", "Calls", "Share of known"])
+    out["duration"] = (t, int(len(w) - len(dur)))
+    sc = w["_score"].dropna()
+    if len(sc):
+        t = pd.DataFrame({"Statistic": ["Scored calls", "Minimum", "Q1", "Median", "Q3", "Maximum", "Share below poor-score cut-off"],
+                          "Value": [len(sc), sc.min(), sc.quantile(.25), sc.median(), sc.quantile(.75), sc.max(), float((sc < float(s9_config()["poor_score"])).mean())]})
+    else:
+        t = pd.DataFrame(columns=["Statistic", "Value"])
+    out["score"] = (t, int(len(w) - len(sc)))
+    fk = w["_fk_ok"].astype(bool)
+    t = pd.DataFrame({"Value": ["Yes", "No"], "Calls": [int(w.loc[fk, "_fake"].sum()), int(fk.sum() - w.loc[fk, "_fake"].sum())]})
+    t["Share of known"] = t["Calls"] / max(int(t["Calls"].sum()), 1)
+    out["fake"] = (t, int((~fk).sum()))
+    out["line"] = _s12_dist(w["_line"])
+    out["phone_company"] = _s12_dist(w["_pc"])
+    out["hangup"] = _s12_dist(w["_hang"])
+    return out
+
+
+def s12_qc_categories(qf, cfg, top=10):
+    """Categories discovered from the parsed 'QC: <field>' columns (not hard-coded). Values are grouped by normalised exact text only. A field with too many
+    distinct values is free text and is listed as such, not categorised. Returns ({field: table}, [skipped fields])."""
+    out, skipped = {}, []
+    for c in qf.columns:
+        if not str(c).startswith(QC_PREFIX):
+            continue
+        s = qf[c].astype(str).str.strip()
+        s = s[~s.map(lambda x: x == "" or is_unavailable(x))]
+        if not len(s):
+            continue
+        norm = s.str.lower().str.replace(r"\s+", " ", regex=True)
+        if norm.nunique() > int(cfg["max_distinct_qc_values"]):
+            skipped.append(f"{str(c)[len(QC_PREFIX):]} (free text, {norm.nunique()} distinct values)")
+            continue
+        vc = norm.value_counts().head(top)
+        t = pd.DataFrame({"Value": vc.index, "Calls": vc.values})
+        t["Share of informative"] = t["Calls"] / int(len(norm))
+        out[str(c)[len(QC_PREFIX):]] = (t, int(len(qf) - len(s)))
+    return out, skipped
+
+
+def s12_repeat_callers(w, top=10):
+    """Masked Caller IDs that called more than once (descriptive only)."""
+    ca = w[w["_caller"] != ""]
+    if not len(ca):
+        return pd.DataFrame(columns=["Caller", "Calls", "Publishers"])
+    g = ca.groupby("_caller").agg(Calls=("_one", "sum"), Publishers=("publisher", lambda x: ", ".join(sorted(set(x))[:3])))
+    g = g[g["Calls"] > 1].sort_values("Calls", ascending=False).head(top).reset_index()
+    g["Caller"] = g["_caller"].map(s16_mask_phone)
+    return g[["Caller", "Calls", "Publishers"]]
+
+
+def s12_cov_warning(cur, prev, cfg):
+    """Warning text when QC completion differs a lot between the two windows (that alone can fake a quality change). '' when fine."""
+    if not len(cur) or not len(prev):
+        return ""
+    a, b = float(cur["_qc"].mean()), float(prev["_qc"].mean())
+    if abs(a - b) > float(cfg["qc_cov_diff"]):
+        return (f"QC coverage differs between the two periods ({a * 100:.0f}% now vs {b * 100:.0f}% before). Quality figures are based on different shares of calls, "
+                "so a quality change may come from QC coverage and not from the traffic.")
+    return ""
+
+
+def s12_compare_entities(m, cur, prev, keys, cfg):
+    """Two windows side by side per entity. Changes of rates are in percentage points, only for entities with enough evaluated calls in BOTH windows."""
+    c, p = s12_entity_stats(s12_win(m, cur), keys, cfg), s12_entity_stats(s12_win(m, prev), keys, cfg)
+    if not len(c):
+        return pd.DataFrame(), s12_cov_warning(s12_win(m, cur), s12_win(m, prev), cfg)
+    p2 = p.set_index("Entity") if len(p) else pd.DataFrame()
+    rows = []
+    for _, r in c.iterrows():
+        pr = p2.loc[r["Entity"]] if len(p2) and r["Entity"] in p2.index else None
+        d = {"Entity": r["Entity"], "Calls now": int(r["Calls"]), "Calls before": int(pr["Calls"]) if pr is not None else 0, "Sufficient": bool(r["Sufficient"])}
+        for k, (_x, _n, lab) in S12_RATES.items():
+            d[lab + " now"], d[lab + " n now"] = r[k + "_rate"], int(r[k + "_n"])
+            d[lab + " before"], d[lab + " n before"] = (pr[k + "_rate"] if pr is not None else None), (int(pr[k + "_n"]) if pr is not None else 0)
+            ok = pr is not None and r[k + "_n"] >= cfg["min_qc"] and pr[k + "_n"] >= cfg["min_qc"] and r[k + "_rate"] is not None and pr[k + "_rate"] is not None
+            d[lab + " change (points)"] = round((r[k + "_rate"] - pr[k + "_rate"]) * 100, 1) if ok else None
+        d["Avg score now"], d["Avg score before"] = r["Avg score"], (pr["Avg score"] if pr is not None else None)
+        rows.append(d)
+    return pd.DataFrame(rows), s12_cov_warning(s12_win(m, cur), s12_win(m, prev), cfg)
+
+
+def s12_combinations(w, combo, cfg, metric="spam"):
+    """Combination analysis (publisher x campaign, publisher x buyer, buyer x campaign, publisher x buyer x campaign). Returns (ranked, insufficient)."""
+    stats = s12_entity_stats(w, list(combo), cfg)
+    return s12_rank(stats, metric, cfg, worst=True)
+
+
+S12_COMBOS = {"publisher x campaign": ("publisher", "campaign"), "publisher x buyer": ("publisher", "buyer"), "buyer x campaign": ("buyer", "campaign"),
+              "publisher x buyer x campaign": ("publisher", "buyer", "campaign")}
+
+
+def s12_mix_shift(cur_w, prev_w, a, b, cfg):
+    """Share of each `a` value inside each `b` value, now vs before (e.g. each publisher's share of a buyer's calls). Possible mix changes only; never a cause."""
+    if not len(cur_w) or not len(prev_w):
+        return pd.DataFrame()
+    ct = pd.crosstab(cur_w[b], cur_w[a])
+    pt = pd.crosstab(prev_w[b], prev_w[a])
+    rows = []
+    for bv in ct.index:
+        nb, pb = int(ct.loc[bv].sum()), int(pt.loc[bv].sum()) if bv in pt.index else 0
+        if nb < cfg["min_calls"] or pb < cfg["min_calls"]:
+            continue
+        for av in sorted(set(ct.columns) | set(pt.columns)):
+            now_s = float(ct.loc[bv].get(av, 0)) / nb
+            bef_s = float(pt.loc[bv].get(av, 0)) / pb
+            d = now_s - bef_s
+            rows.append({b: bv, a: av, "Calls in group now": nb, "Share now": now_s, "Calls in group before": pb, "Share before": bef_s, "Change (points)": round(d * 100, 1),
+                         "Note": "possible mix change" if abs(d) >= cfg["mix_delta"] else ""})
+    out = pd.DataFrame(rows)
+    if len(out):
+        out = out.reindex(out["Change (points)"].abs().sort_values(ascending=False).index)
+    return out
+
+
+def _s12_rate_sig(x, n, xb, nb, cfg):
+    if n < cfg["min_calls"] or nb < cfg["min_base_calls"] or n == 0 or nb == 0:
+        return None
+    rate, base = x / n, xb / nb
+    lo, _hi = _s9_wilson(x, n)
+    if rate - base >= cfg["rate_min_delta"] and lo > base:
+        return {"rate": rate, "base": base, "lo": lo, "strength": min(5.0, max(1.0, (rate - base) / cfg["rate_min_delta"]))}
+    return None
+
+
+def _s12_tvd(a, b):
+    ks = set(a.index) | set(b.index)
+    return 0.5 * sum(abs(float(a.get(k, 0)) - float(b.get(k, 0))) for k in ks)
+
+
+def s12_patterns(m, cur, prev, cfg):
+    """Descriptive pattern signals per publisher, each with its own sample-size rule. Wording is always 'unusual compared with the entity's own baseline'."""
+    sigs = []
+    c, p = s12_win(m, cur), s12_win(m, prev)
+    if not len(c):
+        return sigs
+
+    def add(sig, ent, obs, base, n, nb, strength, extra=""):
+        sigs.append({"signal": sig, "entity_type": "publisher", "entity_key": ent, "observed": obs, "baseline": base, "n": int(n), "n_base": int(nb), "strength": float(strength),
+                     "text": f"{ent}: {extra} is {S12_WORDING} ({obs} now vs {base} before; {int(n)} and {int(nb)} evaluated calls).", "disclaimer": S12_DISCLAIMER})
+    for pub, gc in c.groupby("publisher"):
+        gp = p[p["publisher"] == pub]
+        for sig, (xc, nc, lab) in S12_RATES.items():
+            if sig == "poor":
+                continue
+            n, x = int(gc[nc].sum()), int(gc[xc].sum())
+            nb, xb = int(gp[nc].sum()), int(gp[xc].sum())
+            r = _s12_rate_sig(x, n, xb, nb, cfg)
+            if r:
+                add({"short": "short_call_cluster", "spam": "spam_concentration", "fake": "fake_rate_high", "voip": "voip_share_high"}[sig], pub, f"{r['rate'] * 100:.1f}%", f"{r['base'] * 100:.1f}%", n, nb, r["strength"], lab)
+        for col, lab in (("_pc", "Phone Company"), ("_line", "Line Type")):
+            kc, kp = gc[gc[col] != ""][col], gp[gp[col] != ""][col]
+            if len(kc) >= cfg["min_calls"] and len(kp) >= cfg["min_base_calls"]:
+                top = kc.value_counts()
+                v = top.index[0]
+                sc_, sp_ = float(top.iloc[0]) / len(kc), float((kp == v).sum()) / len(kp)
+                if sc_ >= cfg["company_share"] and sc_ - sp_ >= cfg["company_delta"]:
+                    add("company_dominance" if col == "_pc" else "line_type_dominance", pub, f"{sc_ * 100:.0f}% {v}", f"{sp_ * 100:.0f}%", len(kc), len(kp), min(5.0, (sc_ - sp_) / cfg["company_delta"]), f"{lab} '{v}' share")
+        hc, hp = gc[gc["_hang"] != ""]["_hang"], gp[gp["_hang"] != ""]["_hang"]
+        if len(hc) >= cfg["min_calls"] and len(hp) >= cfg["min_base_calls"]:
+            tv = _s12_tvd(hc.value_counts(normalize=True), hp.value_counts(normalize=True))
+            if tv >= cfg["hangup_tvd"]:
+                add("hangup_mix_change", pub, f"mix shifted by {tv * 100:.0f} points", "previous mix", len(hc), len(hp), min(5.0, tv / cfg["hangup_tvd"]), "Hangup By mix (who ended the call)")
+        nc_, np_ = len(gc), len(gp)
+        if np_ > 0 and nc_ >= cfg["vol_ratio"] * np_ and nc_ - np_ >= cfg["vol_min_abs"]:
+            add("volume_spike", pub, f"{nc_} calls", f"{np_} calls", nc_, np_, min(5.0, nc_ / (cfg["vol_ratio"] * np_)), "Call volume")
+        ca = gc[gc["_caller"] != ""]["_caller"].value_counts()
+        burst = ca[ca >= int(cfg["burst_calls"])]
+        if len(gc) >= cfg["min_calls"] and len(burst):
+            ex = ", ".join(s16_mask_phone(k) for k in list(burst.index)[:3])
+            add("caller_burst", pub, f"{len(burst)} number(s) with {int(burst.iloc[0])}+ calls", "none expected", len(gc), len(gp), min(5.0, float(burst.iloc[0]) / cfg["burst_calls"]), f"Repeated Caller IDs (e.g. {ex})")
+    return sigs
+
+
+def s12_persistence(m, cur, prev, cfg, sigs):
+    """How many of the last `persist_windows` equal windows (including the current one) showed the same signal for the same entity."""
+    hits = {(s["signal"], s["entity_key"]): 1 for s in sigs}
+    span = pd.Timestamp(cur[1]) - pd.Timestamp(cur[0])
+    for k in range(1, int(cfg["persist_windows"])):
+        sh = span * k
+        old = s12_patterns(m, (pd.Timestamp(cur[0]) - sh, pd.Timestamp(cur[1]) - sh), (pd.Timestamp(prev[0]) - sh, pd.Timestamp(prev[1]) - sh), cfg)
+        for s in old:
+            key = (s["signal"], s["entity_key"])
+            if key in hits:
+                hits[key] += 1
+    return hits
+
+
+_S12_SIGNAL_LABEL = {"fake_rate_high": ("Fake Number rate", "fake"), "voip_share_high": ("VoIP share", "voip"), "spam_concentration": ("QC spam rate", "spam"),
+                     "short_call_cluster": ("short-call rate", "short"), "company_dominance": ("Phone Company concentration", None), "line_type_dominance": ("Line Type concentration", None),
+                     "hangup_mix_change": ("Hangup By mix", None), "volume_spike": ("call volume", None), "caller_burst": ("repeated Caller IDs", None)}
+
+
+def s12_review_items(m, cur, prev, cfg):
+    """Investigation / review items (no action on Ringba). Priority = evidence strength x calls affected x persistence, with the parts shown.
+    Allowed verbs: Review, Investigate, Compare, Monitor, Collect more QC."""
+    sigs = s12_patterns(m, cur, prev, cfg)
+    pers = s12_persistence(m, cur, prev, cfg, sigs) if sigs else {}
+    items = []
+    for s in sigs:
+        pc = pers.get((s["signal"], s["entity_key"]), 1)
+        lab, rate_key = _S12_SIGNAL_LABEL.get(s["signal"], (s["signal"], None))
+        verb = "Monitor" if s["signal"] == "volume_spike" else ("Investigate" if pc >= 2 else "Review")
+        conf = "high" if pc >= int(cfg["persist_windows"]) and s["n"] >= 3 * cfg["min_calls"] else ("medium" if pc >= 2 else "low")
+        items.append({"rule": "S12-" + s["signal"].upper(), "verb": verb, "entity_type": "publisher", "entity_key": s["entity_key"],
+                      "title": f"{verb} publisher {s['entity_key']}: {lab} is {S12_WORDING}", "observed": s["observed"], "baseline": s["baseline"], "n": s["n"], "n_base": s["n_base"],
+                      "period": f"{pd.Timestamp(cur[0]):%Y-%m-%d %H:%M} to {pd.Timestamp(cur[1]):%Y-%m-%d %H:%M}", "confidence": conf,
+                      "parts": {"strength": round(s["strength"], 2), "calls_affected": s["n"], "persistence": pc}, "priority_score": round(s["strength"] * s["n"] * pc, 1),
+                      "unknown": ["Why it happened", "Whether the calls were valuable (the sheet has no revenue or conversion data)", "Whether the buyer accepted them (no acceptance field)"],
+                      "check": "Sample the calls behind this figure and compare them with the same publisher's earlier traffic.", "metric": S12_METRIC_OF.get(rate_key) if rate_key else None,
+                      "text": s["text"]})
+    cw = s12_win(m, cur)
+    for pub, g in cw.groupby("publisher"):
+        if len(g) >= cfg["min_calls"] and int(g["_qc"].sum()) < cfg["min_qc"]:
+            items.append({"rule": "S12-QC-GAP", "verb": "Collect more QC", "entity_type": "publisher", "entity_key": pub, "title": f"Collect more QC for publisher {pub}: too few completed QC reports to judge quality",
+                          "observed": f"{int(g['_qc'].sum())} QC-completed of {len(g)} calls", "baseline": f"minimum {int(cfg['min_qc'])}", "n": len(g), "n_base": 0,
+                          "period": f"{pd.Timestamp(cur[0]):%Y-%m-%d %H:%M} to {pd.Timestamp(cur[1]):%Y-%m-%d %H:%M}", "confidence": "low", "parts": {"strength": 1.0, "calls_affected": len(g), "persistence": 1},
+                          "priority_score": float(len(g)), "unknown": ["Quality of these calls"], "check": "Run or finish AI QC for this publisher's calls.", "metric": None,
+                          "text": f"{pub}: only {int(g['_qc'].sum())} of {len(g)} calls have a completed QC report."})
+    items.sort(key=lambda x: -x["priority_score"])
+    return items
+
+
+def s12_store_items(store, items, cur, now=None):
+    """Save review items as Step 10 recommendations (idempotent per rule + entity + period)."""
+    n = 0
+    for it in items:
+        ev = {k: it[k] for k in ("observed", "baseline", "n", "n_base", "period", "parts", "unknown", "check", "text", "metric") if k in it}
+        ev["why"] = it["text"]
+        _, created = s10_upsert(store, "rule:step12", it["entity_type"], it["entity_key"], it["rule"], it["title"], ev, confidence=it["confidence"], now=now,
+                                period_key=pd.Timestamp(cur[0]).strftime("%Y-%m-%d"), baseline={"metric": it.get("metric"), "n": it["n"]} if it.get("metric") else None)
+        n += int(created)
+    return n
+
+
+def s12_overview(qf, cols, days=7, cfg=None, as_of=None):
+    """Everything the page / briefing / assistant needs for the default rolling windows, from one call."""
+    cfg = cfg or s12_config()
+    m = s12_prepare(qf, cols)
+    if not len(m):
+        return {"m": m, "cur": None, "prev": None, "network": pd.DataFrame(), "publishers": pd.DataFrame(), "cfg": cfg}
+    cur, prev = s12_windows(m, days, as_of)
+    w = s12_win(m, cur)
+    return {"m": m, "cur": cur, "prev": prev, "network": s12_entity_stats(w, [], cfg), "publishers": s12_entity_stats(w, ["publisher"], cfg), "cfg": cfg,
+            "warning": s12_cov_warning(w, s12_win(m, prev), cfg)}
+
+
+# =====================================================================================================================
+# STEP 13 - Traffic Quality Distribution Review Advisor (RECOMMENDATION-ONLY).
+# The sheet has no buyer acceptance, billable status, revenue, payout, caps, schedules or eligibility rules, so this step cannot recommend moving traffic to a
+# buyer or changing any allocation. It lists REVIEW candidates built only from observed quality, with samples, intervals and what is not known.
+# =====================================================================================================================
+S13_CAPABILITIES = [
+    ("Recommend giving a buyer more or less traffic", ["buyer acceptance / connected flag per call", "buyer-publisher-campaign eligibility rules"], r"accept|connected|eligib"),
+    ("Cap or capacity checks", ["campaign cap", "buyer capacity", "operating schedule"], r"\bcap\b|capacity|schedule|hours of operation"),
+    ("Value-based comparison", ["revenue per call", "payout per call (or per billable call)"], r"revenue|payout|profit|cost|billable"),
+    ("Rejection-reason analysis", ["buyer rejection or disposition reason per call"], r"reject|disposition"),
+]
+
+
+def s13_capabilities(available_columns):
+    """Which advanced capabilities could be enabled. A capability stays OFF unless a matching column exists (and, even then, only a validated rules / field
+    adapter would switch it on - none ships in this build). Returns a table; never fabricates a field."""
+    names = [str(c) for c in available_columns]
+    rules = str(_cfg("ROUTING_RULES", "") or "").strip()
+    rows = []
+    for cap, fields, rx in S13_CAPABILITIES:
+        found = [c for c in names if re.search(rx, c, re.I)]
+        if found:
+            state = "Possible field detected (" + ", ".join(found[:3]) + "), but it is NOT validated and no allocation advice is produced in this build."
+        elif rules:
+            state = "ROUTING_RULES was supplied, but no validated allocation adapter exists in this build, so advice stays off."
+        else:
+            state = "Disabled - missing: " + "; ".join(fields) + "."
+        rows.append({"Capability": cap, "Needs": "; ".join(fields), "State": state, "Enabled": False})
+    return pd.DataFrame(rows)
+
+
+def _s13_ind(rate_row, rate_key):
+    return rate_row[rate_key + "_rate"], rate_row[rate_key + "_n"], rate_row[rate_key + "_lo"], rate_row[rate_key + "_hi"]
+
+
+def s13_candidates(m, cur, prev, cfg):
+    """(candidates, insufficient). A publisher x campaign / publisher x buyer combination is a candidate when an indicator's Wilson LOWER bound is clearly above the
+    same publisher's own previous-window rate or the network's current rate (and at least rate_min_delta above it), with the minimum calls and evaluated calls."""
+    cw, pw = s12_win(m, cur), s12_win(m, prev)
+    out, insuff = [], []
+    if not len(cw):
+        return out, insuff
+    net = s12_entity_stats(cw, [], cfg).iloc[0]
+    pub_prev = s12_entity_stats(pw, ["publisher"], cfg)
+    pub_prev = pub_prev.set_index("publisher") if len(pub_prev) else pd.DataFrame()
+    pub_cur = s12_entity_stats(cw, ["publisher"], cfg).set_index("publisher")
+    for combo_name, keys in (("publisher x campaign", ["publisher", "campaign"]), ("publisher x buyer", ["publisher", "buyer"])):
+        stats = s12_entity_stats(cw, keys, cfg)
+        for _, r in stats.iterrows():
+            if r["Calls"] < cfg["min_calls"]:
+                insuff.append({"Combination": combo_name, "Entity": r["Entity"], "Calls": int(r["Calls"]), "Why": f"fewer than {int(cfg['min_calls'])} calls - Insufficient evidence"})
+                continue
+            flags, evaluated = [], 0
+            for k, (_x, _n, lab) in S12_RATES.items():
+                rate, n, lo, hi = _s13_ind(r, k)
+                if rate is None or n < cfg["min_qc"]:
+                    continue
+                evaluated += 1
+                pub = r["publisher"]
+                refs = []
+                if len(pub_prev) and pub in pub_prev.index and pub_prev.loc[pub, k + "_n"] >= cfg["min_base_calls"] and pub_prev.loc[pub, k + "_rate"] is not None:
+                    refs.append(("the same publisher's previous period", float(pub_prev.loc[pub, k + "_rate"]), int(pub_prev.loc[pub, k + "_n"])))
+                if net[k + "_rate"] is not None and net[k + "_n"] >= cfg["min_base_calls"]:
+                    refs.append(("the network (same period)", float(net[k + "_rate"]), int(net[k + "_n"])))
+                for rname, rrate, rn in refs:
+                    ref_hi = _s9_wilson(int(round(rrate * rn)), int(rn))[1]   # the reference has its own uncertainty: the two intervals must not overlap
+                    if lo > max(rrate, ref_hi if ref_hi == ref_hi else rrate) and rate - rrate >= cfg["rate_min_delta"]:
+                        flags.append({"indicator": lab, "observed": rate, "interval": (lo, hi), "n": int(n), "reference": rname, "reference_rate": rrate, "reference_n": rn})
+                        break
+            if not evaluated:
+                insuff.append({"Combination": combo_name, "Entity": r["Entity"], "Calls": int(r["Calls"]), "Why": f"fewer than {int(cfg['min_qc'])} calls with a known value for any indicator - Insufficient evidence"})
+                continue
+            if flags:
+                cov = r["QC completion"]
+                out.append({"combination": combo_name, "entity": r["Entity"], "publisher": r["publisher"], "calls": int(r["Calls"]), "qc_completion": cov, "flags": flags,
+                            "score": round(sum(min(5.0, (f["observed"] - f["reference_rate"]) / cfg["rate_min_delta"]) for f in flags) * r["Calls"], 1)})
+    out.sort(key=lambda x: -x["score"])
+    return out, insuff
+
+
+def s13_candidate_text(c, cfg, cur, prev):
+    """Plain-language card for one candidate (observed values and expectation kept apart; no impact claim)."""
+    obs = [f"{f['indicator']}: {f['observed'] * 100:.1f}% (95% interval {f['interval'][0] * 100:.1f}-{f['interval'][1] * 100:.1f}%, {f['n']} evaluated calls) "
+           f"vs {f['reference_rate'] * 100:.1f}% for {f['reference']} ({f['reference_n']} calls)" for f in c["flags"]]
+    return {"Proposed review action": f"Review the traffic from {c['entity']} ({c['combination']}); sample its calls and compare them with the same publisher's other traffic.",
+            "Affected entities": c["entity"], "Period": f"{pd.Timestamp(cur[0]):%Y-%m-%d %H:%M} to {pd.Timestamp(cur[1]):%Y-%m-%d %H:%M}",
+            "Baseline": f"{pd.Timestamp(prev[0]):%Y-%m-%d %H:%M} to {pd.Timestamp(prev[1]):%Y-%m-%d %H:%M} (same publisher) and the network in the current period",
+            "Observed": obs, "Sample": f"{c['calls']} calls; QC completion " + ("n/a" if c["qc_completion"] is None else f"{c['qc_completion'] * 100:.0f}%"),
+            "Not known": ["Why the difference exists", "Buyer acceptance or rejection of these calls (no such field)", "Revenue, payout or conversion (no such fields)", "Caps, capacity or eligibility rules"],
+            "Risks and assumptions": ["Small groups can look extreme by chance; the interval is shown for that reason.", "QC may cover only part of the calls.", "A signal here is not proof of misconduct or poor value."],
+            "Approval": "Human approval required before any change. This tool changes nothing.", "Re-evaluate on": (pd.Timestamp(cur[1]) + pd.Timedelta(days=7)).strftime("%Y-%m-%d"),
+            "Type": "Observation - not a cause and no impact estimate"}
+
+
+def s13_buyer_mix(m, cur, cfg):
+    """'Buyer X receives a larger share of weaker-scored traffic than buyer Y' - only where the Wilson intervals of the poor-score rates do not overlap and both
+    buyers have enough scored calls. An observation, not a cause."""
+    cw = s12_win(m, cur)
+    st_ = s12_entity_stats(cw, ["buyer"], cfg)
+    if not len(st_):
+        return pd.DataFrame()
+    ok = st_[(st_["Calls"] >= cfg["min_calls"]) & (st_["poor_n"] >= cfg["min_qc"])]
+    rows = []
+    for _, x in ok.iterrows():
+        for _, y in ok.iterrows():
+            if x["buyer"] != y["buyer"] and x["poor_lo"] > y["poor_hi"]:
+                rows.append({"Buyer (more weak-scored traffic)": x["buyer"], "Poor-score rate": x["poor_rate"], "Scored calls": int(x["poor_n"]), "Compared with buyer": y["buyer"],
+                             "Their rate": y["poor_rate"], "Their scored calls": int(y["poor_n"]), "Type": "observation, not cause"})
+    return pd.DataFrame(rows)
+
+
+def s13_overview(qf, cols, available_columns, days=7, cfg=None):
+    cfg = cfg or s12_config()
+    m = s12_prepare(qf, cols)
+    res = {"capabilities": s13_capabilities(available_columns), "candidates": [], "insufficient": [], "buyer_mix": pd.DataFrame(), "mix_shift": pd.DataFrame(), "cur": None, "prev": None, "m": m, "cfg": cfg}
+    if not len(m):
+        return res
+    cur, prev = s12_windows(m, days)
+    res["cur"], res["prev"] = cur, prev
+    res["candidates"], res["insufficient"] = s13_candidates(m, cur, prev, cfg)
+    res["buyer_mix"] = s13_buyer_mix(m, cur, cfg)
+    ms = s12_mix_shift(s12_win(m, cur), s12_win(m, prev), "publisher", "buyer", cfg)
+    res["mix_shift"] = ms[ms["Note"] != ""] if len(ms) else ms
+    return res
+
+
+# =====================================================================================================================
+# STEP 14 - Daily operations briefing. Built only from the existing engines; every claim carries its record id or calculation, the period and the generation time.
+# Sections whose data does not exist are hidden with a one-line reason. Not included (no data): revenue, margin, billable or conversion changes.
+# Scheduling reality: a Streamlit rerun is not a scheduler. See HEADLESS_AND_SCHEDULING.md - unattended daily delivery needs an external trigger and a headless entry point.
+# =====================================================================================================================
+def _s14_sec(sid, title):
+    return {"id": sid, "title": title, "facts": [], "interpretations": [], "suggestions": [], "hidden": ""}
+
+
+def _pct(v, d=1):
+    return "n/a" if v is None or (isinstance(v, float) and v != v) else f"{v * 100:.{d}f}%"
+
+
+def s14_build(store, qf, cols, now, available_columns=None, tz=None, target_date=None):
+    """Return {generated_at, period, sections:[...], priorities:[...], date}. Python only. `target_date` defaults to yesterday."""
+    now = pd.Timestamp(now)
+    cfg9, cfg12 = s9_config(), s12_config()
+    m = s12_prepare(qf, cols, cfg9)
+    day = pd.Timestamp(target_date).normalize() if target_date is not None else (now.normalize() - pd.Timedelta(days=1))
+    b = {"generated_at": s16_ts(now), "date": now.strftime("%Y-%m-%d"), "sections": [], "priorities": [], "target_day": day.strftime("%Y-%m-%d (%a)"),
+         "not_included": "Revenue, margin, billable and conversion changes are not included: the sheet has no such fields."}
+    if len(m):
+        as_of = m["ts"].max() + pd.Timedelta(seconds=1)
+        win = s9_windows("day", as_of, {**cfg9, "baseline_windows": 1}, target_date=day)
+        cur, prev = win["current"], win["baselines"][0]
+        b["period"] = f"{win['label']} versus the same weekday and hours one week earlier"
+    else:
+        cur = prev = None
+        b["period"] = f"{day:%Y-%m-%d} (no readable calls in the loaded data)"
+    # 1 network status
+    s = _s14_sec("network", "1. Network status")
+    if cur is None or not len(s12_win(m, cur)):
+        s["hidden"] = "No calls in the briefing period; check Step 15 (data freshness)."
+    else:
+        cw, pw = s12_win(m, cur), s12_win(m, prev)
+        a, p = _s12_stats(cw, cfg12), _s12_stats(pw, cfg12)
+        chg = "no calls in the comparison window" if not p["Calls"] else f"{(a['Calls'] - p['Calls']) / p['Calls'] * 100:+.0f}% versus {p['Calls']:,}"
+        s["facts"].append((f"{a['Calls']:,} calls ({chg}).", "calc: calls in window"))
+        s["facts"].append((f"QC completed for {a['QC completed n']:,} calls ({_pct(a['QC completion'], 0)}) now vs {_pct(p['QC completion'], 0)} before.", "calc: QC-completed share"))
+        for k, (_x, _n, lab) in S12_RATES.items():
+            if a[k + "_rate"] is not None:
+                s["facts"].append((f"{lab}: {_pct(a[k + '_rate'])} of {a[k + '_n']:,} evaluated calls (before: {_pct(p[k + '_rate'])} of {p[k + '_n']:,}).", f"calc: {k} rate over known values"))
+        w = s12_cov_warning(cw, pw, cfg12)
+        if w:
+            s["interpretations"].append(w)
+    b["sections"].append(s)
+    # 2 alerts
+    s = _s14_sec("alerts", "2. New and unresolved critical / high alerts")
+    try:
+        al = store.list_alerts(statuses=list(S9_ACTIVE), severities=["critical", "high"], limit=20)
+    except Exception:
+        al = pd.DataFrame()
+    if not len(al):
+        s["facts"].append(("No active critical or high alerts.", "store: alerts"))
+    else:
+        for _, r in al.head(10).iterrows():
+            new = r["detected_at"] >= (now - pd.Timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+            s["facts"].append((f"[{r['severity'].upper()}{' · new in 24 h' if new else ''}] {r['title']} - {r['entity_key']} ({r['status']}, seen {r['occurrences']}x).", f"alert {r['id']}"))
+            b["priorities"].append({"text": f"Look at alert: {r['title']} - {r['entity_key']}", "ref": f"alert {r['id']}", "rank": 1 if r["severity"] == "critical" else 2})
+        s["interpretations"].append(S9_DISCLAIMER)
+    b["sections"].append(s)
+    # 3 entity quality changes
+    s = _s14_sec("changes", "3. Publisher quality changes")
+    if cur is None:
+        s["hidden"] = "No readable calls."
+    else:
+        cmp_, w = s12_compare_entities(m, cur, prev, ["publisher"], cfg12)
+        rows = []
+        if len(cmp_):
+            for _, r in cmp_.iterrows():
+                for k, (_x, _n, lab) in S12_RATES.items():
+                    ch = r.get(lab + " change (points)")
+                    if ch is not None and ch == ch and abs(ch) >= cfg12["rate_min_delta"] * 100:
+                        rows.append((abs(ch), f"{r['Entity']}: {lab} {ch:+.1f} points ({_pct(r[lab + ' before'])} to {_pct(r[lab + ' now'])}; {r[lab + ' n now']} and {r[lab + ' n before']} evaluated calls).", r["Entity"]))
+        rows.sort(reverse=True)
+        for _, t, ent in rows[:6]:
+            s["facts"].append((t, f"calc: publisher compare {ent}"))
+        if not rows:
+            s["facts"].append(("No publisher has a rate change of 5 points or more with enough evaluated calls in both periods.", "calc: publisher compare"))
+        if w:
+            s["interpretations"].append(w)
+    b["sections"].append(s)
+    # 4 patterns
+    s = _s14_sec("patterns", "4. Suspicious-pattern signals and QC concerns")
+    if not len(m):
+        s["hidden"] = "No readable calls."
+    else:
+        c7, p7 = s12_windows(m, 7)
+        sigs = s12_patterns(m, c7, p7, cfg12)
+        for x in sorted(sigs, key=lambda z: -z["strength"] * z["n"])[:6]:
+            s["facts"].append((x["text"], f"calc: pattern {x['signal']}"))
+        if not sigs:
+            s["facts"].append(("No pattern signal passed its sample-size rule over the last 7 days.", "calc: patterns"))
+        else:
+            s["interpretations"].append(S12_DISCLAIMER)
+    b["sections"].append(s)
+    # 5 tasks and approvals
+    s = _s14_sec("work", "5. Overdue tasks and pending approvals")
+    try:
+        od = s11_list(store, now, overdue_only=True, limit=10)
+        for _, r in od.iterrows():
+            s["facts"].append((f"Overdue [{r['severity']}] {r['title']} (due {r['due_at']}, owner {r['owner'] or 'none'}, {r['status']}).", f"task {r['id']}"))
+            b["priorities"].append({"text": f"Overdue task: {r['title']}", "ref": f"task {r['id']}", "rank": 1 if r["severity"] == "critical" else 3})
+        if not len(od):
+            s["facts"].append(("No overdue tasks.", "store: tasks"))
+        pa = s16_list(store, ["Pending Approval"], limit=10)
+        for _, r in pa.iterrows():
+            s["facts"].append((f"Pending approval: {r['action_type']} for {r['target']} (requested {r['created_at']}; expires {r['expires_at']}).", f"approval {r['id']}"))
+            b["priorities"].append({"text": f"Decide pending approval for {r['target']}", "ref": f"approval {r['id']}", "rank": 3})
+        if not len(pa):
+            s["facts"].append(("No pending approvals.", "store: approvals"))
+    except Exception as exc:
+        s["hidden"] = f"Task / approval tables could not be read ({type(exc).__name__})."
+    b["sections"].append(s)
+    # 6 recommendations and outcomes
+    s = _s14_sec("recs", "6. Review recommendations and measured outcomes")
+    try:
+        nr = s10_list(store, ["new"], limit=5)
+        for _, r in nr.iterrows():
+            s["facts"].append((f"New [{r['confidence']}] {r['title']}", f"recommendation {r['id']}"))
+            b["priorities"].append({"text": r["title"], "ref": f"recommendation {r['id']}", "rank": 4})
+        if not len(nr):
+            s["facts"].append(("No new recommendations.", "store: recommendations"))
+        for _, r in s10_list(store, ["accepted"], limit=5).iterrows():
+            o = s10_outcome(store, r["id"], qf, cols, now, cfg=cfg9)
+            if o.get("available"):
+                s["facts"].append((f"Accepted {r['id']} ({r['entity_key']}): {S9_METRICS[o['metric']][0]} {_s9_fmt_val(o['metric'], o['before'])} before vs {_s9_fmt_val(o['metric'], o['after'])} after "
+                                   f"({o['before_n']:.0f} and {o['after_n']:.0f} calls). Observed, not proof of cause.", f"recommendation {r['id']}"))
+            else:
+                s["facts"].append((f"Accepted {r['id']} ({r['entity_key']}): no outcome yet - {o.get('why', 'not measurable')}", f"recommendation {r['id']}"))
+    except Exception as exc:
+        s["hidden"] = f"Recommendation table could not be read ({type(exc).__name__})."
+    b["sections"].append(s)
+    # 7 data health
+    s = _s14_sec("health", "7. Data freshness, QC backlog, sync, provider and e-mail status")
+    try:
+        chk = [c for c in s15_run_checks(qf_or_none(qf), qf, cols, now, store=store, meta=None) if c["status"] in ("warn", "critical")]
+        for c in chk:
+            s["facts"].append((f"[{c['status'].upper()}] {c['name']}: {c['detail']}", "check: Step 15"))
+            b["priorities"].append({"text": f"Data health: {c['name']}", "ref": "check: Step 15", "rank": 2 if c["status"] == "critical" else 4})
+        if not chk:
+            s["facts"].append(("All monitorable data and integration checks are within their limits.", "check: Step 15"))
+        s["interpretations"].append("Not monitorable from this app: Ringba API, transcription jobs, external scheduler.")
+    except Exception as exc:
+        s["hidden"] = f"Health checks could not run ({type(exc).__name__})."
+    b["sections"].append(s)
+    # 8 priorities
+    s = _s14_sec("priorities", "8. Suggested priorities (each tied to a record)")
+    pr = sorted(b["priorities"], key=lambda z: z["rank"])[:8]
+    for i, x in enumerate(pr, 1):
+        s["suggestions"].append((f"{i}. {x['text']}", x["ref"]))
+    if not pr:
+        s["facts"].append(("Nothing needs attention from the monitored data.", "calc: all sections"))
+    b["sections"].append(s)
+    return b
+
+
+def qf_or_none(qf):
+    """The health checks need the raw frame only for the duplicate check; the query frame carries the same columns."""
+    return qf
+
+
+def s14_markdown(b):
+    L = [f"# Daily operations briefing - {b['target_day']}", f"*Generated {b['generated_at']} · period: {b['period']}*", ""]
+    for s in b["sections"]:
+        L.append(f"## {s['title']}")
+        if s["hidden"]:
+            L += [f"_Hidden: {s['hidden']}_", ""]
+            continue
+        if s["facts"]:
+            L.append("**Facts**")
+            L += [f"- {t}  `[{r}]`" for t, r in s["facts"]]
+        if s["interpretations"]:
+            L.append("**Interpretation (possible, not proven)**")
+            L += [f"- {t}" for t in s["interpretations"]]
+        if s["suggestions"]:
+            L.append("**Suggestions**")
+            L += [f"- {t}  `[{r}]`" for t, r in s["suggestions"]]
+        L.append("")
+    L += [f"_{b['not_included']}_", f"_{S16_NOTE}_"]
+    return "\n".join(L)
+
+
+def s14_text(b):
+    """Plain text for e-mail (no markdown, links and Caller IDs already masked by the builders)."""
+    return s16_scrub(re.sub(r"[`*_#]", "", s14_markdown(b)), 20000)
+
+
+def s14_save(store, b, now=None):
+    """Store the briefing. One per calendar day (idempotent): returns (id, created). An existing briefing is not overwritten."""
+    idem = s16_idem("briefing", b["date"])
+    now_s = s16_ts(now)
+
+    def fn(c):
+        r = c.execute("SELECT id FROM briefings WHERE idem = ?", (idem,)).fetchone()
+        if r:
+            return r["id"], False
+        bid = s16_id("B", idem)
+        c.execute("INSERT INTO briefings(id, idem, ts, period, content) VALUES (?,?,?,?,?)", (bid, idem, now_s, b["period"], json.dumps(b, default=str)))
+        s16_audit(c, now_s, "system", False, "briefing_saved", bid, b["period"])
+        return bid, True
+    return store._tx(fn)
+
+
+def s14_get(store, date_str=None):
+    r = store._q("SELECT id, ts, period, content FROM briefings " + ("WHERE idem = ?" if date_str else "ORDER BY ts DESC") + " LIMIT 1", ((s16_idem("briefing", date_str),) if date_str else ()))
+    if not r:
+        return None
+    d = r[0]
+    d["briefing"] = json.loads(d["content"])
+    return d
+
+
+def s14_send(store, bid, b, now, mailer=None, ec=None):
+    """E-mail the briefing through the Step 9 sender. Idempotent per (briefing date, recipient, delivery type): a repeat press never re-sends; a failed send is retried
+    only when pressed again, at most `max_attempts` times. Returns {'sent', 'skipped', 'failed', 'reason'}."""
+    ec = ec or s9_email_config()
+    out = {"sent": 0, "skipped": 0, "failed": 0, "reason": ""}
+    probs = s9_email_problems(ec)
+    if probs:
+        out["reason"] = probs[0]
+        return out
+    now_s = s16_ts(now)
+    todo = []
+
+    def prep(c):
+        for rcp in ec["to"]:
+            idem = s16_idem("briefing_mail", b["date"], rcp.lower(), "email")
+            r = c.execute("SELECT id, status, attempts FROM briefing_deliveries WHERE idem = ?", (idem,)).fetchone()
+            if r and r["status"] == "sent":
+                out["skipped"] += 1
+            elif r and r["attempts"] >= ec["max_attempts"]:
+                out["skipped"] += 1
+                out["reason"] = "A previous delivery attempt limit was reached for at least one recipient."
+            else:
+                if not r:
+                    c.execute("INSERT INTO briefing_deliveries(idem, briefing_id, recipient, kind, status, attempts, ts) VALUES (?,?,?,?,?,?,?)", (idem, bid, rcp, "email", "pending", 0, now_s))
+                todo.append((idem, rcp))
+    store._tx(prep)
+    if not todo:
+        return out
+    try:
+        (mailer or s9_smtp_send)(ec, f"[Ringba briefing] {b['target_day']}", s14_text(b))
+        ok, err = "sent", ""
+    except Exception as exc:
+        ok, err = "failed", s9_scrub(type(exc).__name__, ec)
+
+    def fin(c):
+        for idem, _rcp in todo:
+            c.execute("UPDATE briefing_deliveries SET status=?, attempts=attempts+1, ts=?, error=? WHERE idem=?", (ok, now_s, err, idem))
+        s16_audit(c, now_s, "system", False, "briefing_email_" + ok, bid, f"{len(todo)} recipient(s)")
+    store._tx(fin)
+    out["sent" if ok == "sent" else "failed"] += len(todo)
+    return out
+
+
+# =====================================================================================================================
+# STEP 16 - Governed operations: permissions, approvals, one execution gateway, hash-chained audit.
+# Facts first: there is NO real authentication, NO write-capable Ringba integration and NO verified Ringba blocking endpoint in this app. Therefore the only
+# executable action types are a labelled DRY RUN and "create task". S16_REAL_ADAPTERS is intentionally empty; a future real adapter must be added there, behind this
+# gateway, after real user login and a verified Ringba endpoint exist.
+# =====================================================================================================================
+S16_STATUSES = ("Draft", "Pending Approval", "Approved", "Rejected", "Expired", "Executing", "Completed", "Failed", "Cancelled", "Reconciliation Required")
+S16_TRANSITIONS = {
+    "Draft": ("Pending Approval", "Cancelled"),
+    "Pending Approval": ("Approved", "Rejected", "Expired", "Cancelled"),
+    "Approved": ("Executing", "Expired", "Cancelled"),
+    "Executing": ("Completed", "Failed", "Reconciliation Required"),
+    "Reconciliation Required": ("Completed", "Failed", "Cancelled"),
+    "Failed": ("Cancelled",), "Rejected": (), "Expired": (), "Completed": (), "Cancelled": (),
+}
+S16_ACTIONS = {
+    "dry_run_review": {"label": "Dry run: review an entity", "adapter": "dry", "recovery": "Nothing is changed, so nothing needs recovery."},
+    "create_task": {"label": "Create an operations task", "adapter": "task", "recovery": "Reversible: cancel the task."},
+    "publisher_block_review": {"label": "Dry run: publisher block REVIEW (design only, nothing is blocked)", "adapter": "dry", "guard": "block", "recovery": "Nothing is changed, so nothing needs recovery."},
+}
+S16_REAL_ADAPTERS = {}          # intentionally empty: no verified, write-capable Ringba endpoint exists
+S16_WEAK_SIGNALS = {"voip_share_high", "fake_rate_high", "poor_score"}
+S16_PRECONDITION_OPS = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, "<": lambda a, b: a < b}
+
+
+def s16_block_guard(target, evidence):
+    """A publisher-wide proposal needs repeated evidence across SEPARATE windows and more than one kind of signal; a single VoIP / Fake Number / low-score signal
+    can never trigger it; an allow-listed publisher is never proposed. Returns (ok, reason)."""
+    et, ek = str(target.get("entity_type", "")), str(target.get("entity_key", ""))
+    allow = {x.strip().lower() for x in str(_cfg("PUBLISHER_ALLOWLIST", "") or "").split(",") if x.strip()}
+    if ek.lower() in allow:
+        return False, f"'{ek}' is on the allow-list (PUBLISHER_ALLOWLIST); it is never proposed."
+    if et != "publisher":
+        return True, "ok"
+    sig = [s for s in (evidence or {}).get("signals", []) if isinstance(s, dict) and s.get("type") and s.get("window")]
+    kinds, wins = {s["type"] for s in sig}, {str(s["window"]) for s in sig}
+    if len(wins) < 2:
+        return False, "A publisher-wide proposal needs the signal to repeat in at least 2 separate windows."
+    if len(kinds) < 2:
+        return False, "A publisher-wide proposal needs at least 2 different kinds of signal; a single signal is never enough."
+    if kinds <= S16_WEAK_SIGNALS:
+        return False, "VoIP, Fake Number and low-score signals alone can never justify a publisher-wide proposal."
+    return True, "ok"
+
+
+def s16_request(store, action_type, target, reason, ident, evidence=None, preconditions=None, expected="", risks="", expires_h=48, now=None, draft=False):
+    """Create an approval request (Pending Approval, or Draft). Idempotent: the same action + target + reason on the same day returns the existing open request.
+    Returns (approval_id, 'created' | 'existing'). Raises ValueError / PermissionError with a plain reason when refused."""
+    s16_require("request_action", ident)
+    if action_type not in S16_ACTIONS:
+        raise ValueError("Unknown action type. Only: " + ", ".join(S16_ACTIONS))
+    target = {"entity_type": str((target or {}).get("entity_type", "")), "entity_key": s16_scrub((target or {}).get("entity_key", ""), 200)}
+    if not str(reason or "").strip():
+        raise ValueError("A reason is required.")
+    if S16_ACTIONS[action_type].get("guard") == "block":
+        ok, why = s16_block_guard(target, evidence)
+        if not ok:
+            raise ValueError("Refused: " + why)
+        if not preconditions:
+            raise ValueError("Refused: a block-review proposal needs a precondition that is re-checked against current data before it can run.")
+    now_s = s16_ts(now)
+    idem = s16_idem("approval", action_type, target["entity_type"], target["entity_key"], str(reason).strip().lower(), now_s[:10])
+    exp = (pd.Timestamp(now_s) + pd.Timedelta(hours=float(max(1, min(expires_h, 24 * 14))))).strftime("%Y-%m-%d %H:%M:%S")
+
+    def fn(c):
+        r = c.execute("SELECT id FROM approvals WHERE substr(idem, 1, 24) = ? AND status IN ('Draft','Pending Approval','Approved')", (idem,)).fetchone()
+        if r:
+            return r["id"], "existing"
+        aid = s16_id("P", idem)
+        status = "Draft" if draft else "Pending Approval"
+        ref = s16_audit(c, now_s, ident["label"], ident["verified"], "approval_requested", aid, f"{action_type} / {target['entity_key']}: {reason}")
+        c.execute("""INSERT INTO approvals(id, idem, action_type, target, scope, reason, evidence, preconditions, expected, risks, requested_by, requested_verified, status, created_at, expires_at,
+                     execution_status, audit_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (aid, idem + "-" + aid, action_type, target["entity_key"], json.dumps(target), s16_scrub(reason, 600), s16_json(evidence or {}), json.dumps(preconditions or {}),
+                   s16_scrub(expected, 400), s16_scrub(risks, 400), ident["label"], int(ident["verified"]), status, now_s, exp, "not_executed", ref))
+        return aid, "created"
+    return store._tx(fn)
+
+
+def s16_get(store, aid):
+    r = store._q("SELECT * FROM approvals WHERE id = ?", (str(aid),))
+    if not r:
+        return None
+    d = r[0]
+    for k in ("evidence", "preconditions", "scope"):
+        try:
+            d[k] = json.loads(d[k]) if d.get(k) else {}
+        except Exception:
+            d[k] = {}
+    return d
+
+
+def s16_list(store, statuses=None, limit=100):
+    where, args = "", []
+    sts = [s for s in (statuses or []) if s in S16_STATUSES]
+    if sts:
+        where = " WHERE status IN (" + ",".join("?" * len(sts)) + ")"
+        args = sts
+    return pd.DataFrame(store._q("SELECT id, status, action_type, target, reason, requested_by, requested_verified, decided_by, decided_at, created_at, expires_at, execution_status, result "
+                                 "FROM approvals" + where + " ORDER BY created_at DESC LIMIT ?", tuple(args) + (int(max(1, min(limit, 1000))),)))
+
+
+def _s16_set(c, aid, frm, to, now_s, ident, action, detail="", extra=None):
+    if to not in S16_TRANSITIONS.get(frm, ()):
+        raise ValueError(f"{frm} -> {to} is not an allowed transition")
+    sets, args = ["status=?"], [to]
+    for k, v in (extra or {}).items():
+        sets.append(f"{k}=?")
+        args.append(v)
+    c.execute("UPDATE approvals SET " + ", ".join(sets) + " WHERE id=? AND status=?", tuple(args) + (aid, frm))
+    s16_audit(c, now_s, ident["label"], ident["verified"], action, aid, detail)
+
+
+def s16_expire(store, now):
+    """Mark overdue Draft / Pending / Approved requests Expired (history stays). Returns the number expired."""
+    now_s = s16_ts(now)
+    sysid = {"label": "system", "verified": False}
+
+    def fn(c):
+        n = 0
+        for r in c.execute("SELECT id, status FROM approvals WHERE status IN ('Pending Approval','Approved') AND expires_at < ?", (now_s,)).fetchall():
+            _s16_set(c, r["id"], r["status"], "Expired", now_s, sysid, "approval_expired", "expiry time passed")
+            n += 1
+        return n
+    return store._tx(fn)
+
+
+def s16_decide(store, aid, approve, ident, note="", now=None):
+    """Approve or reject a Pending request. Needs the operator level. Where BOTH identities are verified (Streamlit viewer login) the requester cannot approve their own
+    request; with typed labels that separation of duties cannot be enforced and the record says so. Returns (ok, message)."""
+    try:
+        s16_require("approve_action", ident)
+    except PermissionError as exc:
+        return False, str(exc)
+    now_s = s16_ts(now)
+
+    def fn(c):
+        r = c.execute("SELECT status, expires_at, requested_by, requested_verified FROM approvals WHERE id = ?", (str(aid),)).fetchone()
+        if not r:
+            return False, "Unknown request."
+        if r["status"] != "Pending Approval":
+            return False, f"Only a Pending Approval request can be decided (this one is {r['status']})."
+        if r["expires_at"] < now_s:
+            _s16_set(c, str(aid), "Pending Approval", "Expired", now_s, {"label": "system", "verified": False}, "approval_expired", "expired before a decision")
+            return False, "This request has expired."
+        if r["requested_verified"] and ident["verified"] and r["requested_by"].lower() == ident["label"].lower():
+            return False, "Separation of duties: the person who requested an action cannot approve it."
+        extra = {"decided_by": ident["label"], "decided_verified": int(ident["verified"]), "decided_at": now_s, "decision_note": s16_scrub(note, 400)}
+        _s16_set(c, str(aid), "Pending Approval", "Approved" if approve else "Rejected", now_s, ident, "approval_approved" if approve else "approval_rejected",
+                 note + ("" if ident["verified"] and r["requested_verified"] else " [identity unverified: separation of duties not enforced]"), extra)
+        return True, ("Approved. An approved dry run still changes nothing." if approve else "Rejected.")
+    return store._tx(fn)
+
+
+def s16_cancel(store, aid, ident, now=None):
+    try:
+        s16_require("request_action", ident)
+    except PermissionError as exc:
+        return False, str(exc)
+    now_s = s16_ts(now)
+
+    def fn(c):
+        r = c.execute("SELECT status FROM approvals WHERE id = ?", (str(aid),)).fetchone()
+        if not r:
+            return False, "Unknown request."
+        try:
+            _s16_set(c, str(aid), r["status"], "Cancelled", now_s, ident, "approval_cancelled")
+        except ValueError as exc:
+            return False, str(exc)
+        return True, "Cancelled."
+    return store._tx(fn)
+
+
+def _s16_precondition(pre, qf, cols):
+    """Re-check a stored precondition against CURRENT data. {'metric','entity_type','entity_key','operator','threshold','window_days','min_n'}. Returns (ok, text)."""
+    if not pre:
+        return True, "no precondition stored"
+    try:
+        metric, et, ek = pre["metric"], pre.get("entity_type", "network"), pre.get("entity_key", "")
+        op, thr, days, minn = pre.get("operator", ">="), float(pre["threshold"]), int(pre.get("window_days", 7)), float(pre.get("min_n", 20))
+        if metric not in S9_METRICS or op not in S16_PRECONDITION_OPS or et not in ("network", "publisher", "buyer", "campaign"):
+            return False, "the stored precondition is not valid"
+        m = s9_prepare(qf, cols, s9_config())
+        if not len(m):
+            return False, "no readable data to re-check"
+        if et != "network":
+            m = m[m[et].str.lower() == str(ek).lower()]
+        end = m["ts"].max() + pd.Timedelta(seconds=1) if len(m) else pd.Timestamp.now()
+        v = _s9_value(_s9_agg(m, end - pd.Timedelta(days=days), end, []).iloc[0], metric)
+        if v[1] < minn or v[0] != v[0]:
+            return False, f"too little current data to confirm ({v[1]:.0f} evaluated calls, minimum {minn:.0f})"
+        ok = S16_PRECONDITION_OPS[op](float(v[0]), thr)
+        return ok, f"current {S9_METRICS[metric][0]} is {_s9_fmt_val(metric, v[0])} over {v[1]:.0f} calls; required {op} {thr:g}: " + ("met" if ok else "NOT met")
+    except Exception as exc:
+        return False, f"precondition could not be evaluated ({type(exc).__name__})"
+
+
+def s16_execute(store, aid, ident, qf, cols, now=None):
+    """THE single execution gateway. Order: permission -> approval exists -> duplicate -> status Approved -> expiry -> precondition re-validation against current data
+    -> scope exists -> adapter supported -> execute -> record attempt and outcome. Every refusal is recorded. Returns {'ok','status','message','steps'}."""
+    now_s = s16_ts(now)
+    steps = []
+
+    def attempt(outcome, detail):
+        store._tx(lambda c: (c.execute("INSERT INTO action_attempts(approval_id, ts, actor, outcome, detail) VALUES (?,?,?,?,?)", (str(aid), now_s, s16_scrub(ident["label"], 80), outcome, s16_scrub(detail, 400))),
+                             s16_audit(c, now_s, ident["label"], ident["verified"], "execute_" + outcome, aid, detail)))
+
+    def refuse(outcome, msg, status=None):
+        attempt(outcome, msg)
+        return {"ok": False, "status": status, "message": msg, "steps": steps}
+    try:
+        s16_require("execute_action", ident)
+    except PermissionError as exc:
+        return refuse("refused_permission", str(exc))
+    steps.append("permission: operator level")
+    a = s16_get(store, aid)
+    if not a:
+        return {"ok": False, "status": None, "message": "Unknown request.", "steps": steps}
+    if a["status"] == "Completed":
+        return refuse("duplicate_ignored", "Duplicate ignored: this request was already executed.", a["status"])
+    if a["status"] != "Approved":
+        return refuse("refused_status", f"Only an Approved request can run (this one is {a['status']}).", a["status"])
+    steps.append("status: Approved")
+    if a["expires_at"] < now_s:
+        store._tx(lambda c: _s16_set(c, str(aid), "Approved", "Expired", now_s, {"label": "system", "verified": False}, "approval_expired", "expired before execution"))
+        return refuse("refused_expired", "This approval has expired and cannot run.", "Expired")
+    steps.append("expiry: still valid")
+    spec = S16_ACTIONS.get(a["action_type"])
+    if not spec:
+        return refuse("refused_unknown_action", "Unknown action type.", a["status"])
+    ok, txt = _s16_precondition(a["preconditions"], qf, cols)
+    if not ok:
+        steps.append("precondition: " + txt)
+        def fail(c):
+            _s16_set(c, str(aid), "Approved", "Executing", now_s, ident, "execute_started", "revalidating")
+            _s16_set(c, str(aid), "Executing", "Failed", now_s, ident, "execute_failed_precondition", txt, {"execution_status": "precondition_failed", "result": s16_scrub(txt, 400)})
+        store._tx(fail)
+        attempt("precondition_failed", txt)
+        return {"ok": False, "status": "Failed", "message": "The precondition no longer holds against current data: " + txt, "steps": steps}
+    steps.append("precondition: " + txt)
+    et, ek = a["scope"].get("entity_type", ""), a["scope"].get("entity_key", "")
+    if et in ("publisher", "buyer", "campaign") and cols.get(et):
+        names = set(qf[cols[et]].astype(str).str.strip().str.lower())
+        if str(ek).strip().lower() not in names:
+            return refuse("refused_scope", f"The target {et} '{ek}' does not exist in the current data.", a["status"])
+    steps.append("scope: target exists")
+    if spec["adapter"] not in ("dry", "task") and spec["adapter"] not in S16_REAL_ADAPTERS:
+        return refuse("refused_adapter", "The real integration does not support this action in this build.", a["status"])
+    steps.append("adapter: supported")
+    store._tx(lambda c: _s16_set(c, str(aid), "Approved", "Executing", now_s, ident, "execute_started", a["action_type"], {"execution_status": "executing"}))
+    try:
+        if spec["adapter"] == "dry":
+            result = f"{S16_DRY}. Would have: {a['action_type'].replace('_', ' ')} for {a['scope'].get('entity_type')} '{ek}'. Reason on file: {a['reason']}"
+        elif spec["adapter"] == "task":
+            tid, how = s11_create(store, f"Approved: {a['reason'][:120]}", ident, description=a["reason"], type_="review", source="approval", source_id=aid, purpose="approved-task",
+                                  publisher=ek if et == "publisher" else "", buyer=ek if et == "buyer" else "", campaign=ek if et == "campaign" else "", severity="medium", evidence={"approval_id": aid}, now=now)
+            result = f"Task {tid} ({how}). No change was made in Ringba."
+        else:
+            result = S16_REAL_ADAPTERS[spec["adapter"]](a)
+    except Exception as exc:
+        def uncertain(c):
+            _s16_set(c, str(aid), "Executing", "Reconciliation Required", now_s, ident, "execute_uncertain", type(exc).__name__, {"execution_status": "uncertain", "result": "The outcome is uncertain; check manually."})
+        store._tx(uncertain)
+        attempt("uncertain", type(exc).__name__)
+        return {"ok": False, "status": "Reconciliation Required", "message": "The result is uncertain; the request now needs manual reconciliation.", "steps": steps}
+    store._tx(lambda c: _s16_set(c, str(aid), "Executing", "Completed", now_s, ident, "execute_completed", result, {"execution_status": "completed", "result": s16_scrub(result, 500)}))
+    attempt("completed", result)
+    return {"ok": True, "status": "Completed", "message": result, "steps": steps}
+
+
+def s16_reconcile_stale(store, now, minutes=15):
+    """Requests stuck in Executing (a crash mid-run) become 'Reconciliation Required'; nothing is retried automatically. Returns the count."""
+    now_s = s16_ts(now)
+    limit = (pd.Timestamp(now_s) - pd.Timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def fn(c):
+        n = 0
+        for r in c.execute("SELECT a.id FROM approvals a WHERE a.status='Executing' AND COALESCE((SELECT MAX(ts) FROM action_attempts t WHERE t.approval_id=a.id), a.created_at) < ?", (limit,)).fetchall():
+            _s16_set(c, r["id"], "Executing", "Reconciliation Required", now_s, {"label": "system", "verified": False}, "execute_uncertain", "stuck in Executing", {"execution_status": "uncertain"})
+            n += 1
+        return n
+    return store._tx(fn)
+
+
+def s16_proposal_preview(entity_type, entity_key, reason=""):
+    """Used by the assistant: describes a dry-run review proposal WITHOUT storing it. Block / pause / route wording is refused elsewhere."""
+    return {"action_type": "dry_run_review", "target": {"entity_type": entity_type, "entity_key": entity_key}, "reason": reason or f"Review {entity_type} {entity_key}",
+            "note": f"A dry-run proposal records a review request and its evidence, and {S16_DRY}. Create it in the Governance tab so a person can approve it."}
+
+
+# =====================================================================================================================
+# UI for Steps 10-16 (one section on the page, seven tabs). Each tab is isolated: an error in one never takes the others (or the dashboard) down.
+# =====================================================================================================================
+_S15_ICON = {"ok": "🟢", "warn": "🟡", "critical": "🔴", "info": "⚪"}
+
+
+def _s16_pct_cols(df, cols_):
+    d = df.copy()
+    for c in cols_:
+        if c in d.columns:
+            d[c] = d[c].map(lambda v: None if v is None or (isinstance(v, float) and v != v) else round(float(v) * 100, 1))
+    return d
+
+
+def _s16_rate_table(stats, keys=("short", "poor", "spam", "fake", "voip")):
+    """Readable table: every percentage next to its denominator (evaluated calls) and 95 % interval."""
+    rows = []
+    for _, r in stats.iterrows():
+        d = {"Entity": r["Entity"], "Calls": int(r["Calls"]), "Enough calls": "yes" if r["Sufficient"] else "NO (insufficient evidence)", "QC completion %": None if r["QC completion"] is None else round(r["QC completion"] * 100, 0),
+             "Median duration (s)": None if r["Median duration (s)"] is None else round(r["Median duration (s)"], 0), "Avg score": None if r["Avg score"] is None else round(r["Avg score"], 1), "Scored calls": int(r["Scored n"])}
+        for k in keys:
+            lab = S12_RATES[k][2]
+            rate = r[k + "_rate"]
+            d[lab + " %"] = None if rate is None else round(rate * 100, 1)
+            d[lab + " (evaluated calls)"] = int(r[k + "_n"])
+            d[lab + " 95% interval"] = "" if r[k + "_lo"] is None else f"{r[k + '_lo'] * 100:.1f}-{r[k + '_hi'] * 100:.1f}"
+        d["Repeat-caller %"] = None if r["Repeat caller share"] is None else round(r["Repeat caller share"] * 100, 1)
+        rows.append(d)
+    return pd.DataFrame(rows)
+
+
+def _s16_tab_health(ctx):
+    st_, qf, cols, store, now, ident, df = st, ctx["qf"], ctx["cols"], ctx["store"], ctx["now"], ctx["ident"], ctx["df"]
+    cfg = s15_config()
+    st.caption("Monitors only what really exists in this app. Reads only; nothing is changed. Secrets, links and call text are never shown.")
+    c1 = st.columns(3)
+    run = c1[0].button("Run checks now", key="s15_run")
+    probe_btn = c1[1].button("Re-check Google Sheet access (read-only)", key="s15_probe")
+    if run or probe_btn or "s15_last" not in st.session_state:
+        probe = None
+        if probe_btn:
+            if not s16_allowed("run_health_check", ident):
+                st.error("Re-checking needs the operator level (action password).")
+            else:
+                probe = s15_read_probe(_s9_open_spreadsheet)
+        checks = s15_run_checks(df, qf, cols, now, store=store, meta=ctx["meta"], cfg=cfg, probe=probe)
+        st.session_state["s15_last"] = checks
+        if (run or probe_btn) and s16_allowed("run_health_check", ident):
+            try:
+                summ = s15_persist(store, checks, now, records_read=len(qf))
+                st.caption(f"Saved: {summ['incidents_opened']} new incident(s), {summ['incidents_updated']} updated, {summ['recovered']} recovered, {summ['alerts']} alert(s) raised.")
+            except Exception as exc:
+                st.warning(f"The results could not be saved ({type(exc).__name__}).")
+    checks = st.session_state.get("s15_last", [])
+    real = [c for c in checks if not c["name"].startswith("Not monitorable")]
+    st.dataframe(pd.DataFrame([{"": _S15_ICON.get(c["status"], ""), "Check": c["name"], "Status": c["status"], "Detail": c["detail"]} for c in real]), hide_index=True, width="stretch")
+    with st.expander("Not monitorable from this app (shown honestly instead of a green light)"):
+        for c in checks:
+            if c["name"].startswith("Not monitorable"):
+                st.markdown(f"- **{c['name'][len('Not monitorable: '):]}** - {c['detail']}")
+    bd = s15_by_day(qf, cols)
+    if len(bd):
+        st.markdown("**By day (last 14 days): QC completion and blank rates**")
+        st.dataframe(bd, hide_index=True, width="stretch")
+        if "QC done %" in bd.columns:
+            st.line_chart(bd.set_index("Day")[["QC done %"]])
+    inc = s15_incidents(store, "open")
+    st.markdown(f"**Open incidents: {len(inc)}**")
+    if len(inc):
+        st.dataframe(inc, hide_index=True, width="stretch")
+        pick = st.selectbox("Create a task from incident", ["(choose)"] + list(inc["id"]), key="s15_inc_pick")
+        if pick != "(choose)" and st.button("Create task", key="s15_inc_task"):
+            try:
+                tid, how = s11_from_incident(store, pick, ident, now)
+                st.success(f"Task {tid} ({how}).")
+            except Exception as exc:
+                st.error(str(exc)[:200])
+    rc = s15_recent_checks(store, 60)
+    if len(rc):
+        with st.expander("Recent check history"):
+            st.dataframe(rc, hide_index=True, width="stretch")
+
+
+def _s16_tab_tasks(ctx):
+    store, now, ident = ctx["store"], ctx["now"], ctx["ident"]
+    cnt = s11_counts(store, now)
+    m = st.columns(4)
+    m[0].metric("Open tasks", cnt["open_total"])
+    m[1].metric("Overdue", cnt["overdue"])
+    m[2].metric("Completed", cnt["by_status"].get("Completed", 0))
+    m[3].metric("Cancelled", cnt["by_status"].get("Cancelled", 0))
+    st.caption(f"Acting as **{ident['label']}** - {ident['via']}. {ident['gate']}. A task records work; it never blocks or changes anything in Ringba.")
+    with st.expander("Create a task"):
+        t = st.text_input("Title", key="s11_title")
+        sev = st.selectbox("Severity", ["medium", "high", "critical", "low"], key="s11_sev")
+        own = st.text_input("Owner (free text)", key="s11_owner")
+        desc = st.text_input("Description", key="s11_desc")
+        if st.button("Create task", key="s11_create"):
+            try:
+                tid, how = s11_create(store, t, ident, description=desc, source="manual", source_id=s16_id("m"), severity=sev, owner=own, now=now)
+                st.success(f"Task {tid} created.")
+            except Exception as exc:
+                st.error(str(exc)[:200])
+        al = store.list_alerts(statuses=list(S9_ACTIVE), limit=50)
+        if len(al):
+            opts = {f"{r['severity']} · {r['title']} · {r['entity_key']} · {r['id']}": r["id"] for _, r in al.iterrows()}
+            ap = st.selectbox("…or create from an alert", ["(choose)"] + list(opts), key="s11_alert")
+            if ap != "(choose)" and st.button("Create from alert", key="s11_from_alert"):
+                try:
+                    tid, how = s11_from_alert(store, opts[ap], ident, now)
+                    st.success(f"Task {tid} ({how}).")
+                except Exception as exc:
+                    st.error(str(exc)[:200])
+    f = st.columns(3)
+    sts = f[0].multiselect("Status", list(S11_STATUSES), default=[s for s in S11_STATUSES if s not in S11_CLOSED], key="s11_f_status")
+    own_f = f[1].text_input("Owner filter", key="s11_f_owner")
+    od = f[2].checkbox("Overdue only", key="s11_f_od")
+    page = int(st.number_input("Page", min_value=1, max_value=500, value=1, step=1, key="s11_page"))
+    size = s11_config()["page_size"]
+    df = s11_list(store, now, statuses=sts, owner=own_f or None, overdue_only=od, limit=size, offset=(page - 1) * size)
+    st.dataframe(df, hide_index=True, width="stretch")
+    if len(df):
+        tid = st.selectbox("Task details", list(df["id"]), key="s11_pick")
+        t = s11_get(store, tid)
+        if t:
+            st.write(f"**{t['title']}** · {t['status']} · priority {t['priority']} · due {t['due_at']} · owner {t['owner'] or '(none)'}")
+            st.caption(f"Created by {t['created_by']} ({'verified' if t['identity_verified'] else 'unverified'} identity) · source {t['source']} {t['source_id']}")
+            st.write(t["description"])
+            if t["evidence"]:
+                st.json(t["evidence"])
+            st.dataframe(s11_events(store, tid), hide_index=True, width="stretch")
+            c = st.columns(3)
+            to = c[0].selectbox("Move to", list(S11_TRANSITIONS.get(t["status"], ())) or ["(none)"], key="s11_to")
+            res = c[1].text_input("Result (needed to complete)", key="s11_res")
+            if c[2].button("Apply", key="s11_apply") and to != "(none)":
+                ok, msg = s11_transition(store, tid, to, ident, result=res, now=now)
+                _s9_say(ok, msg)
+            o = st.columns(2)
+            new_owner = o[0].text_input("Assign to", key="s11_assign")
+            if o[1].button("Assign", key="s11_assign_go"):
+                ok, msg = s11_update(store, tid, ident, owner=new_owner, now=now)
+                _s9_say(ok, msg)
+    if st.button("Send escalation e-mail for overdue / critical tasks", key="s11_esc"):
+        r = s11_escalate(store, now, ident)
+        st.info(f"{r['candidates']} candidate(s); sent {r['sent']}, failed {r['failed']}, skipped {r['skipped']}. {r['reason']}")
+
+
+def _s16_tab_quality(ctx):
+    qf, cols, store, now, ident = ctx["qf"], ctx["cols"], ctx["store"], ctx["now"], ctx["ident"]
+    cfg = s12_config()
+    st.caption("Call volume and call QUALITY only. The sheet has no revenue, payout, billable, conversion or buyer-acceptance field, so none is shown. "
+               "Every percentage is based on calls where the value is known, and the number of those calls is shown next to it.")
+    days = int(st.selectbox("Window (days, compared with the equal window before it)", [1, 3, 7, 14, 30], index=2, key="s12_days"))
+    ov = s12_overview(qf, cols, days, cfg)
+    m = ov["m"]
+    if ov["cur"] is None or not len(ov["network"]):
+        st.info("No calls with a readable date in this window.")
+        return
+    cur, prev = ov["cur"], ov["prev"]
+    n = ov["network"].iloc[0]
+    k = st.columns(5)
+    k[0].metric("Calls", int(n["Calls"]))
+    k[1].metric("QC completion", _pct(n["QC completion"], 0))
+    k[2].metric("Median duration", "n/a" if n["Median duration (s)"] is None else f"{n['Median duration (s)']:.0f} s")
+    k[3].metric("Avg score", "n/a" if n["Avg score"] is None else f"{n['Avg score']:.1f}", f"{int(n['Scored n'])} scored")
+    k[4].metric("Repeat callers", _pct(n["Repeat caller share"]), f"{int(n['Caller known n'])} with Caller ID")
+    st.caption(f"Window: {pd.Timestamp(cur[0]):%Y-%m-%d %H:%M} to {pd.Timestamp(cur[1]):%Y-%m-%d %H:%M}; compared with {pd.Timestamp(prev[0]):%Y-%m-%d %H:%M} to {pd.Timestamp(prev[1]):%Y-%m-%d %H:%M}.")
+    if ov.get("warning"):
+        st.warning(ov["warning"])
+    st.markdown("**Entity leaderboard (ranked by the confidence interval, not the raw rate; small groups are listed apart)**")
+    c = st.columns(3)
+    level = c[0].selectbox("Level", ["publisher", "buyer", "campaign"], key="s12_level")
+    metric = c[1].selectbox("Indicator", list(S12_RATES), format_func=lambda x: S12_RATES[x][2], key="s12_metric")
+    stats = s12_entity_stats(s12_win(m, cur), [level], cfg)
+    ranked, small = s12_rank(stats, metric, cfg, worst=True)
+    if len(ranked):
+        st.dataframe(_s16_rate_table(ranked), hide_index=True, width="stretch")
+        st.download_button("📥 Download leaderboard CSV", _s16_rate_table(ranked).to_csv(index=False).encode("utf-8"), file_name="call_quality_leaderboard.csv", mime="text/csv", key="s12_dl")
+    else:
+        st.info("No entity has enough evaluated calls for this indicator.")
+    if len(small):
+        with st.expander(f"Insufficient evidence ({len(small)}) - not ranked"):
+            st.dataframe(small[["Entity", "Calls", metric + "_n", "Why"]], hide_index=True, width="stretch")
+    st.markdown("**Distributions**")
+    pubs = ["(whole network)"] + sorted(m["publisher"].unique())
+    who = st.selectbox("Entity", pubs, key="s12_dist_pub")
+    w = s12_win(m, cur)
+    if who != "(whole network)":
+        w = w[w["publisher"] == who]
+    dist = s12_distributions(w, cfg)
+    dc = st.columns(3)
+    for i, (key, title) in enumerate((("duration", "Duration"), ("score", "Quality Score"), ("fake", "Fake Number"), ("line", "Line Type"), ("phone_company", "Phone Company"), ("hangup", "Hangup By (who ended the call)"))):
+        t, unk = dist[key]
+        with dc[i % 3]:
+            st.markdown(f"*{title}*")
+            st.dataframe(t, hide_index=True, width="stretch")
+            st.caption(f"Unknown / blank: {unk:,} call(s) - left out of the shares.")
+    cats, skipped = s12_qc_categories(qf.loc[w.index] if len(w) else qf.iloc[0:0], cfg)
+    if cats:
+        with st.expander("AI QC issue categories (discovered from your QC reports)"):
+            for fld, (t, unk) in cats.items():
+                st.markdown(f"*{fld}* ({unk:,} call(s) blank / not available)")
+                st.dataframe(t, hide_index=True, width="stretch")
+            if skipped:
+                st.caption("Not categorised: " + "; ".join(skipped))
+    st.markdown("**Combination analysis**")
+    cc = st.columns(2)
+    combo = cc[0].selectbox("Combination", list(S12_COMBOS), key="s12_combo")
+    cm = cc[1].selectbox("Indicator ", list(S12_RATES), format_func=lambda x: S12_RATES[x][2], key="s12_combo_m")
+    r2, s2 = s12_combinations(s12_win(m, cur), S12_COMBOS[combo], cfg, cm)
+    if len(r2):
+        st.dataframe(_s16_rate_table(r2.head(int(cfg["top"]) * 2)), hide_index=True, width="stretch")
+    else:
+        st.info("No combination has enough evaluated calls.")
+    if len(s2):
+        st.caption(f"{len(s2)} combination(s) have insufficient evidence and are not ranked (minimum {int(cfg['min_calls'])} calls and {int(cfg['min_qc'])} evaluated calls).")
+    st.markdown("**Mix shifts (possible explanation for network-level moves - never a proven cause)**")
+    pair = st.selectbox("Share of …", ["publisher within each buyer", "buyer within each publisher", "publisher within each campaign"], key="s12_mix")
+    a_, b_ = {"publisher within each buyer": ("publisher", "buyer"), "buyer within each publisher": ("buyer", "publisher"), "publisher within each campaign": ("publisher", "campaign")}[pair]
+    ms = s12_mix_shift(s12_win(m, cur), s12_win(m, prev), a_, b_, cfg)
+    if len(ms):
+        st.dataframe(_s16_pct_cols(ms, ["Share now", "Share before"]).head(30), hide_index=True, width="stretch")
+    else:
+        st.info("Not enough calls in both windows.")
+    st.markdown("**Entity comparison with the equal previous window**")
+    cmp_, w2 = s12_compare_entities(m, cur, prev, [level], cfg)
+    if w2:
+        st.warning(w2)
+    if len(cmp_):
+        st.dataframe(_s16_pct_cols(cmp_, [x for x in cmp_.columns if x.endswith(" now") and "n now" not in x or x.endswith(" before") and "n before" not in x and "Avg" not in x]), hide_index=True, width="stretch")
+    st.markdown("**Pattern signals** (" + S12_WORDING + "; " + S12_DISCLAIMER + ")")
+    items = s12_review_items(m, cur, prev, cfg)
+    if items:
+        st.dataframe(pd.DataFrame([{"Priority": i["priority_score"], "Action": i["verb"], "Entity": i["entity_key"], "Rule": i["rule"], "What": i["text"], "Confidence": i["confidence"],
+                                    "Parts": json.dumps(i["parts"])} for i in items[:int(cfg["top"])]]), hide_index=True, width="stretch")
+        if st.button("Save these as recommendations (Step 10)", key="s12_save"):
+            try:
+                st.success(f"{s12_store_items(store, items, cur, now)} new recommendation(s) saved (existing ones were only refreshed).")
+            except Exception as exc:
+                st.error(f"Could not save ({type(exc).__name__}).")
+    else:
+        st.info("No pattern signal passed its sample-size rule in this window.")
+    rc = s12_repeat_callers(s12_win(m, cur))
+    if len(rc):
+        with st.expander("Repeat callers (masked Caller IDs, descriptive only)"):
+            st.dataframe(rc, hide_index=True, width="stretch")
+
+
+def _s16_tab_review(ctx):
+    qf, cols, store, now, ident = ctx["qf"], ctx["cols"], ctx["store"], ctx["now"], ctx["ident"]
+    st.caption("Recommendation-only. This advisor can only suggest what a person should REVIEW, from observed call quality. It cannot suggest moving traffic between buyers: the sheet has no buyer-acceptance, cap or eligibility data.")
+    days = int(st.selectbox("Window (days)", [3, 7, 14, 30], index=1, key="s13_days"))
+    res = s13_overview(qf, cols, ctx["available_columns"], days)
+    st.markdown("**What is switched off, and exactly what is missing**")
+    st.dataframe(res["capabilities"], hide_index=True, width="stretch")
+    if res["cur"] is None:
+        st.info("No calls with a readable date.")
+        return
+    cfg = res["cfg"]
+    if not res["candidates"]:
+        st.success("No combination shows quality clearly worse than its baseline with enough evidence.")
+    for i, cd in enumerate(res["candidates"][:15]):
+        card = s13_candidate_text(cd, cfg, res["cur"], res["prev"])
+        with st.expander(f"Review candidate: {cd['entity']} ({cd['combination']}) - {cd['calls']} calls"):
+            for k_, v in card.items():
+                if isinstance(v, list):
+                    st.markdown(f"**{k_}**")
+                    for x in v:
+                        st.markdown(f"- {x}")
+                else:
+                    st.markdown(f"**{k_}:** {v}")
+            if st.button("Create approval task for this review", key=f"s13_task_{i}"):
+                try:
+                    tid, how = s11_create(store, f"Review {cd['entity']} ({cd['combination']})", ident, description=card["Proposed review action"], type_="review", source="advisor",
+                                          source_id=f"{cd['combination']}|{cd['entity']}|{pd.Timestamp(res['cur'][0]):%Y-%m-%d}", purpose="review", publisher=cd["publisher"], severity="medium",
+                                          evidence={"observed": card["Observed"], "calls": cd["calls"]}, status="Waiting for Approval", now=now)
+                    st.success(f"Task {tid} ({how}).")
+                except Exception as exc:
+                    st.error(str(exc)[:200])
+    if res["insufficient"]:
+        with st.expander(f"Insufficient evidence ({len(res['insufficient'])}) - not assessed"):
+            st.dataframe(pd.DataFrame(res["insufficient"]), hide_index=True, width="stretch")
+    if len(res["buyer_mix"]):
+        st.markdown("**Buyer-mix observations** (observation, not cause)")
+        st.dataframe(_s16_pct_cols(res["buyer_mix"], ["Poor-score rate", "Their rate"]), hide_index=True, width="stretch")
+    if len(res["mix_shift"]):
+        st.markdown("**Mix changes versus the equal previous window** (possible, not proven)")
+        st.dataframe(_s16_pct_cols(res["mix_shift"], ["Share now", "Share before"]).head(15), hide_index=True, width="stretch")
+
+
+def _s16_tab_briefing(ctx):
+    qf, cols, store, now, ident = ctx["qf"], ctx["cols"], ctx["store"], ctx["now"], ctx["ident"]
+    st.caption("Built from the engines already on this page. Revenue, margin, billable and conversion changes are not included (no such fields). "
+               "Generation is on demand: a Streamlit page cannot run in the background. See HEADLESS_AND_SCHEDULING.md for unattended daily delivery.")
+    saved = s14_get(store, now.strftime("%Y-%m-%d"))
+    if saved:
+        st.caption(f"Today's briefing was already saved at {saved['ts']} (one per day; the saved copy is not overwritten).")
+    c = st.columns(3)
+    gen = c[0].button("Generate briefing now", key="s14_gen")
+    if gen or (saved and "s14_cur" not in st.session_state):
+        b = s14_build(store, qf, cols, now, ctx["available_columns"]) if gen else saved["briefing"]
+        st.session_state["s14_cur"] = b
+    b = st.session_state.get("s14_cur")
+    if not b:
+        st.info("Press 'Generate briefing now'.")
+        return
+    st.markdown(s14_markdown(b))
+    st.download_button("📥 Download briefing (Markdown)", s14_markdown(b).encode("utf-8"), file_name=f"briefing_{b['date']}.md", mime="text/markdown", key="s14_dl")
+    if c[1].button("Save today's briefing", key="s14_save"):
+        bid, created = s14_save(store, b, now)
+        st.success("Saved." if created else "Today's briefing already exists; not overwritten.")
+    if c[2].button("E-mail it (Step 9 sender)", key="s14_mail"):
+        if not s16_allowed("run_health_check", ident):
+            st.error("Sending needs the operator level.")
+        else:
+            bid, _ = s14_save(store, b, now)
+            r = s14_send(store, bid, b, now)
+            st.info(f"sent {r['sent']}, skipped (already sent) {r['skipped']}, failed {r['failed']}. {r['reason']}")
+
+
+def _s16_tab_gov(ctx):
+    qf, cols, store, now, ident = ctx["qf"], ctx["cols"], ctx["store"], ctx["now"], ctx["ident"]
+    st.warning("There is no real user login and no write-capable Ringba connection in this app. Approvals therefore run as a DRY RUN only: they record a decision and change nothing. "
+               "Permissions use one shared action password (a shared-secret gate, not user identity) unless Streamlit viewer login is configured.")
+    st.markdown(f"**You are:** {ident['label']} · {ident['via']} · level **{ident['level']}**")
+    st.dataframe(pd.DataFrame([{"Permission": k, "Needs": {"viewer": "anyone", "open": "no password set, or password supplied", "strict": "action password configured AND supplied"}[v]} for k, v in S16_PERMS.items()]), hide_index=True, width="stretch")
+    s16_expire(store, now)
+    s16_reconcile_stale(store, now)
+    with st.expander("Request a dry-run action"):
+        at = st.selectbox("Action", list(S16_ACTIONS), format_func=lambda x: S16_ACTIONS[x]["label"], key="s16_at")
+        et = st.selectbox("Target type", ["publisher", "buyer", "campaign"], key="s16_et")
+        names = sorted({str(x).strip() for x in qf[cols[et]]}) if cols.get(et) else []
+        ek = st.selectbox("Target", names or ["(none)"], key="s16_ek")
+        reason = st.text_input("Reason", key="s16_reason")
+        hours = int(st.number_input("Expires in (hours)", min_value=1, max_value=336, value=48, step=1, key="s16_hours"))
+        st.caption("Optional precondition, re-checked against current data before it can run.")
+        pc = st.columns(5)
+        pm = pc[0].selectbox("Metric", ["(none)"] + [k for k, v in S9_METRICS.items() if v[1] == "rate"], key="s16_pm")
+        po = pc[1].selectbox("Operator", list(S16_PRECONDITION_OPS), key="s16_po")
+        pt = pc[2].number_input("Threshold (0.10 = 10%)", min_value=0.0, max_value=1.0, value=0.10, step=0.01, key="s16_pt")
+        pd_ = int(pc[3].number_input("Window (days)", min_value=1, max_value=30, value=7, step=1, key="s16_pd"))
+        pn = int(pc[4].number_input("Min evaluated calls", min_value=1, max_value=5000, value=30, step=5, key="s16_pn"))
+        if st.button("Create request", key="s16_req"):
+            pre = {} if pm == "(none)" else {"metric": pm, "entity_type": et, "entity_key": ek, "operator": po, "threshold": float(pt), "window_days": pd_, "min_n": pn}
+            try:
+                aid, how = s16_request(store, at, {"entity_type": et, "entity_key": ek}, reason, ident, evidence={"created_from": "governance tab"}, preconditions=pre, expires_h=hours, now=now)
+                st.success(f"Request {aid} ({how}). A person with the operator level must approve it before it can run.")
+            except (ValueError, PermissionError) as exc:
+                st.error(str(exc))
+    lst = s16_list(store, limit=100)
+    st.dataframe(lst, hide_index=True, width="stretch")
+    if len(lst):
+        aid = st.selectbox("Request details", list(lst["id"]), key="s16_pick")
+        a = s16_get(store, aid)
+        st.write(f"**{a['action_type']}** on **{a['target']}** · {a['status']} · expires {a['expires_at']}")
+        st.write(a["reason"])
+        st.caption("Recovery: " + S16_ACTIONS.get(a["action_type"], {}).get("recovery", "n/a"))
+        c = st.columns(4)
+        note = c[0].text_input("Decision note", key="s16_note")
+        if c[1].button("Approve", key="s16_appr"):
+            ok, msg = s16_decide(store, aid, True, ident, note, now)
+            _s9_say(ok, msg)
+        if c[2].button("Reject", key="s16_rej"):
+            ok, msg = s16_decide(store, aid, False, ident, note, now)
+            _s9_say(ok, msg)
+        if c[3].button("Run (dry run)", key="s16_run"):
+            r = s16_execute(store, aid, ident, qf, cols, now)
+            _s9_say(r["ok"], r["message"])
+            st.caption(" -> ".join(r["steps"]))
+        if st.button("Cancel request", key="s16_cancel"):
+            ok, msg = s16_cancel(store, aid, ident, now)
+            _s9_say(ok, msg)
+    st.markdown("**Audit trail**")
+    ok, n, bad = s16_verify_chain(store)
+    _s9_say(ok, f"Hash chain verified: {n} row(s), no tampering detected." if ok else f"Hash chain BROKEN at row {bad}: a row was changed or removed.")
+    st.caption("Limit: the chain detects edits and deletions, but SQLite on Streamlit Cloud or a PC is not tamper-proof against someone who can replace the whole database file. No credentials, links or call text are stored in audit rows.")
+    ar = s16_audit_rows(store, 100)
+    if len(ar):
+        st.dataframe(ar, hide_index=True, width="stretch")
+
+
+def _s16_tab_recs(ctx):
+    qf, cols, store, now, ident = ctx["qf"], ctx["cols"], ctx["store"], ctx["now"], ctx["ident"]
+    st.caption("Every recommendation keeps its evidence. Accepting one records a decision; it changes nothing in Ringba. Accepted ones are measured afterwards (observed before / after, not proof).")
+    if st.button("Load the Step 6 recommendations into the list", key="s10_load"):
+        st.success(f"{s10_from_step6(store, qf, {**cols}, ctx['timeline'], now)} new recommendation(s) stored.")
+    sts = st.multiselect("Status", list(S10_STATUSES), default=["new", "accepted"], key="s10_f")
+    lst = s10_list(store, sts)
+    st.dataframe(lst, hide_index=True, width="stretch")
+    if len(lst):
+        rid = st.selectbox("Recommendation", list(lst["id"]), key="s10_pick")
+        r = s10_get(store, rid)
+        st.write(f"**{r['title']}** · {r['status']} · confidence {r['confidence']} · seen {r['times_seen']}x")
+        if r["evidence"]:
+            st.json(r["evidence"])
+        c = st.columns(4)
+        note = c[0].text_input("Decision note", key="s10_note")
+        for i, (lab, to) in enumerate((("Accept", "accepted"), ("Reject", "rejected"), ("Supersede", "superseded"))):
+            if c[i + 1].button(lab, key="s10_" + to):
+                ok, msg = s10_decide(store, rid, to, ident, note, now)
+                _s9_say(ok, msg)
+        o = st.columns(2)
+        if o[0].button("Measure outcome", key="s10_out"):
+            res = s10_outcome(store, rid, qf, cols, now)
+            st.json(res)
+        if o[1].button("Create a task from this", key="s10_task"):
+            try:
+                tid, how = s11_from_recommendation(store, rid, ident, now)
+                st.success(f"Task {tid} ({how}).")
+            except Exception as exc:
+                st.error(str(exc)[:200])
+
+
+def render_step10_16(df, available_columns, overrides, sidebar_timeline):
+    st.markdown("---")
+    st.markdown("### 🧭 Steps 10–16 — Operations, Call Quality & Governance")
+    cols = resolve_query_columns(available_columns, overrides)
+    st.caption("Python calculates everything here; no AI decides any figure. Nothing on this page changes Ringba, publishers, buyers, campaigns or routing. " + S16_NOTE)
+    if not cols.get("date"):
+        st.info("Steps 10-16 need a readable Call Date column.")
+        return
+    qf = get_query_frame(df, cols)
+    tz = st.session_state.get("date_tz", DEFAULT_TIMEZONE)
+    try:
+        now = pd.Timestamp.now(tz=tz).tz_localize(None)
+    except Exception:
+        now = pd.Timestamp.now()
+    store = s9_get_store()
+    if store.warning:
+        st.warning(store.warning)
+    with st.expander("Who is acting? (identity and permissions)"):
+        lab = st.text_input("Your name (a label, not proof of identity)", key="s16_actor")
+        pw = st.text_input("Action password (if one is configured)", key="s16_pw", type="password")
+    ident = s16_identity(lab, pw)
+    ctx = {"df": df, "qf": qf, "cols": cols, "store": store, "now": now, "ident": ident, "tz": tz, "available_columns": available_columns, "timeline": sidebar_timeline,
+           "meta": st.session_state.get("meta", {}) or {}}
+    tabs = st.tabs(["🩺 Data health", "✅ Tasks", "📊 Call quality", "🔎 Review advisor", "📰 Briefing", "🛡️ Governance", "💡 Recommendations"])
+    for tab, name, fn in zip(tabs, ("Data health", "Tasks", "Call quality", "Review advisor", "Briefing", "Governance", "Recommendations"),
+                             (_s16_tab_health, _s16_tab_tasks, _s16_tab_quality, _s16_tab_review, _s16_tab_briefing, _s16_tab_gov, _s16_tab_recs)):
+        with tab:
+            try:
+                fn(ctx)
+            except Exception as exc:
+                st.warning(f"The {name} tab could not be displayed ({type(exc).__name__}). The other tabs and the dashboard are unaffected.")
+
+
+# =====================================================================================================================
+# Assistant integration for Steps 10-16 (read only, Python only). Hooked into ops_respond after the Step 9 alert / forecast answers.
+# Money questions are left to the existing "not available in this sheet" refusal. The assistant never creates, approves or runs anything.
+# =====================================================================================================================
+_S16C = {
+    "tasks": re.compile(r"\b(overdue|open|pending|unresolved|my)\b.{0,30}\b(operations?\s+)?tasks?\b|\btasks?\b.{0,30}\b(overdue|open|pending)\b|\bmost important unresolved problems?\b", re.I),
+    "approvals": re.compile(r"\b(pending|open|show|list|any)\b.{0,20}\bapprovals?\b|\bapprovals?\b.{0,20}\bpending\b", re.I),
+    "health": re.compile(r"\b(sheet|feed|data)\b.{0,40}\b(fresh|complete|stale|up to date|healthy)\b|\bdata (health|freshness)\b|\bis the (google )?sheet\b|\bsheet feed\b", re.I),
+    "briefing": re.compile(r"\b(operations|daily|today'?s)\s+(ai\s+)?briefing\b|\b(generate|prepare|create)\b.{0,25}\bbriefing\b", re.I),
+    "qc_drop": re.compile(r"\bqc completion\b.{0,40}\b(drop\w*|fell|fall\w*|declin\w*|lower|down|why)\b|\b(why|did)\b.{0,30}\bqc completion\b", re.I),
+    "weakest": re.compile(r"\b(weakest|lowest|worst|poorest|weak)\b.{0,30}\b(quality|score)\b.{0,30}\b(publishers?|buyers?|campaigns?)\b|\b(publishers?|buyers?|campaigns?)\b.{0,30}\b(weakest|lowest|worst|poorest)\b.{0,20}\b(quality|score)\b|\b(publishers?|buyers?|campaigns?)\b.{0,20}\b(with|have|has)\b.{0,15}\b(weakest|lowest|worst)\b", re.I),
+    "combos": re.compile(r"\b(buyer.{0,4}publisher|publisher.{0,4}buyer|combinations?)\b.{0,40}\b(review|need|attention)\b", re.I),
+    "explain_rec": re.compile(r"\b(explain|evidence|why)\b.{0,40}\brecommendation\s+(R[0-9a-f]{6,})\b", re.I),
+    "block": re.compile(r"\b(block|ban|shut\s*(?:off|down)|cut\s*off|disable)\b.{0,40}\b(publishers?|buyers?|campaigns?|callers?|numbers?)\b", re.I),
+    "dryrun": re.compile(r"\b(dry.?run|proposal)\b", re.I),
+    "mix": re.compile(r"\b(line type|phone company|carrier|hangup|hang up)\b.{0,25}\b(mix|distribution|breakdown|split)\b", re.I),
+}
+_S16C_ACTION_WORDS = re.compile(r"\b(block|pause|stop|cut|reroute|re-route|route|remove|disable|ban|shut|throttle|cap)\b", re.I)
+
+
+def _s16c_days(q):
+    ql = q.lower()
+    m = re.search(r"last\s+(\d{1,3})\s+days?", ql)
+    if m:
+        return max(1, min(60, int(m.group(1)))), f"last {int(m.group(1))} days"
+    if "yesterday" in ql or "today" in ql:
+        return 1, "the last day"
+    if "month" in ql:
+        return 30, "the last 30 days"
+    return 7, "the last 7 days (this week)" if "this week" in ql else "the last 7 days"
+
+
+def _s16c_entity(q, qf, cols, key):
+    c = cols.get(key)
+    if not c or c not in qf.columns:
+        return None
+    names = sorted({str(x).strip() for x in qf[c] if str(x).strip()}, key=len, reverse=True)
+    ql = q.lower()
+    for n in names:
+        if n.lower() in ql:
+            return n
+    return None
+
+
+def _s16c_level(q):
+    ql = q.lower()
+    if re.search(r"\bbuyers?\b", ql):
+        return "buyer"
+    if re.search(r"\bcampaigns?\b", ql):
+        return "campaign"
+    return "publisher"
+
+
+def ops_s16_answer(question, qf, cols, today, tz=DEFAULT_TIMEZONE):
+    """OpsAnswer for a Step 10-16 question, else None (the normal assistant continues)."""
+    q = str(question or "")
+    if _S9C_MONEY.search(q):
+        return None
+    intent = next((k for k, rx in _S16C.items() if rx.search(q)), None)
+    if intent is None:
+        return None
+    if intent == "weakest" and not re.search(r"\b(quality|score)\b", q, re.I):
+        return None
+    try:
+        now = pd.Timestamp.now(tz=tz).tz_localize(None)
+    except Exception:
+        now = pd.Timestamp.now()
+    try:
+        store = s9_get_store()
+    except Exception as exc:
+        return OpsAnswer(status="unavailable", kind="s16_" + intent, scope="Steps 10-16 store", answer=f"The operations store could not be opened ({type(exc).__name__}), so I cannot answer that.")
+    try:
+        return _s16c_dispatch(intent, q, qf, cols, now, store)
+    except Exception as exc:
+        return OpsAnswer(status="unavailable", kind="s16_" + intent, scope="Steps 10-16 (read only)", answer=f"I could not work that out ({type(exc).__name__}). Nothing was changed.")
+
+
+def _s16c_dispatch(intent, q, qf, cols, now, store):
+    a = OpsAnswer(status="ok", kind="s16_" + intent, scope="Steps 10-16 (read only; calculated by Python; nothing was changed)")
+    a.sources = ["S9Store", "s12_*", "s15_*"]
+    if intent == "tasks":
+        od = bool(re.search(r"overdue", q, re.I))
+        df = s11_list(store, now, statuses=[s for s in S11_STATUSES if s not in S11_CLOSED], overdue_only=od, limit=15)
+        cnt = s11_counts(store, now)
+        unresolved = re.search(r"unresolved problems?", q, re.I)
+        al = store.list_alerts(statuses=list(S9_ACTIVE), severities=["critical", "high"], limit=8) if unresolved else pd.DataFrame()
+        if not len(df) and not len(al):
+            a.answer = ("There are no overdue operations tasks." if od else "There are no open operations tasks.") + f" ({cnt['open_total']} open, {cnt['overdue']} overdue in total.)"
+            return a
+        a.answer = f"{len(df)} {'overdue ' if od else ''}task(s) shown; {cnt['open_total']} open and {cnt['overdue']} overdue in total."
+        if len(df):
+            a.evidence.append(("Tasks", df[["id", "status", "severity", "title", "owner", "due_at", "overdue"]]))
+            a.observed += [f"{r['id']}: {r['title']} - {r['status']}, due {r['due_at']}{' (OVERDUE)' if r['overdue'] else ''}" for _, r in df.head(6).iterrows()]
+        if len(al):
+            a.evidence.append(("Active critical / high alerts", _s9c_alert_rows(al)))
+            a.observed.append(f"{len(al)} active critical / high alert(s) are also unresolved.")
+        a.steps.append("Open Steps 10-16 → Tasks to update or complete them.")
+        return a
+    if intent == "approvals":
+        df = s16_list(store, ["Pending Approval"], limit=20)
+        if not len(df):
+            a.answer = "There are no pending approvals."
+            return a
+        a.answer = f"{len(df)} approval request(s) are pending. They are dry-run review requests: approving one changes nothing in Ringba."
+        a.evidence.append(("Pending approvals", df[["id", "action_type", "target", "reason", "requested_by", "expires_at"]]))
+        a.steps.append("Decide them in Steps 10-16 → Governance (needs the operator level).")
+        return a
+    if intent == "health":
+        ch = s15_run_checks(qf, qf, cols, now, store=store, meta=None)
+        real = [c for c in ch if not c["name"].startswith("Not monitorable")]
+        bad = [c for c in real if c["status"] in ("warn", "critical")]
+        fr = next((c for c in real if c["name"] == "Data freshness"), None)
+        qc = next((c for c in real if c["name"] == "AI QC backlog"), None)
+        a.answer = ((fr["detail"] if fr else "Freshness could not be assessed.") + " " + (qc["detail"] if qc else "")).strip()
+        a.observed += [f"[{c['status'].upper()}] {c['name']}: {c['detail']}" for c in bad] or ["All monitorable checks are within their limits."]
+        a.evidence.append(("Data-health checks", pd.DataFrame([{"Check": c["name"], "Status": c["status"], "Detail": c["detail"]} for c in real])))
+        a.caveats.append("Not monitorable from this app: Ringba API connectivity, transcription jobs, external scheduler runs.")
+        return a
+    if intent == "briefing":
+        b = s14_build(store, qf, cols, now)
+        a.answer = f"Here is today's operations briefing for {b['target_day']} (generated now, not saved or e-mailed)."
+        for s in b["sections"]:
+            if s["hidden"]:
+                a.observed.append(f"{s['title']}: hidden - {s['hidden']}")
+            else:
+                a.evidence.append((s["title"], [t for t, _r in (s["facts"] + s["suggestions"])]))
+        a.caveats.append(b["not_included"])
+        a.steps.append("Save or e-mail it from Steps 10-16 → Briefing.")
+        return a
+    if intent == "qc_drop":
+        bd = s15_by_day(qf, cols, days=14)
+        if not len(bd) or "QC done %" not in bd.columns:
+            a.status, a.answer = "unavailable", "There is no AI QC Report column or no recent data to measure QC completion."
+            return a
+        bd = bd.copy()
+        bd["Change (points)"] = bd["QC done %"].diff().round(1)
+        worst = bd.loc[bd["Change (points)"].idxmin()] if bd["Change (points)"].notna().any() else None
+        a.answer = (f"QC completion by day is in the table. The biggest one-day fall was {worst['Change (points)']:+.1f} points on {worst['Day']} "
+                    f"(to {worst['QC done %']:.0f}%)." if worst is not None and worst["Change (points)"] < 0 else "QC completion did not fall from one day to the next in the last 14 days.")
+        a.evidence.append(("QC completion by day", bd[["Day", "Calls", "QC done %", "Change (points)"]]))
+        a.possible.append("Possible, unverified: newer calls have not been through AI QC yet (a backlog), or the QC step ran less often. The sheet has no log of QC jobs, so the cause cannot be confirmed here.")
+        a.caveats.append("Recent days are often incomplete because QC runs after the call; compare complete days.")
+        return a
+    if intent == "weakest":
+        days, label = _s16c_days(q)
+        cfg = s12_config()
+        m = s12_prepare(qf, cols)
+        if not len(m):
+            a.status, a.answer = "unavailable", "No calls with a readable date."
+            return a
+        cur, prev = s12_windows(m, days)
+        level = _s16c_level(q)
+        st_ = s12_entity_stats(s12_win(m, cur), [level], cfg)
+        ok = st_[(st_["Calls"] >= cfg["min_calls"]) & (st_["Scored n"] >= cfg["min_qc"])].sort_values("Avg score")
+        small = len(st_) - len(ok)
+        if not len(ok):
+            a.status, a.answer = "unavailable", f"No {level} has enough scored calls in {label} (minimum {int(cfg['min_calls'])} calls and {int(cfg['min_qc'])} scored calls)."
+            return a
+        top = ok.head(5)
+        a.answer = f"Lowest average Quality Score over {label}: " + "; ".join(f"{r['Entity']} {r['Avg score']:.1f} ({int(r['Scored n'])} scored of {int(r['Calls'])} calls)" for _, r in top.iterrows()) + "."
+        a.evidence.append((f"Average Quality Score by {level} (scored calls only)", _s16_rate_table(top, keys=("poor",))))
+        if small:
+            a.caveats.append(f"{small} {level}(s) have too few calls or scored calls and are not ranked.")
+        a.caveats.append("Quality Score exists only for calls whose AI QC finished; this is an observation about scored calls, not a measure of revenue, buyer acceptance or cause.")
+        w = s12_cov_warning(s12_win(m, cur), s12_win(m, prev), cfg)
+        if w:
+            a.caveats.append(w)
+        return a
+    if intent == "combos":
+        res = s13_overview(qf, cols, list(qf.columns), 7)
+        if res["cur"] is None:
+            a.status, a.answer = "unavailable", "No calls with a readable date."
+            return a
+        c = res["candidates"][:5]
+        if not c:
+            a.answer = "No publisher × buyer or publisher × campaign combination shows quality clearly worse than its baseline with enough evidence over the last 7 days."
+        else:
+            a.answer = "Combinations worth a REVIEW (observed quality only): " + "; ".join(f"{x['entity']} ({x['calls']} calls)" for x in c) + "."
+            a.evidence.append(("Review candidates", pd.DataFrame([{"Combination": x["combination"], "Entity": x["entity"], "Calls": x["calls"], "Indicators": "; ".join(f['indicator'] for f in x["flags"])} for x in c])))
+        a.caveats.append(f"{len(res['insufficient'])} combination(s) have insufficient evidence and were not assessed.")
+        a.caveats.append("Review only: the sheet has no buyer acceptance, caps or eligibility data, so no traffic-allocation advice is possible.")
+        return a
+    if intent == "explain_rec":
+        rid = _S16C["explain_rec"].search(q).group(2)
+        r = s10_get(store, rid)
+        if not r:
+            a.status, a.answer = "unavailable", f"I could not find recommendation {rid}."
+            return a
+        ev = r.get("evidence") or {}
+        a.answer = f"Recommendation {rid} ({r['status']}, confidence {r['confidence']}): {r['title']}"
+        a.observed += [f"{k}: {v}" for k, v in ev.items() if k in ("observed", "baseline", "n", "n_base", "period", "text", "why", "rule", "calls")]
+        if ev.get("unknown"):
+            a.possible += ["Not known: " + "; ".join(ev["unknown"])]
+        a.caveats.append("It is a review suggestion from a fixed rule; it is not proof of a problem and changes nothing.")
+        return a
+    if intent == "block":
+        a.status, a.kind = "unsupported", "s16_refused"
+        a.answer = ("I cannot block anything: this app has no connection that can change Ringba, and a single signal is never enough to justify blocking. "
+                    "I can show the evidence (for example the Step 12 pattern signals) or prepare a dry-run review request that a person approves; it changes nothing.")
+        return a
+    if intent == "dryrun":
+        if _S16C_ACTION_WORDS.search(q):
+            a.status, a.kind = "unsupported", "s16_refused"
+            a.answer = ("I do not prepare actions that block, pause, route or cap traffic. This app cannot change Ringba, and a single signal is never enough to justify it. "
+                        "What I can prepare is a dry-run REVIEW request for a person to approve; it records the evidence and changes nothing.")
+            return a
+        ent = _s16c_entity(q, qf, cols, "publisher") or _s16c_entity(q, qf, cols, "buyer") or _s16c_entity(q, qf, cols, "campaign")
+        if not ent:
+            a.status, a.answer = "clarify", "Which publisher, buyer or campaign should the dry-run review be about?"
+            return a
+        et = "publisher" if _s16c_entity(q, qf, cols, "publisher") == ent else ("buyer" if _s16c_entity(q, qf, cols, "buyer") == ent else "campaign")
+        pv = s16_proposal_preview(et, ent)
+        a.answer = f"Prepared (not saved): a dry-run review request for {et} '{ent}'. {pv['note']}"
+        a.observed.append(f"Action type: {pv['action_type']}; reason on file: {pv['reason']}.")
+        a.steps.append("Create it in Steps 10-16 → Governance → 'Request a dry-run action', then have an operator approve and run it.")
+        return a
+    if intent == "mix":
+        days, label = _s16c_days(q)
+        m = s12_prepare(qf, cols)
+        if not len(m):
+            a.status, a.answer = "unavailable", "No calls with a readable date."
+            return a
+        cur, _p = s12_windows(m, days)
+        w = s12_win(m, cur)
+        who, scope = "the whole network", None
+        for key in ("publisher", "buyer", "campaign"):
+            e = _s16c_entity(q, qf, cols, key)
+            if e:
+                w, who = w[w[key].str.lower() == e.lower()], f"{key} {e}"
+                break
+        dist = s12_distributions(w, s12_config())
+        ql = q.lower()
+        key = "line" if "line type" in ql else ("phone_company" if ("phone company" in ql or "carrier" in ql) else "hangup")
+        t, unk = dist[key]
+        if not len(t):
+            a.status, a.answer = "unavailable", f"No known values for that field for {who} in {label}."
+            return a
+        a.answer = f"{key.replace('_', ' ').title()} mix for {who} over {label}: " + "; ".join(f"{r['Value']} {r['Share of known'] * 100:.0f}%" for _, r in t.head(5).iterrows()) + f" (shares over {int(t['Calls'].sum()):,} calls with a known value; {unk:,} unknown)."
+        a.evidence.append((f"{key} distribution", t))
+        if key == "hangup":
+            a.caveats.append("'Hangup By' only says who ended the call. It does not mean a buyer accepted or rejected anything.")
+        return a
+    return None
+
+
+GOLDEN_QUESTIONS += [("What are my overdue operations tasks?", "ok*"), ("Show pending approvals", "ok*"), ("Is the Google Sheet feed fresh and complete?", "ok*"),
+                     ("Which publishers have the weakest quality this week?", "ok*"), ("Which buyer-publisher combinations need review?", "ok*"),
+                     ("Generate today's operations briefing", "ok*"), ("Prepare a dry-run proposal to review publisher {pub}", "ok*"), ("Block publisher {pub} now", "refuse")]
+
+
 # ---------------------------------------------------------------
 # Main flow
 # ---------------------------------------------------------------
@@ -11191,6 +13888,15 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
         )
     except Exception as exc:                      # Step 9 must never take the rest of the dashboard down
         st.warning(f"Step 9 could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
+    # Steps 10-16: recommendations, data health, tasks, call-quality intelligence, review advisor, briefing, governance (Python only; advisory; never changes Ringba)
+    try:
+        render_step10_16(
+            df, available_columns,
+            {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
+            timeline,
+        )
+    except Exception as exc:                      # these tabs must never take the rest of the dashboard down
+        st.warning(f"Steps 10-16 could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
     top_issues_slot = st.container()  # filled further down, once the group-by choice is known
     st.markdown("### 📈 Network Overview & Key Metrics")
     if len(work_df) == 0:
