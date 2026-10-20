@@ -26,8 +26,233 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("📊 Network & Campaign Intelligence Dashboard")
-st.markdown("Advanced Publisher & Campaign Intelligence Engine")
+# (the old page title is replaced by the top bar below the menu)
+# ---------------------------------------------------------------
+# UI shell (look & navigation only). Every feature below is unchanged: this block only decides WHICH existing section is drawn on which
+# sidebar page, and how the page looks. "Classic view" draws everything on one page exactly as before.
+# ---------------------------------------------------------------
+UI_PAGE = "__all__"            # set by ui_nav(); read by ui_page_is()
+UI_SECTIONS = [
+    ("OVERVIEW", [
+        ("Dashboard", "🏠", "Dashboard", "Key numbers, health and where to look first."),
+        ("Reports", "📋", "Reports", "Performance breakdown by any column, with selectable rows, totals and downloads."),
+        ("Trends", "📈", "Trends & Insights", "How the selected period compares with the equivalent previous period, and what to do about it."),
+        ("Compare", "⚖️", "Compare Periods", "Side-by-side comparison of any two dates or periods, for publishers, buyers and campaigns."),
+    ]),
+    ("INTELLIGENCE", [
+        ("Briefing", "🧠", "Network Briefing", "Plain-language summary, root causes and recommendations from the loaded data."),
+        ("Assistant", "🤖", "AI Assistant", "Ask questions in plain words (English, Banglish or Bengali). Python calculates every number."),
+        ("Explorer", "🔎", "Data Explorer", "Statistics, rankings, daily series, comparisons, anomalies and the raw call list."),
+    ]),
+    ("MONITORING", [
+        ("Alerts", "🚨", "Alerts & Forecasts", "Active alerts, investigation, forecasts and e-mail settings."),
+        ("Health", "🩺", "Data Health", "Is the Google Sheet feed fresh and complete? Checks, incidents and history."),
+        ("Quality", "📊", "Call Quality", "Duration, quality score, fake / line-type mix, repeat callers and publisher / buyer performance."),
+        ("Advisor", "🧭", "Review Advisor", "Publisher x buyer / campaign combinations that deserve a human review (recommendation only)."),
+    ]),
+    ("OPERATIONS", [
+        ("Tasks", "✅", "Tasks", "Follow-up work created from alerts, incidents and recommendations."),
+        ("Recs", "💡", "Recommendations", "Stored recommendations with their evidence, decisions and measured outcome."),
+        ("DailyBrief", "📰", "Daily Briefing", "The operations briefing for a day: what changed, what is open, what is not known."),
+        ("Governance", "🛡️", "Governance", "Approval requests, dry-run gateway and the tamper-evident audit log."),
+    ]),
+    ("", [("__all__", "🧾", "Classic view", "Everything on one long page (the previous layout).")]),
+]
+UI_PAGE_INFO = {k: (ic, t, d) for _s, items in UI_SECTIONS for (k, ic, t, d) in items}
+UI_LABELS = {k: f"{ic}  {t}" for k, (ic, t, d) in UI_PAGE_INFO.items()}
+UI_S1016_PAGES = {"Health": "health", "Quality": "quality", "Advisor": "review", "Tasks": "tasks", "Recs": "recs", "DailyBrief": "briefing", "Governance": "gov"}
+
+UI_CSS = """
+:root{--ui-navy:#0b1f3a;--ui-navy2:#10294d;--ui-accent:#2563eb;--ui-accent-soft:#e8f0fe;--ui-bg:#f3f6fb;--ui-card:#ffffff;--ui-border:#e2e8f0;
+--ui-text:#0f172a;--ui-muted:#64748b;--ui-good:#16a34a;--ui-warn:#d97706;--ui-bad:#dc2626}
+.stApp{background:var(--ui-bg);color-scheme:light}
+#MainMenu,footer{visibility:hidden}
+[data-testid="stHeader"]{background:transparent}
+.block-container{padding-top:1.4rem;padding-bottom:3rem;max-width:1480px}
+[data-testid="stMain"],section.main{color:var(--ui-text)}
+[data-testid="stMain"] h1,[data-testid="stMain"] h2,[data-testid="stMain"] h3,[data-testid="stMain"] h4,[data-testid="stMain"] h5,
+[data-testid="stMain"] p,[data-testid="stMain"] li,[data-testid="stMain"] label,[data-testid="stMain"] [data-testid="stMarkdownContainer"]{color:var(--ui-text)}
+[data-testid="stMain"] h2{font-size:1.35rem;font-weight:700;letter-spacing:-.01em;margin-top:.6rem}
+[data-testid="stMain"] h3{font-size:1.12rem;font-weight:700;letter-spacing:-.005em}
+[data-testid="stMain"] h4{font-size:1rem;font-weight:650}
+[data-testid="stMain"] [data-testid="stCaptionContainer"],[data-testid="stMain"] small{color:var(--ui-muted)}
+[data-testid="stMain"] hr{border-color:var(--ui-border);margin:1.1rem 0}
+
+/* top bar */
+.ui-top{background:var(--ui-card);border:1px solid var(--ui-border);border-radius:16px;padding:16px 22px;margin:0 0 16px 0;display:flex;justify-content:space-between;
+align-items:center;gap:18px;flex-wrap:wrap;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+.ui-top .ui-t{font-size:1.4rem;font-weight:750;letter-spacing:-.015em;color:var(--ui-text);line-height:1.2}
+.ui-top .ui-d{margin-top:3px;color:var(--ui-muted);font-size:.9rem}
+.ui-chips{display:flex;gap:6px;flex-wrap:wrap}
+.ui-chip{background:#eef2f7;color:#334155;border-radius:999px;padding:5px 11px;font-size:.78rem;font-weight:550;white-space:nowrap}
+.ui-chip.blue{background:var(--ui-accent-soft);color:#1d4ed8}
+
+/* metric cards */
+[data-testid="stMetric"]{background:var(--ui-card);border:1px solid var(--ui-border);border-radius:14px;padding:16px 18px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+[data-testid="stMetricLabel"],[data-testid="stMetricLabel"] *{color:var(--ui-muted)!important;font-size:.82rem!important;font-weight:600!important}
+[data-testid="stMetricValue"],[data-testid="stMetricValue"] *{color:var(--ui-text)!important;font-weight:750!important;letter-spacing:-.02em}
+[data-testid="stMetricDelta"]{font-size:.78rem}
+.ui-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:4px 0 14px 0}
+.ui-card{background:var(--ui-card);border:1px solid var(--ui-border);border-radius:14px;padding:15px 18px;box-shadow:0 1px 2px rgba(15,23,42,.04);border-left:4px solid #cbd5e1}
+.ui-card .l{font-size:.78rem;color:var(--ui-muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.ui-card .v{font-size:1.7rem;font-weight:750;letter-spacing:-.02em;color:var(--ui-text);margin-top:2px}
+.ui-card .h{font-size:.8rem;color:var(--ui-muted);margin-top:2px}
+.ui-card.good{border-left-color:var(--ui-good)}.ui-card.warn{border-left-color:var(--ui-warn)}.ui-card.bad{border-left-color:var(--ui-bad)}.ui-card.info{border-left-color:var(--ui-accent)}
+.ui-sec{font-size:.74rem;font-weight:750;letter-spacing:.1em;color:var(--ui-muted);margin:18px 0 6px 2px}
+
+/* tabs */
+[data-baseweb="tab-list"]{gap:4px;background:var(--ui-card);border:1px solid var(--ui-border);border-radius:12px;padding:4px;flex-wrap:wrap}
+button[data-baseweb="tab"]{border-radius:9px;padding:7px 14px;color:var(--ui-muted);font-weight:600;height:auto}
+button[data-baseweb="tab"][aria-selected="true"]{background:var(--ui-accent-soft);color:#1d4ed8}
+[data-baseweb="tab-highlight"],[data-baseweb="tab-border"]{display:none}
+[data-testid="stTabs"] [data-baseweb="tab-panel"]{padding-top:14px}
+
+/* containers */
+[data-testid="stMain"] [data-testid="stExpander"]{background:var(--ui-card);border:1px solid var(--ui-border)!important;border-radius:12px}
+[data-testid="stMain"] [data-testid="stExpander"] summary,[data-testid="stMain"] [data-testid="stExpander"] summary *{color:var(--ui-text)}
+[data-testid="stDataFrame"]{border:1px solid var(--ui-border);border-radius:12px;overflow:hidden;background:var(--ui-card)}
+[data-testid="stAlert"]{border-radius:12px}
+[data-testid="stMain"] .stButton>button,[data-testid="stMain"] .stDownloadButton>button{border-radius:10px;border:1px solid var(--ui-border);background:var(--ui-card);
+color:var(--ui-text);font-weight:600;transition:all .15s}
+[data-testid="stMain"] .stButton>button:hover,[data-testid="stMain"] .stDownloadButton>button:hover{border-color:var(--ui-accent);color:var(--ui-accent)}
+[data-testid="stMain"] .stButton>button[kind="primary"],[data-testid="stMain"] .stButton>button[data-testid="stBaseButton-primary"]{background:var(--ui-accent);color:#fff;border-color:var(--ui-accent)}
+[data-testid="stMain"] [data-baseweb="input"],[data-testid="stMain"] [data-baseweb="select"]>div,[data-testid="stMain"] [data-baseweb="textarea"]{background:var(--ui-card);border-radius:10px}
+[data-testid="stMain"] input,[data-testid="stMain"] textarea{color:var(--ui-text)}
+[data-testid="stChatMessage"]{background:var(--ui-card);border:1px solid var(--ui-border);border-radius:14px}
+
+/* sidebar */
+[data-testid="stSidebar"]{background:linear-gradient(185deg,var(--ui-navy) 0%,var(--ui-navy2) 100%);border-right:0}
+[data-testid="stSidebar"] *{color:#cbd5e1}
+[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:#f1f5f9!important;font-size:.78rem!important;font-weight:750!important;letter-spacing:.1em;text-transform:uppercase}
+[data-testid="stSidebar"] hr{border-color:rgba(255,255,255,.1)}
+[data-testid="stSidebar"] a{color:#93c5fd!important}
+[data-testid="stSidebar"] input,[data-testid="stSidebar"] textarea,[data-testid="stSidebar"] [data-baseweb="select"] *{color:#0f172a!important}
+[data-testid="stSidebar"] [data-baseweb="input"],[data-testid="stSidebar"] [data-baseweb="select"]>div{background:#f8fafc;border-radius:9px}
+[data-testid="stSidebar"] .stButton>button{background:var(--ui-accent);border:0;color:#fff!important;font-weight:650;border-radius:10px;width:100%}
+[data-testid="stSidebar"] .stButton>button *{color:#fff!important}
+[data-testid="stSidebar"] [data-testid="stExpander"]{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12)!important;border-radius:10px}
+[data-testid="stSidebar"] [data-testid="stAlert"]{background:rgba(255,255,255,.08)}
+[data-testid="stSidebar"] [data-testid="stAlert"] *{color:#e2e8f0!important}
+.ui-brand{display:flex;align-items:center;gap:11px;padding:6px 4px 14px 4px}
+.ui-logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff!important;font-weight:800;font-size:1.15rem;display:flex;align-items:center;justify-content:center}
+.ui-brand-t{color:#fff!important;font-weight:750;font-size:1.02rem;line-height:1.15}
+.ui-brand-s{color:#94a3b8!important;font-size:.75rem}
+.ui-side-title{font-size:.7rem;font-weight:750;letter-spacing:.12em;color:#7c8fb0!important;margin:20px 0 4px 2px}
+[data-testid="stSidebar"] [role="radiogroup"]{gap:2px}
+[data-testid="stSidebar"] [role="radiogroup"]>label{position:relative;padding:9px 13px;border-radius:10px;margin:0;width:100%;cursor:pointer;transition:background .12s}
+[data-testid="stSidebar"] [role="radiogroup"]>label>div:first-child{display:none}
+[data-testid="stSidebar"] [role="radiogroup"]>label>span:first-child{display:none}
+[data-testid="stSidebar"] [role="radiogroup"]>label>input[type="radio"]{position:absolute;opacity:0;pointer-events:none}
+[data-testid="stSidebar"] [role="radiogroup"]>label:hover{background:rgba(255,255,255,.08)}
+[data-testid="stSidebar"] [role="radiogroup"]>label p{font-size:.93rem;font-weight:550;margin:0}
+[data-testid="stSidebar"] [role="radiogroup"]>label:has(input:checked){background:var(--ui-accent);box-shadow:0 4px 12px rgba(37,99,235,.35)}
+[data-testid="stSidebar"] [role="radiogroup"]>label:has(input:checked) *{color:#fff!important;font-weight:650}
+"""
+
+
+def ui_nav_css():
+    """Section captions (OVERVIEW / INTELLIGENCE / ...) above the first item of each group, generated from UI_SECTIONS."""
+    out, idx = [], 1
+    for sec, items in UI_SECTIONS:
+        if sec:
+            out.append(f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx}){{margin-top:26px}}'
+                       f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx})::before{{content:"{sec}";position:absolute;top:-19px;left:4px;'
+                       f'font-size:.68rem;font-weight:750;letter-spacing:.12em;color:#7c8fb0}}')
+        elif idx > 1:
+            out.append(f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx}){{margin-top:14px;border-top:1px solid rgba(255,255,255,.1);border-radius:0 0 10px 10px}}')
+        idx += len(items)
+    out.append('[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child(1){margin-top:22px}')
+    return "".join(out)
+
+
+def ui_inject_theme():
+    st.markdown("<style>" + UI_CSS + ui_nav_css() + "</style>", unsafe_allow_html=True)
+
+
+def ui_page_is(*keys):
+    """True when the current sidebar page is one of `keys` (always True in Classic view)."""
+    return UI_PAGE == "__all__" or UI_PAGE in keys
+
+
+def ui_nav():
+    """Sidebar brand + menu. Returns the page key and remembers it in session_state['ui_page']."""
+    global UI_PAGE
+    st.sidebar.markdown('<div class="ui-brand"><div class="ui-logo">N</div><div><div class="ui-brand-t">Network Intelligence</div>'
+                        '<div class="ui-brand-s">Campaign &amp; publisher QC</div></div></div>', unsafe_allow_html=True)
+    labels = [UI_LABELS[k] for _s, items in UI_SECTIONS for (k, _i, _t, _d) in items]
+    back = {v: k for k, v in UI_LABELS.items()}
+    choice = st.sidebar.radio("Navigate", labels, index=0, key="ui_nav_choice", label_visibility="collapsed")
+    UI_PAGE = back.get(choice, "Dashboard") if isinstance(choice, str) else "Dashboard"
+    st.session_state["ui_page"] = UI_PAGE
+    st.sidebar.markdown('<div class="ui-side-title">DATA SOURCE &amp; FILTERS</div>', unsafe_allow_html=True)
+    return UI_PAGE
+
+
+def ui_topbar_slot():
+    slot = st.empty()
+    ui_topbar_render(slot, UI_PAGE, [])
+    return slot
+
+
+def ui_topbar_render(slot, page, chips):
+    ic, title, desc = UI_PAGE_INFO.get(page, ("", "Dashboard", ""))
+    import html as _html
+    chip_html = "".join(f'<span class="ui-chip{" blue" if i == 0 else ""}">{_html.escape(str(c))}</span>' for i, c in enumerate(chips))
+    slot.markdown(f'<div class="ui-top"><div><div class="ui-t">{ic} {_html.escape(title)}</div><div class="ui-d">{_html.escape(desc)}</div></div>'
+                  f'<div class="ui-chips">{chip_html}</div></div>', unsafe_allow_html=True)
+
+
+def ui_stat_cards(cards):
+    """cards = [(label, value, hint, tone)] -> a responsive row of cards (tone: good / warn / bad / info / '')."""
+    import html as _html
+    body = "".join(f'<div class="ui-card {_html.escape(t)}"><div class="l">{_html.escape(str(l))}</div><div class="v">{_html.escape(str(v))}</div>'
+                   f'<div class="h">{_html.escape(str(h))}</div></div>' for (l, v, h, t) in cards)
+    st.markdown(f'<div class="ui-grid">{body}</div>', unsafe_allow_html=True)
+
+
+def ui_dashboard_extras(work_df):
+    """Operations snapshot (from the stores that already exist) + daily call volume. Read only; every part degrades quietly."""
+    try:
+        store = s9_get_store()
+        now = pd.Timestamp.now()
+
+        def one(sql, args=()):
+            try:
+                return int(store._q(sql, args)[0]["n"])
+            except Exception:
+                return None
+        act = one("SELECT COUNT(*) n FROM alerts WHERE status IN ('new','acknowledged','recurring')")
+        hi = one("SELECT COUNT(*) n FROM alerts WHERE status IN ('new','acknowledged','recurring') AND severity IN ('high','critical')")
+        try:
+            tk = s11_counts(store, now)
+            open_t, overdue = tk["open_total"], tk["overdue"]
+        except Exception:
+            open_t = overdue = None
+        appr = one("SELECT COUNT(*) n FROM approvals WHERE status = 'Pending Approval'")
+        inc = one("SELECT COUNT(*) n FROM health_incidents WHERE status = 'open'")
+        show = lambda x: "-" if x is None else f"{x:,}"
+        tone = lambda x, bad=1: "info" if x is None else ("bad" if x >= bad else "good")
+        st.markdown('<div class="ui-sec">OPERATIONS SNAPSHOT</div>', unsafe_allow_html=True)
+        ui_stat_cards([
+            ("Active alerts", show(act), f"{show(hi)} high or critical", tone(hi)),
+            ("Open tasks", show(open_t), f"{show(overdue)} overdue", tone(overdue)),
+            ("Pending approvals", show(appr), "waiting for a person", "warn" if appr else "good"),
+            ("Data-feed incidents", show(inc), "open health incidents", tone(inc)),
+        ])
+    except Exception:
+        pass
+    try:
+        if "Parsed_Date" in work_df.columns:
+            daily = work_df["Parsed_Date"].dropna().dt.floor("D").value_counts().sort_index()
+            if len(daily) > 1:
+                st.markdown('<div class="ui-sec">DAILY CALL VOLUME</div>', unsafe_allow_html=True)
+                st.area_chart(daily, height=220)
+    except Exception:
+        pass
+
+
+
+ui_inject_theme()
 
 # ---------------------------------------------------------------
 # Matching patterns (AI QC Report format:
@@ -9009,6 +9234,8 @@ def render_query_layer(df, available_columns, overrides, sidebar_timeline):
 # ---------------------------------------------------------------
 # Sidebar: connection
 # ---------------------------------------------------------------
+ui_nav()
+UI_TOPBAR = ui_topbar_slot()
 st.sidebar.header("⚙️ Configuration & Filters")
 
 target_sheet_name = st.sidebar.text_input("Google Sheet Name:", "Ringba to Sheet QC")
@@ -13456,6 +13683,36 @@ def render_step10_16(df, available_columns, overrides, sidebar_timeline):
                 st.warning(f"The {name} tab could not be displayed ({type(exc).__name__}). The other tabs and the dashboard are unaffected.")
 
 
+def render_step10_16_page(df, available_columns, overrides, sidebar_timeline, which):
+    """One Steps 10-16 feature on its own sidebar page (same context, same tab functions as render_step10_16)."""
+    cols = resolve_query_columns(available_columns, overrides)
+    st.caption("Python calculates everything here; no AI decides any figure. Nothing on this page changes Ringba, publishers, buyers, campaigns or routing. " + S16_NOTE)
+    if not cols.get("date"):
+        st.info("This page needs a readable Call Date column.")
+        return
+    qf = get_query_frame(df, cols)
+    tz = st.session_state.get("date_tz", DEFAULT_TIMEZONE)
+    try:
+        now = pd.Timestamp.now(tz=tz).tz_localize(None)
+    except Exception:
+        now = pd.Timestamp.now()
+    store = s9_get_store()
+    if store.warning:
+        st.warning(store.warning)
+    with st.expander("Who is acting? (identity and permissions)"):
+        lab = st.text_input("Your name (a label, not proof of identity)", key="s16_actor")
+        pw = st.text_input("Action password (if one is configured)", key="s16_pw", type="password")
+    ident = s16_identity(lab, pw)
+    ctx = {"df": df, "qf": qf, "cols": cols, "store": store, "now": now, "ident": ident, "tz": tz, "available_columns": available_columns, "timeline": sidebar_timeline,
+           "meta": st.session_state.get("meta", {}) or {}}
+    fns = {"health": _s16_tab_health, "tasks": _s16_tab_tasks, "quality": _s16_tab_quality, "review": _s16_tab_review, "briefing": _s16_tab_briefing,
+           "gov": _s16_tab_gov, "recs": _s16_tab_recs}
+    try:
+        fns[which](ctx)
+    except Exception as exc:
+        st.warning(f"This page could not be displayed ({type(exc).__name__}). The other pages and the dashboard are unaffected.")
+
+
 # =====================================================================================================================
 # Assistant integration for Steps 10-16 (read only, Python only). Hooked into ops_respond after the Step 9 alert / forecast answers.
 # Money questions are left to the existing "not available in this sheet" refusal. The assistant never creates, approves or runs anything.
@@ -13867,86 +14124,117 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
     # ---------------------------------------------------------------
     # KPI metrics: counts with their percentage of total calls (selected timeline)
     # ---------------------------------------------------------------
-    # Step 6: Network Intelligence briefing (advisory only; reads the loaded sheet through Step 5A)
-    render_network_briefing(
-        df, available_columns,
-        {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
-        timeline,
-    )
-    # Step 7: AI Network Operations Assistant (reads Steps 5A / 5B / 6; advisory only)
-    render_ops_assistant(
-        df, available_columns,
-        {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
-        timeline,
-    )
-    # Step 9: alerts, investigation and forecasts (Python only; advisory; never changes Ringba)
-    try:
-        render_step9(
+    _ui_chips = [f"{len(df):,} calls loaded"]
+    if timeline and timeline.get("start") is not None:
+        _ui_chips.append("Showing " + describe_period(timeline["start"], timeline["end"]))
+    elif timeline:
+        _ui_chips.append("Showing " + str(timeline.get("preset", "All time")))
+    _ui_chips.append(f"{len(work_df):,} calls in view")
+    if meta and meta.get("tab"):
+        _ui_chips.append("Tab: " + str(meta["tab"]))
+    ui_topbar_render(UI_TOPBAR, UI_PAGE, _ui_chips)
+    # Briefing / assistant / alerts: one sidebar page each (Classic view shows them all, as before)
+    if ui_page_is("Briefing"):
+        render_network_briefing(
             df, available_columns,
             {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
             timeline,
         )
-    except Exception as exc:                      # Step 9 must never take the rest of the dashboard down
-        st.warning(f"Step 9 could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
-    # Steps 10-16: recommendations, data health, tasks, call-quality intelligence, review advisor, briefing, governance (Python only; advisory; never changes Ringba)
-    try:
-        render_step10_16(
+    if ui_page_is("Assistant"):
+        render_ops_assistant(
             df, available_columns,
             {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
             timeline,
         )
-    except Exception as exc:                      # these tabs must never take the rest of the dashboard down
-        st.warning(f"Steps 10-16 could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
+    if ui_page_is("Alerts"):
+        try:
+            render_step9(
+                df, available_columns,
+                {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
+                timeline,
+            )
+        except Exception as exc:                      # Step 9 must never take the rest of the dashboard down
+            st.warning(f"Step 9 could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
+    if UI_PAGE == "__all__":
+        try:
+            render_step10_16(
+                df, available_columns,
+                {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
+                timeline,
+            )
+        except Exception as exc:                      # these tabs must never take the rest of the dashboard down
+            st.warning(f"Steps 10-16 could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
+    elif UI_PAGE in UI_S1016_PAGES:
+        try:
+            render_step10_16_page(
+                df, available_columns,
+                {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
+                timeline, UI_S1016_PAGES[UI_PAGE],
+            )
+        except Exception as exc:
+            st.warning(f"This page could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
     top_issues_slot = st.container()  # filled further down, once the group-by choice is known
-    st.markdown("### 📈 Network Overview & Key Metrics")
-    if len(work_df) == 0:
+    if len(work_df) == 0 and UI_PAGE in ("Reports", "Trends", "Compare", "Explorer"):
         st.warning("No calls match the current filters (date range / search). Try a wider range.")
-    kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
+    qc_failed = qc_failed_mask(work_df)   # also needed by the Reports page (the Dashboard block below computes it again, harmlessly)
+    if ui_page_is("Dashboard"):
+        st.markdown("### 📈 Network Overview & Key Metrics")
+        if len(work_df) == 0:
+            st.warning("No calls match the current filters (date range / search). Try a wider range.")
+        kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
 
-    kpi = period_kpis(work_df, selected_qc_col, selected_voip_col)
-    n_calls = kpi["Calls"]
+        kpi = period_kpis(work_df, selected_qc_col, selected_voip_col)
+        n_calls = kpi["Calls"]
 
-    kpi1.metric("Total Filtered Calls", f"{n_calls:,}")
-    kpi2.metric("Qualified Calls", count_with_pct(kpi["Qualified"], n_calls))
-    kpi3.metric("Spam / Fake Calls", count_with_pct(kpi["Spam"], n_calls))
-    kpi4.metric("VoIP Calls", count_with_pct(kpi["VoIP"], n_calls))
-    kpi5.metric("Avg Quality Score", f"{kpi['Avg Score']:.1f}" if not pd.isna(kpi["Avg Score"]) else "0.0")
-    qc_completion = 0.0 if not n_calls else kpi["QC Done"] / n_calls * 100
-    kpi6.metric(
-        "QC Completion",
-        f"{qc_completion:.1f}%",
-        delta=f"{kpi['QC Done']:,} of {n_calls:,} calls",
-        delta_color="off",
-    )
+        kpi1.metric("Total Filtered Calls", f"{n_calls:,}")
+        kpi2.metric("Qualified Calls", count_with_pct(kpi["Qualified"], n_calls))
+        kpi3.metric("Spam / Fake Calls", count_with_pct(kpi["Spam"], n_calls))
+        kpi4.metric("VoIP Calls", count_with_pct(kpi["VoIP"], n_calls))
+        kpi5.metric("Avg Quality Score", f"{kpi['Avg Score']:.1f}" if not pd.isna(kpi["Avg Score"]) else "0.0")
+        qc_completion = 0.0 if not n_calls else kpi["QC Done"] / n_calls * 100
+        kpi6.metric(
+            "QC Completion",
+            f"{qc_completion:.1f}%",
+            delta=f"{kpi['QC Done']:,} of {n_calls:,} calls",
+            delta_color="off",
+        )
 
-    if selected_qc_col != "None":
-        pending = n_calls - kpi["QC Done"]
-        if pending:
+        if selected_qc_col != "None":
+            pending = n_calls - kpi["QC Done"]
+            if pending:
+                st.caption(
+                    f"ℹ️ {pending:,} of {n_calls:,} filtered calls have no completed AI QC result yet "
+                    "(blank in the sheet, or the AI run failed). They count in Total Calls but not as "
+                    "Qualified / Spam, and are left out of Avg Quality Score. All percentages are a share "
+                    "of total calls."
+                )
+
+        qc_failed = qc_failed_mask(work_df)
+        if int(qc_failed.sum()):
             st.caption(
-                f"ℹ️ {pending:,} of {n_calls:,} filtered calls have no completed AI QC result yet "
-                "(blank in the sheet, or the AI run failed). They count in Total Calls but not as "
-                "Qualified / Spam, and are left out of Avg Quality Score. All percentages are a share "
-                "of total calls."
+                f"⚠️ {int(qc_failed.sum()):,} of {n_calls:,} filtered calls had a failed AI QC run "
+                "(Processing error / all AI providers failed). They have no QC result."
             )
 
-    qc_failed = qc_failed_mask(work_df)
-    if int(qc_failed.sum()):
-        st.caption(
-            f"⚠️ {int(qc_failed.sum()):,} of {n_calls:,} filtered calls had a failed AI QC run "
-            "(Processing error / all AI providers failed). They have no QC result."
-        )
+        st.markdown("---")
 
-    st.markdown("---")
+        ui_dashboard_extras(work_df)
 
     # ---------------------------------------------------------------
     # Dimension grouping
     # ---------------------------------------------------------------
     default_dim = available_columns.index("Publisher") if "Publisher" in available_columns else 0
-    selected_dimension = st.selectbox(
-        "Group / Analyze By (All Sheet Headings):", available_columns, index=default_dim
-    )
+    if st.session_state.get("ui_dim_saved") in available_columns:
+        default_dim = available_columns.index(st.session_state["ui_dim_saved"])
+    if ui_page_is("Dashboard", "Reports", "Trends"):
+        selected_dimension = st.selectbox(
+            "Group / Analyze By (All Sheet Headings):", available_columns, index=default_dim, key="ui_dim"
+        )
+    else:
+        selected_dimension = available_columns[default_dim]
+    st.session_state["ui_dim_saved"] = selected_dimension
 
-    if selected_dimension:
+    if selected_dimension and ui_page_is("Dashboard", "Reports", "Trends"):
         temp_df = normalize_groups(work_df, [selected_dimension])
         stats = add_percentages(
             period_stats(temp_df, [selected_dimension], selected_qc_col, selected_voip_col)
@@ -13975,106 +14263,114 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
             summary[col] = summary[col].round(1)
         summary = summary.sort_values(by="Total_Calls", ascending=False).reset_index(drop=True)
 
-        st.subheader(f"Performance Breakdown by {selected_dimension}")
+        if ui_page_is("Reports"):
+            st.subheader(f"Performance Breakdown by {selected_dimension}")
 
-        failing = qc_failure_groups(temp_df, qc_failed.values, selected_dimension)
-        if not failing.empty:
-            parts = [
-                f"**{r[selected_dimension]}** ({int(r['Failed'])} of {int(r['Calls'])} calls, {r['Share']:.0f}%)"
-                for _, r in failing.head(5).iterrows()
-            ]
-            more = f" and {len(failing) - 5} more" if len(failing) > 5 else ""
-            st.warning(
-                f"⚠️ AI QC keeps failing for {selected_dimension}: {', '.join(parts)}{more}. "
-                "These calls have no Qualified / Spam result, so their numbers and health status may be "
-                "incomplete. Check the AI QC automation (API limits or errors) for these rows."
-            )
-
-        if len(summary) > 0:
-            health_counts = summary["Health"].value_counts()
-            st.caption(
-                "Health status: "
-                + " · ".join(
-                    f"{label} {int(health_counts.get(label, 0))}"
-                    for label in ("🟢 HEALTHY", "🟡 WATCH", "🔴 HIGH RISK", "⚪ INSUFFICIENT DATA")
+        if ui_page_is("Dashboard", "Reports"):
+            failing = qc_failure_groups(temp_df, qc_failed.values, selected_dimension)
+            if not failing.empty:
+                parts = [
+                    f"**{r[selected_dimension]}** ({int(r['Failed'])} of {int(r['Calls'])} calls, {r['Share']:.0f}%)"
+                    for _, r in failing.head(5).iterrows()
+                ]
+                more = f" and {len(failing) - 5} more" if len(failing) > 5 else ""
+                st.warning(
+                    f"⚠️ AI QC keeps failing for {selected_dimension}: {', '.join(parts)}{more}. "
+                    "These calls have no Qualified / Spam result, so their numbers and health status may be "
+                    "incomplete. Check the AI QC automation (API limits or errors) for these rows."
                 )
-            )
-            st.bar_chart(summary.set_index(selected_dimension)["Total_Calls"].head(15))
 
-        with st.expander("How health status and percentages are calculated"):
-            st.markdown(health_rules_markdown())
+            if len(summary) > 0:
+                health_counts = summary["Health"].value_counts()
+                st.caption(
+                    "Health status: "
+                    + " · ".join(
+                        f"{label} {int(health_counts.get(label, 0))}"
+                        for label in ("🟢 HEALTHY", "🟡 WATCH", "🔴 HIGH RISK", "⚪ INSUFFICIENT DATA")
+                    )
+                )
+                st.bar_chart(summary.set_index(selected_dimension)["Total_Calls"].head(15))
 
-        st.markdown("💡 *Select multiple rows in the table below to view and export their combined raw details:*")
+        if ui_page_is("Reports"):
+            with st.expander("How health status and percentages are calculated"):
+                st.markdown(health_rules_markdown())
 
-        event = st.dataframe(
-            summary,
-            width="stretch",
-            on_select="rerun",
-            selection_mode="multi-row",
-            column_config=breakdown_column_config(selected_dimension),
-        )
+            st.markdown("💡 *Select multiple rows in the table below to view and export their combined raw details:*")
 
-        selected_rows = event.selection.rows if hasattr(event, "selection") else []
-
-        # Total report: the ticked rows, or everything currently on the page when none are ticked
-        selected_vals = summary.iloc[selected_rows][selected_dimension].tolist() if selected_rows else []
-        report_frame = temp_df[temp_df[selected_dimension].isin(selected_vals)] if selected_vals else temp_df
-        render_total_report(
-            report_frame, selected_dimension, selected_vals, len(summary),
-            selected_qc_col, selected_voip_col, summary.columns,
-        )
-
-        st.download_button(
-            label="📥 Download Breakdown Table as CSV",
-            data=summary.to_csv(index=False).encode("utf-8"),
-            file_name=f"breakdown_by_{selected_dimension}.csv".replace(" ", "_").replace("/", "-"),
-            mime="text/csv",
-            key="dl_breakdown",
-        )
-
-        if selected_rows:
-
-            st.markdown("---")
-            st.subheader(
-                f"🔍 Full Details for selected `{selected_dimension}`: "
-                f"{', '.join(map(str, selected_vals))}"
+            event = st.dataframe(
+                summary,
+                width="stretch",
+                on_select="rerun",
+                selection_mode="multi-row",
+                column_config=breakdown_column_config(selected_dimension),
             )
 
-            filtered_rows = work_df.loc[temp_df[selected_dimension].isin(selected_vals)]
-            st.info(f"Total matching records found: {len(filtered_rows):,}")
-            st.dataframe(filtered_rows, width="stretch")
+            selected_rows = event.selection.rows if hasattr(event, "selection") else []
+
+            # Total report: the ticked rows, or everything currently on the page when none are ticked
+            selected_vals = summary.iloc[selected_rows][selected_dimension].tolist() if selected_rows else []
+            report_frame = temp_df[temp_df[selected_dimension].isin(selected_vals)] if selected_vals else temp_df
+            render_total_report(
+                report_frame, selected_dimension, selected_vals, len(summary),
+                selected_qc_col, selected_voip_col, summary.columns,
+            )
 
             st.download_button(
-                label="📥 Download Filtered Rows as CSV",
-                data=filtered_rows.to_csv(index=False).encode("utf-8"),
-                file_name="filtered_network_records.csv",
+                label="📥 Download Breakdown Table as CSV",
+                data=summary.to_csv(index=False).encode("utf-8"),
+                file_name=f"breakdown_by_{selected_dimension}.csv".replace(" ", "_").replace("/", "-"),
                 mime="text/csv",
+                key="dl_breakdown",
             )
 
-        # Selected timeline -> previous equivalent period -> trends -> actionable insights
-        trend_ctx = compute_trend_context(
-            timeline, work_df, compare_base, selected_dimension, selected_qc_col, selected_voip_col
-        )
-        with top_issues_slot:
-            render_top_issues(trend_ctx, selected_dimension)
-        render_trends_and_insights(
-            timeline, work_df, compare_base, selected_dimension, selected_qc_col, selected_voip_col,
-            ctx=trend_ctx,
-        )
-        render_custom_insights(
-            compare_base, available_columns, selected_dimension, selected_qc_col, selected_voip_col
-        )
+            if selected_rows:
 
-    render_period_comparison(compare_base, available_columns, selected_qc_col, selected_voip_col)
+                st.markdown("---")
+                st.subheader(
+                    f"🔍 Full Details for selected `{selected_dimension}`: "
+                    f"{', '.join(map(str, selected_vals))}"
+                )
+
+                filtered_rows = work_df.loc[temp_df[selected_dimension].isin(selected_vals)]
+                st.info(f"Total matching records found: {len(filtered_rows):,}")
+                st.dataframe(filtered_rows, width="stretch")
+
+                st.download_button(
+                    label="📥 Download Filtered Rows as CSV",
+                    data=filtered_rows.to_csv(index=False).encode("utf-8"),
+                    file_name="filtered_network_records.csv",
+                    mime="text/csv",
+                )
+
+        if ui_page_is("Dashboard", "Trends"):
+            trend_ctx = compute_trend_context(
+                timeline, work_df, compare_base, selected_dimension, selected_qc_col, selected_voip_col
+            )
+            if ui_page_is("Dashboard"):
+                with top_issues_slot:
+                    render_top_issues(trend_ctx, selected_dimension)
+            if ui_page_is("Trends"):
+                render_trends_and_insights(
+                    timeline, work_df, compare_base, selected_dimension, selected_qc_col, selected_voip_col,
+                    ctx=trend_ctx,
+                )
+                render_custom_insights(
+                    compare_base, available_columns, selected_dimension, selected_qc_col, selected_voip_col
+                )
+
+
+    if ui_page_is("Compare"):
+        render_period_comparison(compare_base, available_columns, selected_qc_col, selected_voip_col)
 
     # Step 5A: Analytics Query Layer (reads the loaded sheet; does not change anything above)
-    render_query_layer(
-        df,
-        available_columns,
-        {
-            "qc": selected_qc_col,
-            "line_type": selected_voip_col,
-            "date": date_col_name if date_cols else None,
-        },
-        timeline,
-    )
+    if ui_page_is("Explorer"):
+        render_query_layer(
+            df,
+            available_columns,
+            {
+                "qc": selected_qc_col,
+                "line_type": selected_voip_col,
+                "date": date_col_name if date_cols else None,
+            },
+            timeline,
+        )
