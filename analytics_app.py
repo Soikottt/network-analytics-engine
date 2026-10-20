@@ -116,9 +116,26 @@ button[data-baseweb="tab"][aria-selected="true"]{background:var(--ui-accent-soft
 color:var(--ui-text);font-weight:600;transition:all .15s}
 [data-testid="stMain"] .stButton>button:hover,[data-testid="stMain"] .stDownloadButton>button:hover{border-color:var(--ui-accent);color:var(--ui-accent)}
 [data-testid="stMain"] .stButton>button[kind="primary"],[data-testid="stMain"] .stButton>button[data-testid="stBaseButton-primary"]{background:var(--ui-accent);color:#fff;border-color:var(--ui-accent)}
-[data-testid="stMain"] [data-baseweb="input"],[data-testid="stMain"] [data-baseweb="select"]>div,[data-testid="stMain"] [data-baseweb="textarea"]{background:var(--ui-card);border-radius:10px}
-[data-testid="stMain"] input,[data-testid="stMain"] textarea{color:var(--ui-text)}
 [data-testid="stChatMessage"]{background:var(--ui-card);border:1px solid var(--ui-border);border-radius:14px}
+
+
+/* input boxes, drop-downs, pickers: always navy with WHITE text (same in Streamlit light and dark mode) */
+[data-baseweb="input"],[data-baseweb="base-input"],[data-baseweb="textarea"],[data-baseweb="select"]>div,[data-testid="stChatInput"]>div,[data-testid="stChatInput"] textarea{
+background:#12294a!important;border:1px solid #2f4f82!important;border-radius:10px!important;color:#ffffff!important}
+[data-baseweb="input"] input,[data-baseweb="base-input"] input,[data-baseweb="textarea"] textarea,textarea,input[type="text"],input[type="number"],input[type="password"],input[type="search"],input[type="date"]{
+color:#ffffff!important;-webkit-text-fill-color:#ffffff!important;caret-color:#ffffff!important;background:transparent!important}
+input::placeholder,textarea::placeholder{color:#9fb3d1!important;-webkit-text-fill-color:#9fb3d1!important;opacity:1}
+[data-baseweb="select"] *,[data-baseweb="select"] input{color:#ffffff!important;-webkit-text-fill-color:#ffffff!important}
+[data-baseweb="select"] svg,[data-baseweb="input"] svg,[data-baseweb="base-input"] svg{fill:#ffffff!important;color:#ffffff!important}
+[data-baseweb="input"] button,[data-baseweb="base-input"] button{background:transparent!important}
+[data-baseweb="input"]:focus-within,[data-baseweb="base-input"]:focus-within,[data-baseweb="select"]:focus-within>div{border-color:#60a5fa!important;box-shadow:0 0 0 2px rgba(96,165,250,.35)!important}
+[data-baseweb="popover"],[data-baseweb="popover"]>div,[data-baseweb="menu"],ul[role="listbox"],[data-baseweb="calendar"]{background:#0f2747!important;color:#ffffff!important}
+[data-baseweb="popover"] *,[data-baseweb="menu"] *,ul[role="listbox"] *,[data-baseweb="calendar"] *{color:#ffffff!important;-webkit-text-fill-color:#ffffff!important}
+[data-baseweb="menu"] li:hover,ul[role="listbox"] li:hover,[role="option"]:hover,[role="option"][aria-selected="true"]{background:#1d4ed8!important}
+[data-baseweb="calendar"] [aria-selected="true"]{background:#2563eb!important}
+[data-baseweb="tag"]{background:#2563eb!important}[data-baseweb="tag"] *{color:#ffffff!important}
+[data-testid="stNumberInput"] button{color:#ffffff!important;background:#1b3a66!important}
+[data-testid="stSelectbox"] label,[data-testid="stTextInput"] label,[data-testid="stNumberInput"] label{font-weight:600}
 
 /* sidebar */
 [data-testid="stSidebar"]{background:linear-gradient(185deg,var(--ui-navy) 0%,var(--ui-navy2) 100%);border-right:0}
@@ -126,8 +143,6 @@ color:var(--ui-text);font-weight:600;transition:all .15s}
 [data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:#f1f5f9!important;font-size:.78rem!important;font-weight:750!important;letter-spacing:.1em;text-transform:uppercase}
 [data-testid="stSidebar"] hr{border-color:rgba(255,255,255,.1)}
 [data-testid="stSidebar"] a{color:#93c5fd!important}
-[data-testid="stSidebar"] input,[data-testid="stSidebar"] textarea,[data-testid="stSidebar"] [data-baseweb="select"] *{color:#0f172a!important}
-[data-testid="stSidebar"] [data-baseweb="input"],[data-testid="stSidebar"] [data-baseweb="select"]>div{background:#f8fafc;border-radius:9px}
 [data-testid="stSidebar"] .stButton>button{background:var(--ui-accent);border:0;color:#fff!important;font-weight:650;border-radius:10px;width:100%}
 [data-testid="stSidebar"] .stButton>button *{color:#fff!important}
 [data-testid="stSidebar"] [data-testid="stExpander"]{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12)!important;border-radius:10px}
