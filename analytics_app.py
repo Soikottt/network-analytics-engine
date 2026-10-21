@@ -39,6 +39,13 @@ UI_SECTIONS = [
         ("Trends", "📈", "Trends & Insights", "How the selected period compares with the equivalent previous period, and what to do about it."),
         ("Compare", "⚖️", "Compare Periods", "Side-by-side comparison of any two dates or periods, for publishers, buyers and campaigns."),
     ]),
+    ("NETWORK MONEY", [
+        ("Money", "💰", "Ringba Summary", "Calls, revenue, payout and profit from Ringba, grouped like the Ringba screen."),
+        ("Econ", "🏦", "Publisher Economics", "Profit and margin by publisher, campaign or buyer, with the period before it and the biggest movers."),
+        ("QxP", "🎯", "Quality × Profit", "Money next to AI-QC quality, for the days the QC sheet covers."),
+        ("Recon", "🔗", "Reconciliation", "Ringba incoming calls versus the QC sheet, day by day."),
+        ("RbSync", "🔄", "Ringba Sync", "Load and refresh Ringba data (read-only API): 13 months of history, last 14 days re-checked."),
+    ]),
     ("INTELLIGENCE", [
         ("Briefing", "🧠", "Network Briefing", "Plain-language summary, root causes and recommendations from the loaded data."),
         ("Assistant", "🤖", "AI Assistant", "Ask questions in plain words (English, Banglish or Bengali). Python calculates every number."),
@@ -13978,6 +13985,924 @@ GOLDEN_QUESTIONS += [("What are my overdue operations tasks?", "ok*"), ("Show pe
                      ("Generate today's operations briefing", "ok*"), ("Prepare a dry-run proposal to review publisher {pub}", "ok*"), ("Block publisher {pub} now", "refuse")]
 
 
+# =====================================================================================================================
+# RINGBA ECONOMICS (read-only). Ringba's Insights API supplies every call + money (revenue, payout, profit); the QC sheet supplies quality for the
+# days it covers. The two are joined ONLY where both exist: a day without QC shows "not available", never 0 %. Python calculates every number.
+# The token is read from Secrets / environment only; it is never shown, logged, stored or put into an error text. Nothing here writes to Ringba.
+# =====================================================================================================================
+RB_HOST = "https://api.ringba.com/v2"
+RB_VALUE_COLUMNS = [("callCount", "calls"), ("completedCalls", "completed"), ("connectedCallCount", "connected"), ("payoutCount", "paid"), ("convertedCalls", "converted"),
+                    ("nonConnectedCallCount", "no_connect"), ("duplicateCalls", "duplicate"), ("blockedCalls", "blocked"), ("incompleteCalls", "ivr_hangup"),
+                    ("conversionAmount", "revenue"), ("payoutAmount", "payout"), ("profitGross", "profit"), ("totalCost", "total_cost"), ("callLengthInSeconds", "tcl_seconds")]
+RB_GROUPS = [("publisherName", "publisher"), ("campaignName", "campaign"), ("buyer", "buyer")]
+RB_METRICS = [k for _c, k in RB_VALUE_COLUMNS]
+RB_UNASSIGNED = "(unassigned)"
+RB_TAB, RB_DAYS_TAB = "Ringba Daily", "Ringba Days"
+RB_PAGES = ("Money", "Econ", "QxP", "Recon", "RbSync")
+RB_PRESETS = ["Today", "Yesterday", "Last 7 days", "Last 30 days", "This week", "Last week", "This month", "Last month", "Last 6 months", "Last 13 months", "Custom range"]
+RB_DEFINITIONS = ("Revenue = Ringba conversionAmount; Payout = payoutAmount; Profit = Ringba profitGross (gross, as Ringba defines it); Margin = Profit / Revenue; "
+                  "Conversion % = Converted / Incoming; Revenue per call = Revenue / Incoming. Margin, Conversion % and Revenue per call are calculated by this app, "
+                  "so they can differ slightly from Ringba's own screen. A figure Ringba did not return is shown as '-', never as 0.")
+S16_PERMS.setdefault("ringba_sync", "open")
+
+
+class RbError(Exception):
+    """kind: config | auth | rejected | rate | server | network | bad_response"""
+    def __init__(self, kind, status=0):
+        super().__init__(kind)
+        self.kind, self.status = kind, status
+
+
+RB_ERROR_TEXT = {
+    "config": "Ringba is not configured (see the list above).",
+    "auth": "Ringba refused the token (HTTP 401/403). Check RINGBA_API_TOKEN and that the token may read reports.",
+    "rejected": "Ringba rejected the request (HTTP 400/404/422). The account id or the report columns may be wrong.",
+    "rate": "Ringba is limiting requests (HTTP 429). Wait a minute and sync again; nothing was lost.",
+    "server": "Ringba had a server problem (HTTP 5xx). Try again later; nothing was lost.",
+    "network": "Could not reach Ringba (network error or timeout). Try again.",
+    "bad_response": "Ringba answered in a format this app does not recognise.",
+}
+
+
+def rb_config(over=None):
+    import zoneinfo
+    nm = _cfg("RINGBA_NAME_MAP", "")
+    try:
+        name_map = dict(nm) if hasattr(nm, "items") else (json.loads(str(nm)) if str(nm).strip() else {})
+        name_map = {str(k): str(v) for k, v in name_map.items()}
+    except Exception:
+        name_map = {}
+    cfg = {"token": _cfg("RINGBA_API_TOKEN", ""), "account": _cfg("RINGBA_ACCOUNT_ID", ""), "tz": _cfg("RINGBA_TIMEZONE", "America/New_York"),
+           "months": int(_cfg_num("RINGBA_BACKFILL_MONTHS", 13, 1, 60)), "refresh_days": int(_cfg_num("RINGBA_REFRESH_DAYS", 14, 1, 60)),
+           "cap": int(_cfg_num("RINGBA_MAX_ROWS", 1000, 100, 10000)), "timeout": int(_cfg_num("RINGBA_TIMEOUT", 30, 5, 120)),
+           "budget": int(_cfg_num("RINGBA_SYNC_SECONDS", 90, 10, 600)), "retries": 3, "min_calls": 30, "min_qc": 20, "qc_cov_start": 0.20, "name_map": name_map,
+           "sheet_sync": (_s9_truthy(_cfg("RINGBA_SHEET_SYNC", "")) if str(_cfg("RINGBA_SHEET_SYNC", "")).strip() else s9_sync_enabled())}
+    cfg.update(over or {})
+    problems = []
+    if not str(cfg["token"]).strip():
+        problems.append("RINGBA_API_TOKEN is missing (add it to Streamlit Secrets).")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,80}", str(cfg["account"]).strip()):
+        problems.append("RINGBA_ACCOUNT_ID is missing or not valid (letters / digits only).")
+    try:
+        zoneinfo.ZoneInfo(cfg["tz"])
+    except Exception:
+        problems.append(f"RINGBA_TIMEZONE '{cfg['tz']}' is not a valid time-zone name (example: America/New_York).")
+    cfg["problems"] = problems
+    return cfg
+
+
+def rb_status_public(cfg):
+    """Everything that may be shown on screen: booleans and settings, never the token."""
+    return {"token_set": bool(str(cfg["token"]).strip()), "account_set": bool(str(cfg["account"]).strip()), "tz": cfg["tz"], "months": cfg["months"],
+            "refresh_days": cfg["refresh_days"], "cap": cfg["cap"], "sheet_sync": cfg["sheet_sync"], "problems": list(cfg["problems"])}
+
+
+def rb_scrub(text, cfg):
+    t = str(text or "")
+    for secret in (cfg.get("token"), ):
+        if secret and str(secret) in t:
+            t = t.replace(str(secret), "***")
+    t = re.sub(r"(?i)(token|bearer|authorization)\s*[:=]?\s*[A-Za-z0-9._\-]{12,}", r"\1 ***", t)
+    return t[:200]
+
+
+def rb_day_bounds(day, tz):
+    """[start, end] of one LOCAL calendar day in `tz`, as UTC instants ('...Z'). DST-safe."""
+    import zoneinfo
+    z = zoneinfo.ZoneInfo(tz)
+    d0 = pd.Timestamp(day).normalize()
+    s = d0.tz_localize(z, ambiguous=True, nonexistent="shift_forward")
+    e = (d0 + pd.Timedelta(days=1)).tz_localize(z, ambiguous=True, nonexistent="shift_forward") - pd.Timedelta(seconds=1)
+    f = "%Y-%m-%dT%H:%M:%SZ"
+    return s.tz_convert("UTC").strftime(f), e.tz_convert("UTC").strftime(f)
+
+
+def rb_payload(day, cfg, groups=None):
+    start, end = rb_day_bounds(day, cfg["tz"])
+    gb = RB_GROUPS if groups is None else groups
+    return {"reportStart": start, "reportEnd": end,
+            "groupByColumns": [{"column": c, "displayName": k.title()} for c, k in gb],
+            "valueColumns": [{"column": c, "aggregateFunction": None} for c, _k in RB_VALUE_COLUMNS],
+            "orderByColumns": [{"column": "callCount", "direction": "desc"}],
+            "formatTimespans": False, "formatPercentages": False, "generateRollups": False,
+            "maxResultsPerGroup": int(cfg["cap"]), "filters": [], "formatTimeZone": cfg["tz"]}
+
+
+def rb_http(url, token, payload, timeout):
+    """The real transport (tests pass a fake one). Returns (status, text). Raises RbError('network')."""
+    import urllib.request, urllib.error, socket
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST",
+                                 headers={"Authorization": f"Token {token}", "Content-Type": "application/json", "Accept": "application/json",
+                                          "User-Agent": "network-intelligence-dashboard/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        return exc.code, body
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError):
+        raise RbError("network")
+
+
+def rb_call(payload, cfg, transport=None, sleep=None):
+    """POST to the Insights endpoint with timeout, retry and back-off (429 / 5xx / network). Returns the parsed JSON dict. Raises RbError (no secrets in it)."""
+    if cfg["problems"]:
+        raise RbError("config")
+    import time as _t
+    sleep = sleep or _t.sleep
+    transport = transport or rb_http
+    url = f"{RB_HOST}/{str(cfg['account']).strip()}/insights"
+    last = None
+    for attempt in range(int(cfg["retries"])):
+        try:
+            status, text = transport(url, cfg["token"], payload, cfg["timeout"])
+        except RbError as exc:
+            last = exc
+        else:
+            if status == 200:
+                try:
+                    obj = json.loads(text)
+                except Exception:
+                    raise RbError("bad_response", 200)
+                if not isinstance(obj, dict):
+                    raise RbError("bad_response", 200)
+                return obj
+            if status in (401, 403):
+                raise RbError("auth", status)
+            if status in (400, 404, 405, 415, 422):
+                raise RbError("rejected", status)
+            last = RbError("rate" if status == 429 else "server", status)
+        if attempt < int(cfg["retries"]) - 1:
+            sleep(2 ** attempt)
+    raise last or RbError("network")
+
+
+def rb_num(v):
+    """Ringba value -> float. Missing / blank / non-numeric -> NaN (missing is not zero). Accepts '$1,590.00', '58.82%', '00:52:14' (seconds)."""
+    if v is None or isinstance(v, bool):
+        return float("nan")
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s or s.lower() in ("none", "null", "nan", "n/a", "-"):
+        return float("nan")
+    s = s.replace("$", "").replace(",", "").replace("%", "").strip()
+    if re.fullmatch(r"\d+:\d{2}:\d{2}", s):
+        h, m_, sec = s.split(":")
+        return float(int(h) * 3600 + int(m_) * 60 + int(sec))
+    try:
+        return float(s)
+    except ValueError:
+        return float("nan")
+
+
+def rb_parse(resp, day, groups=None):
+    rep = resp.get("report", resp) if isinstance(resp, dict) else {}
+    recs = rep.get("records") if isinstance(rep, dict) else None
+    if not isinstance(recs, list):
+        raise RbError("bad_response", 200)
+    gb = RB_GROUPS if groups is None else groups
+    rows = []
+    for rec in recs:
+        if not isinstance(rec, dict):
+            continue
+        row = {"day": pd.Timestamp(day).date().isoformat()}
+        for col, key in RB_GROUPS:
+            v = rec.get(col) if (col, key) in gb else None
+            row[key] = str(v).strip() if v not in (None, "") else RB_UNASSIGNED
+        for col, key in RB_VALUE_COLUMNS:
+            row[key] = rb_num(rec.get(col))
+        rows.append(row)
+    return rows, len(recs)
+
+
+def rb_merge_rows(rows):
+    """Collapse duplicate (day, publisher, campaign, buyer) keys; NaN-aware (all-missing stays missing)."""
+    if not rows:
+        return []
+    df = pd.DataFrame(rows)
+    g = df.groupby(["day", "publisher", "campaign", "buyer"], sort=False)[RB_METRICS].sum(min_count=1).reset_index()
+    return g.to_dict("records")
+
+
+def rb_fetch_day(day, cfg, transport=None, sleep=None):
+    resp = rb_call(rb_payload(day, cfg), cfg, transport, sleep)
+    rows, n = rb_parse(resp, day)
+    return rb_merge_rows(rows), {"n_records": n, "truncated": n >= int(cfg["cap"])}
+
+
+# ---------------- local cache (SQLite via the Step 9 store) ----------------
+RB_DAILY_DDL = ("CREATE TABLE IF NOT EXISTS rb_daily (day TEXT NOT NULL, publisher TEXT NOT NULL, campaign TEXT NOT NULL, buyer TEXT NOT NULL, calls REAL, completed REAL, "
+                "connected REAL, paid REAL, converted REAL, no_connect REAL, duplicate REAL, blocked REAL, ivr_hangup REAL, revenue REAL, payout REAL, profit REAL, "
+                "total_cost REAL, tcl_seconds REAL, PRIMARY KEY (day, publisher, campaign, buyer))")
+RB_DAYS_DDL = ("CREATE TABLE IF NOT EXISTS rb_days (day TEXT PRIMARY KEY, status TEXT NOT NULL, fetched_at TEXT, n_rows INTEGER, n_records INTEGER, "
+               "truncated INTEGER DEFAULT 0, error TEXT)")
+RB_KEYS = ["day", "publisher", "campaign", "buyer"] + RB_METRICS
+
+
+def rb_init(store):
+    def fn(c):
+        c.execute(RB_DAILY_DDL)
+        c.execute(RB_DAYS_DDL)
+        c.execute("CREATE INDEX IF NOT EXISTS rb_daily_day ON rb_daily(day)")
+    store._tx(fn)
+
+
+def _rb_sql_val(v):
+    return None if (v is None or (isinstance(v, float) and v != v)) else v
+
+
+def rb_save_day(store, day, rows, meta, today=None, now=None, status=None):
+    ds = pd.Timestamp(day).date().isoformat()
+    td = pd.Timestamp(today).date().isoformat() if today is not None else None
+    st_ = status or ("truncated" if meta.get("truncated") else ("partial" if td and ds >= td else "ok"))
+    ts = (pd.Timestamp(now) if now is not None else pd.Timestamp.now()).strftime("%Y-%m-%d %H:%M:%S")
+    data = [tuple(_rb_sql_val(r.get(k)) for k in RB_KEYS) for r in rows]
+
+    def fn(c):
+        c.execute("DELETE FROM rb_daily WHERE day = ?", (ds,))
+        if data:
+            c.executemany("INSERT OR REPLACE INTO rb_daily(" + ",".join(RB_KEYS) + ") VALUES (" + ",".join("?" * len(RB_KEYS)) + ")", data)
+        c.execute("INSERT OR REPLACE INTO rb_days(day, status, fetched_at, n_rows, n_records, truncated, error) VALUES (?,?,?,?,?,?,?)",
+                  (ds, st_, ts, len(data), int(meta.get("n_records", len(data))), int(bool(meta.get("truncated"))), ""))
+    store._tx(fn)
+    return st_
+
+
+def rb_mark_failed(store, day, kind, now=None):
+    ds = pd.Timestamp(day).date().isoformat()
+    ts = (pd.Timestamp(now) if now is not None else pd.Timestamp.now()).strftime("%Y-%m-%d %H:%M:%S")
+
+    def fn(c):
+        if c.execute("SELECT 1 FROM rb_days WHERE day = ?", (ds,)).fetchone():
+            c.execute("UPDATE rb_days SET error = ? WHERE day = ?", (str(kind)[:40], ds))
+        else:
+            c.execute("INSERT INTO rb_days(day, status, fetched_at, n_rows, n_records, truncated, error) VALUES (?,?,?,?,?,?,?)", (ds, "failed", ts, 0, 0, 0, str(kind)[:40]))
+    store._tx(fn)
+
+
+def rb_days_df(store):
+    return pd.DataFrame(store._q("SELECT day, status, fetched_at, n_rows, n_records, truncated, error FROM rb_days ORDER BY day"),
+                        columns=["day", "status", "fetched_at", "n_rows", "n_records", "truncated", "error"])
+
+
+def rb_frame(store, start=None, end=None):
+    where, args = "", []
+    if start is not None:
+        where += " AND day >= ?"
+        args.append(pd.Timestamp(start).date().isoformat())
+    if end is not None:
+        where += " AND day <= ?"
+        args.append(pd.Timestamp(end).date().isoformat())
+    df = pd.DataFrame(store._q("SELECT " + ",".join(RB_KEYS) + " FROM rb_daily WHERE 1=1" + where + " ORDER BY day", tuple(args)), columns=RB_KEYS)
+    for k in RB_METRICS:
+        df[k] = pd.to_numeric(df[k], errors="coerce")
+    return df
+
+
+def rb_window_days(cfg, today):
+    t = pd.Timestamp(today).normalize()
+    first = (t - pd.DateOffset(months=int(cfg["months"]))).normalize()
+    return [d.date() for d in pd.date_range(first, t)]
+
+
+def rb_missing_days(store, cfg, today):
+    """Days of the backfill window with no complete data, newest first. 'partial' (fetched while the day was still running) and 'failed' count as missing."""
+    have = {r["day"] for r in store._q("SELECT day FROM rb_days WHERE status IN ('ok','truncated')")}
+    td = pd.Timestamp(today).date().isoformat()
+    have |= {r["day"] for r in store._q("SELECT day FROM rb_days WHERE status = 'partial' AND day >= ?", (td,))}      # today is expected to be partial; it is re-fetched by the recent refresh
+    return [d for d in reversed(rb_window_days(cfg, today)) if d.isoformat() not in have]
+
+
+def rb_sync(store, cfg, mode="recent", today=None, transport=None, sleep=None, clock=None, now=None, progress=None):
+    """mode 'recent' = re-fetch the last refresh_days (late payouts / adjustments); 'backfill' = fetch the missing days, newest first.
+    Stops at the time budget (resume by pressing again), on auth / rejected errors (they would fail every day), or after 3 failures in a row."""
+    import time as _t
+    clock = clock or _t.monotonic
+    t0 = clock()
+    today = pd.Timestamp(today if today is not None else pd.Timestamp.now(tz=cfg["tz"]).tz_localize(None)).normalize()
+    if mode == "recent":
+        days = [d.date() for d in pd.date_range(today - pd.Timedelta(days=int(cfg["refresh_days"]) - 1), today)][::-1]
+    else:
+        days = rb_missing_days(store, cfg, today)
+    out = {"mode": mode, "fetched": 0, "failed": [], "truncated": [], "remaining": 0, "stopped": "", "planned": len(days), "rows": 0}
+    if cfg["problems"]:
+        out["stopped"] = "config"
+        return out
+    rb_init(store)
+    consecutive = 0
+    for i, d in enumerate(days):
+        if clock() - t0 >= float(cfg["budget"]):
+            out["stopped"], out["remaining"] = "time budget reached - press the button again to continue", len(days) - i
+            break
+        try:
+            rows, meta = rb_fetch_day(d, cfg, transport, sleep)
+        except RbError as exc:
+            rb_mark_failed(store, d, exc.kind, now)
+            out["failed"].append((d.isoformat(), exc.kind))
+            consecutive += 1
+            if exc.kind in ("auth", "rejected", "config"):
+                out["stopped"], out["remaining"] = exc.kind, len(days) - i - 1
+                break
+            if consecutive >= 3:
+                out["stopped"], out["remaining"] = "three failures in a row", len(days) - i - 1
+                break
+            continue
+        consecutive = 0
+        stt = rb_save_day(store, d, rows, meta, today=today, now=now)
+        out["fetched"] += 1
+        out["rows"] += len(rows)
+        if stt == "truncated":
+            out["truncated"].append(d.isoformat())
+        if progress:
+            progress(i + 1, len(days), d)
+    return out
+
+
+def rb_verify_day(cfg, day, transport=None, sleep=None):
+    """Cross-check one day: the detailed report (publisher x campaign x buyer) must add up to the same calls and revenue as a publisher-only report."""
+    gb_pub = [("publisherName", "publisher")]
+    det, n_det = rb_parse(rb_call(rb_payload(day, cfg), cfg, transport, sleep), day)
+    pub, n_pub = rb_parse(rb_call(rb_payload(day, cfg, groups=gb_pub), cfg, transport, sleep), day, groups=gb_pub)
+    s = lambda rows, k: float(pd.to_numeric(pd.Series([r[k] for r in rows]), errors="coerce").sum(min_count=1)) if rows else float("nan")
+    d_calls, p_calls, d_rev, p_rev = s(det, "calls"), s(pub, "calls"), s(det, "revenue"), s(pub, "revenue")
+    same = (d_calls == p_calls or (d_calls != d_calls and p_calls != p_calls)) and (abs(d_rev - p_rev) < 0.01 or (d_rev != d_rev and p_rev != p_rev))
+    return {"day": pd.Timestamp(day).date().isoformat(), "detail_rows": n_det, "publisher_rows": n_pub, "detail_calls": d_calls, "publisher_calls": p_calls, "detail_revenue": d_rev,
+            "publisher_revenue": p_rev, "match": bool(same), "truncated": n_det >= int(cfg["cap"])}
+
+
+# ---------------- optional persistence in the Google Sheet (Streamlit Cloud erases local files) ----------------
+def rb_sheet_push(store, spreadsheet, chunk=5000):
+    try:
+        df, days = rb_frame(store), rb_days_df(store)
+        rows = [RB_KEYS] + [[("" if (isinstance(v, float) and v != v) or v is None else v) for v in r] for r in df[RB_KEYS].itertuples(index=False, name=None)]
+        cells = len(rows) * len(RB_KEYS)
+        if cells > 4_000_000:
+            return False, f"Not backed up: {cells:,} cells would be too close to the Google Sheets limit (10 million per workbook)."
+
+        def tab(title, matrix):
+            try:
+                ws = spreadsheet.worksheet(title)
+            except Exception:
+                ws = spreadsheet.add_worksheet(title=title, rows=max(1000, len(matrix) + 50), cols=max(8, len(matrix[0])))
+            ws.clear()
+            for i in range(0, len(matrix), chunk):
+                ws.update(values=matrix[i:i + chunk], range_name=f"A{i + 1}")
+        tab(RB_TAB, rows)
+        tab(RB_DAYS_TAB, [list(days.columns)] + [["" if (v is None or (isinstance(v, float) and v != v)) else v for v in r] for r in days.itertuples(index=False, name=None)])
+        return True, f"Backed up {len(df):,} Ringba rows to the '{RB_TAB}' tab."
+    except Exception as exc:
+        return False, f"Backup of the Ringba cache to the sheet failed ({type(exc).__name__}); the local cache is unaffected."
+
+
+def rb_sheet_pull(store, spreadsheet):
+    """Restore into an EMPTY local cache. Returns (restored, message)."""
+    try:
+        rb_init(store)
+        if store._q("SELECT COUNT(*) n FROM rb_days")[0]["n"]:
+            return False, "The local Ringba cache already has data; nothing restored."
+        vals = spreadsheet.worksheet(RB_TAB).get_all_values()
+        dvals = []
+        try:
+            dvals = spreadsheet.worksheet(RB_DAYS_TAB).get_all_values()
+        except Exception:
+            dvals = []
+    except Exception:
+        return False, "No Ringba backup tab found."
+    if len(vals) < 2 or [str(x) for x in vals[0]] != RB_KEYS:
+        return False, "The Ringba backup tab has an unexpected layout; nothing restored."
+    data = []
+    for r in vals[1:]:
+        if len(r) < len(RB_KEYS) or not str(r[0]).strip():
+            continue
+        data.append(tuple(list(r[:4]) + [(None if str(x).strip() == "" else rb_num(x)) for x in r[4:len(RB_KEYS)]]))
+    dd = []
+    if len(dvals) > 1:
+        for r in dvals[1:]:
+            if len(r) >= 7 and str(r[0]).strip():
+                dd.append((str(r[0]), str(r[1]) or "ok", str(r[2]), int(rb_num(r[3]) or 0) if rb_num(r[3]) == rb_num(r[3]) else 0, int(rb_num(r[4])) if rb_num(r[4]) == rb_num(r[4]) else 0,
+                           int(rb_num(r[5])) if rb_num(r[5]) == rb_num(r[5]) else 0, str(r[6])))
+    else:
+        dd = [(d, "ok", "", 0, 0, 0, "") for d in sorted({r[0] for r in data})]
+
+    def fn(c):
+        c.executemany("INSERT OR REPLACE INTO rb_daily(" + ",".join(RB_KEYS) + ") VALUES (" + ",".join("?" * len(RB_KEYS)) + ")", [tuple(_rb_sql_val(v) for v in r) for r in data])
+        c.executemany("INSERT OR REPLACE INTO rb_days(day, status, fetched_at, n_rows, n_records, truncated, error) VALUES (?,?,?,?,?,?,?)", dd)
+    store._tx(fn)
+    return True, f"Restored {len(data):,} Ringba rows ({len(dd)} days) from the sheet backup."
+
+
+# ---------------- numbers ----------------
+def rb_derive(t):
+    t = t.copy()
+    div = lambda a, b: (t[a] / t[b].where(t[b] > 0)) if a in t.columns and b in t.columns else float("nan")
+    t["margin"] = div("profit", "revenue")
+    t["conv_rate"] = div("converted", "calls")
+    t["rev_per_call"] = div("revenue", "calls")
+    t["connect_rate"] = div("connected", "calls")
+    return t
+
+
+def rb_aggregate(df, by=None):
+    """Sum the daily rows per entity (NaN-aware: an all-missing group stays missing) and add the derived ratios."""
+    by = list(by or [])
+    if df is None or not len(df):
+        return pd.DataFrame(columns=by + RB_METRICS + ["margin", "conv_rate", "rev_per_call", "connect_rate"])
+    if by:
+        t = df.groupby(by, sort=False)[RB_METRICS].sum(min_count=1).reset_index()
+    else:
+        t = df[RB_METRICS].sum(min_count=1).to_frame().T
+    return rb_derive(t)
+
+
+def rb_preset_range(preset, today):
+    t = pd.Timestamp(today).normalize()
+    wk = t - pd.Timedelta(days=t.weekday())
+    first_this = t.replace(day=1)
+    last_month_end = first_this - pd.Timedelta(days=1)
+    r = {"Today": (t, t), "Yesterday": (t - pd.Timedelta(days=1), t - pd.Timedelta(days=1)), "Last 7 days": (t - pd.Timedelta(days=6), t),
+         "Last 30 days": (t - pd.Timedelta(days=29), t), "This week": (wk, t), "Last week": (wk - pd.Timedelta(days=7), wk - pd.Timedelta(days=1)),
+         "This month": (first_this, t), "Last month": (last_month_end.replace(day=1), last_month_end),
+         "Last 6 months": ((t - pd.DateOffset(months=6)).normalize(), t), "Last 13 months": ((t - pd.DateOffset(months=13)).normalize(), t)}
+    a, b = r.get(preset, (t - pd.Timedelta(days=29), t))
+    return a.date(), b.date()
+
+
+def rb_effective_range(start, end, today, exclude_today=True):
+    """Complete days only (default): today is still running, so it would make every comparison unfair. Returns (start, end, note)."""
+    s, e, t = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize(), pd.Timestamp(today).normalize()
+    note = ""
+    if exclude_today and e >= t:
+        e = t - pd.Timedelta(days=1)
+        note = "Today is excluded because the day is not finished."
+    if s > e:
+        return None, None, "The selected range has no complete day."
+    return s.date(), e.date(), note
+
+
+def rb_previous_range(start, end):
+    s, e = pd.Timestamp(start), pd.Timestamp(end)
+    n = (e - s).days + 1
+    return (s - pd.Timedelta(days=n)).date(), (s - pd.Timedelta(days=1)).date()
+
+
+def rb_coverage(store, start, end):
+    """(days in range, days with complete data, missing day list). A missing day is unknown, never zero."""
+    want = [d.date().isoformat() for d in pd.date_range(start, end)]
+    have = {r["day"] for r in store._q("SELECT day FROM rb_days WHERE status IN ('ok','truncated','partial')")}
+    miss = [d for d in want if d not in have]
+    return len(want), len(want) - len(miss), miss
+
+
+def rb_norm(s):
+    return re.sub(r"\s+", " ", str(s or "").strip().lower())
+
+
+def rb_match_names(rb_names, qc_names, name_map=None):
+    """Exact (case / spacing-insensitive) matches plus the explicit RINGBA_NAME_MAP. Close spellings are only SUGGESTED, never applied.
+    Returns (pairs {ringba name: qc name}, unmatched_ringba, unmatched_qc, suggestions {ringba name: [qc names]})."""
+    import difflib
+    nm = {rb_norm(k): v for k, v in (name_map or {}).items()}
+    qc_by = {}
+    for q in qc_names:
+        qc_by.setdefault(rb_norm(q), q)
+    pairs, un_rb = {}, []
+    for r in rb_names:
+        key = rb_norm(nm.get(rb_norm(r), r))
+        if key in qc_by:
+            pairs[r] = qc_by[key]
+        else:
+            un_rb.append(r)
+    used = {rb_norm(v) for v in pairs.values()}
+    un_qc = [q for q in qc_names if rb_norm(q) not in used]
+    sug = {}
+    for r in un_rb:
+        close = difflib.get_close_matches(rb_norm(r), [rb_norm(q) for q in un_qc], n=2, cutoff=0.75)
+        if close:
+            sug[r] = [next(q for q in un_qc if rb_norm(q) == c) for c in close]
+    return pairs, un_rb, un_qc, sug
+
+
+def rb_qc_window(m, cfg):
+    """First / last day with real QC: a day counts when at least qc_cov_start of its sheet calls have a completed QC (and >= min_qc calls). Returns (start, end, daily)."""
+    if m is None or not len(m):
+        return None, None, pd.DataFrame()
+    d = m.assign(_day=m["ts"].dt.floor("D")).groupby("_day")[["_one", "_qc"]].sum()
+    d["cov"] = d["_qc"] / d["_one"]
+    ok = d[(d["cov"] >= float(cfg["qc_cov_start"])) & (d["_qc"] >= float(cfg["min_qc"]))]
+    if ok.empty:
+        return None, None, d
+    return ok.index.min().date(), ok.index.max().date(), d
+
+
+def rb_quality_profit(rbdf, m, cfg, start, end):
+    """One row per publisher: Ringba money for [start, end] next to the QC sheet's quality for the same days. QC rates keep their sample size and a Wilson interval;
+    an estimate for ALL calls is shown only with enough QC-reviewed calls, and is labelled as an estimate (the QC-reviewed calls are not a random sample)."""
+    s_ts, e_ts = pd.Timestamp(start), pd.Timestamp(end) + pd.Timedelta(days=1)
+    rbw = rbdf[(rbdf["day"] >= pd.Timestamp(start).date().isoformat()) & (rbdf["day"] <= pd.Timestamp(end).date().isoformat())]
+    money = rb_aggregate(rbw, ["publisher"])
+    mw = m[(m["ts"] >= s_ts) & (m["ts"] < e_ts)]
+    pairs, un_rb, un_qc, sug = rb_match_names(list(money["publisher"]), sorted(mw["publisher"].unique()), cfg.get("name_map"))
+    money["_qc_name"] = money["publisher"].map(pairs)
+    qc = mw.groupby("publisher")[["_one", "_qc", "_spam", "_line_ok", "_voip", "_sc_ok", "_sc"]].sum()
+    t = money.merge(qc, how="left", left_on="_qc_name", right_index=True)
+    t["matched"] = t["_qc_name"].notna()
+    t = t.rename(columns={"_one": "qc_rows", "_qc": "qc_done", "_spam": "spam_x", "_line_ok": "line_n", "_voip": "voip_x", "_sc_ok": "score_n", "_sc": "score_sum"})
+    for c in ("qc_rows", "qc_done", "spam_x", "line_n", "voip_x", "score_n", "score_sum"):
+        t.loc[~t["matched"], c] = float("nan")          # not in the QC sheet at all: unknown, not zero
+    n_ = t["qc_done"]
+    t["spam_rate"] = t["spam_x"] / n_.where(n_ > 0)
+    t["voip_rate"] = t["voip_x"] / t["line_n"].where(t["line_n"] > 0)
+    t["avg_score"] = t["score_sum"] / t["score_n"].where(t["score_n"] > 0)
+    t["qc_coverage"] = t["qc_done"] / t["calls"].where(t["calls"] > 0)
+    lo, hi = [], []
+    for x, n in zip(t["spam_x"], t["qc_done"]):
+        a, b = _s9_wilson(int(x), int(n)) if (x == x and n == n and n > 0) else (float("nan"), float("nan"))
+        lo.append(a)
+        hi.append(b)
+    t["spam_lo"], t["spam_hi"] = lo, hi
+    enough = (t["qc_done"] >= float(cfg["min_qc"])) & (t["calls"] >= float(cfg["min_calls"]))
+    t["spam_est_lo"] = (t["spam_lo"] * t["calls"]).where(enough)
+    t["spam_est_hi"] = (t["spam_hi"] * t["calls"]).where(enough)
+    net_x, net_n = float(t["spam_x"].sum(min_count=1)) if t["spam_x"].notna().any() else float("nan"), float(t["qc_done"].sum(min_count=1)) if t["qc_done"].notna().any() else float("nan")
+    net_rate = net_x / net_n if net_n and net_n == net_n and net_n > 0 else float("nan")
+    net_hi = _s9_wilson(int(net_x), int(net_n))[1] if net_rate == net_rate else float("nan")
+    med_profit = float(t["profit"].median()) if t["profit"].notna().any() else float("nan")
+    flags, why = [], []
+    for _, r in t.iterrows():
+        if not r["matched"]:
+            flags.append("Not in the QC sheet")
+            why.append("No publisher of this name in the QC sheet for these days (check RINGBA_NAME_MAP).")
+        elif r["calls"] < cfg["min_calls"] or r["qc_done"] < cfg["min_qc"]:
+            flags.append("Insufficient evidence")
+            why.append(f"{int(r['qc_done'])} QC-reviewed calls and {int(r['calls'])} Ringba calls; at least {int(cfg['min_qc'])} QC-reviewed and {int(cfg['min_calls'])} calls are needed.")
+        elif net_rate == net_rate and r["spam_lo"] > max(net_rate, net_hi) and r["spam_rate"] - net_rate >= 0.05:
+            high = (r["profit"] == r["profit"]) and med_profit == med_profit and r["profit"] >= med_profit
+            flags.append("Review" if high else "Monitor")
+            why.append(f"QC spam rate {r['spam_rate'] * 100:.1f}% (95% interval {r['spam_lo'] * 100:.1f}-{r['spam_hi'] * 100:.1f}%, {int(r['qc_done'])} reviewed calls) is clearly above the "
+                       f"network's {net_rate * 100:.1f}%" + ("; profit is at or above the median publisher, so a human review is worth the time." if high else "."))
+        else:
+            flags.append("No clear signal")
+            why.append("Spam rate is not clearly above the network's.")
+    t["signal"], t["evidence"] = flags, why
+    return t, {"network_spam_rate": net_rate, "unmatched_ringba": un_rb, "unmatched_qc": un_qc, "suggestions": sug, "median_profit": med_profit}
+
+
+def rb_reconcile(rbdf, m, start, end):
+    """Per day: Ringba incoming calls versus rows in the QC sheet. Different definitions are possible (the sheet may hold only some calls), so this is a coverage
+    view, not a count of missing calls. A time-zone difference shows up as a day-shifted pattern."""
+    rd = rb_aggregate(rbdf[(rbdf["day"] >= pd.Timestamp(start).date().isoformat()) & (rbdf["day"] <= pd.Timestamp(end).date().isoformat())].assign(_d=lambda x: x["day"]), ["_d"])
+    rd = rd.rename(columns={"_d": "day"})[["day", "calls", "revenue"]].rename(columns={"calls": "ringba_calls"})
+    mw = m[(m["ts"] >= pd.Timestamp(start)) & (m["ts"] < pd.Timestamp(end) + pd.Timedelta(days=1))]
+    q = mw.assign(day=mw["ts"].dt.floor("D").dt.date.astype(str)).groupby("day")[["_one", "_qc"]].sum().rename(columns={"_one": "sheet_rows", "_qc": "qc_done"})
+    t = rd.merge(q, how="outer", left_on="day", right_index=True).sort_values("day").reset_index(drop=True)
+    t["sheet_share"] = t["sheet_rows"] / t["ringba_calls"].where(t["ringba_calls"] > 0)
+    t["qc_share_of_sheet"] = t["qc_done"] / t["sheet_rows"].where(t["sheet_rows"] > 0)
+    med = float(t["sheet_share"].median()) if t["sheet_share"].notna().any() else float("nan")
+    t["unusual"] = (med == med) & ((t["sheet_share"] < 0.5 * med) | (t["sheet_share"] > 1.5 * med))
+    return t, med
+
+
+# ---------------- pages ----------------
+def _rb_fmt_cfg():
+    cc = st.column_config
+    return {"calls": cc.NumberColumn("Incoming", format="%d"), "completed": cc.NumberColumn("Completed", format="%d"), "connected": cc.NumberColumn("Connected", format="%d"),
+            "paid": cc.NumberColumn("Paid", format="%d"), "converted": cc.NumberColumn("Converted", format="%d"), "no_connect": cc.NumberColumn("No Connect", format="%d"),
+            "duplicate": cc.NumberColumn("Duplicate", format="%d"), "blocked": cc.NumberColumn("Blocked", format="%d"), "ivr_hangup": cc.NumberColumn("IVR Hangup", format="%d"),
+            "revenue": cc.NumberColumn("Revenue", format="$%.2f"), "payout": cc.NumberColumn("Payout", format="$%.2f"), "profit": cc.NumberColumn("Profit", format="$%.2f"),
+            "total_cost": cc.NumberColumn("Total Cost", format="$%.2f"), "margin": cc.NumberColumn("Margin", format="percent"), "conv_rate": cc.NumberColumn("Conversion %", format="percent"),
+            "rev_per_call": cc.NumberColumn("Revenue / call", format="$%.2f"), "connect_rate": cc.NumberColumn("Connect %", format="percent"), "tcl_seconds": cc.NumberColumn("TCL (sec)", format="%d")}
+
+
+def _rb_money(x):
+    return "-" if x is None or x != x else f"${x:,.2f}"
+
+
+def _rb_pct(x):
+    return "-" if x is None or x != x else f"{x * 100:.1f}%"
+
+
+def _rb_int(x):
+    return "-" if x is None or x != x else f"{x:,.0f}"
+
+
+def _rb_range_controls(prefix, store, cfg, today):
+    c1, c2, c3 = st.columns([2, 3, 3])
+    preset = c1.selectbox("Date range", RB_PRESETS, index=3, key=prefix + "_preset")
+    if preset == "Custom range":
+        picked = c2.date_input("Start and end date", (pd.Timestamp(today).date() - timedelta(days=29), pd.Timestamp(today).date()), key=prefix + "_custom")
+        try:
+            s, e = (picked[0], picked[1]) if len(picked) == 2 else (picked[0], picked[0])
+        except Exception:
+            s, e = rb_preset_range("Last 30 days", today)
+    else:
+        s, e = rb_preset_range(preset, today)
+    excl = c3.checkbox("Complete days only (leave out today)", value=True, key=prefix + "_excl")
+    return rb_effective_range(s, e, today, excl) + (preset,)
+
+
+def _rb_need_data(store):
+    n = store._q("SELECT COUNT(*) n FROM rb_days")[0]["n"]
+    if not n:
+        st.info("No Ringba data has been loaded yet. Open **Ringba Sync** in the menu and press the sync buttons (13 months of history by default).")
+        return False
+    return True
+
+
+def _rb_restore_once(store, cfg):
+    if st.session_state.get("rb_restored") or not cfg["sheet_sync"]:
+        return
+    st.session_state["rb_restored"] = True
+    try:
+        sp = _s9_open_spreadsheet()
+        if sp is not None:
+            rb_sheet_pull(store, sp)
+    except Exception:
+        pass
+
+
+def _rb_page_summary(store, cfg, today):
+    s, e, note, preset = _rb_range_controls("rbs", store, cfg, today)
+    if s is None:
+        st.info(note)
+        return
+    f1, f2, f3, f4 = st.columns(4)
+    group = f1.selectbox("Group by", ["Publisher", "Campaign", "Buyer", "Publisher + Campaign", "Date"], key="rbs_group")
+    q_pub, q_cmp, q_buy = f2.text_input("Publisher contains", key="rbs_f_pub"), f3.text_input("Campaign contains", key="rbs_f_cmp"), f4.text_input("Buyer contains", key="rbs_f_buy")
+    df = rb_frame(store, s, e)
+    for col, q in (("publisher", q_pub), ("campaign", q_cmp), ("buyer", q_buy)):
+        if q.strip():
+            df = df[df[col].str.contains(q.strip(), case=False, regex=False, na=False)]
+    days, have, miss = rb_coverage(store, s, e)
+    st.caption(f"{pd.Timestamp(s):%b %d, %Y} - {pd.Timestamp(e):%b %d, %Y} ({cfg['tz']}) - {have} of {days} days loaded. " + note)
+    if miss:
+        st.warning(f"{len(miss)} day(s) in this range are not loaded yet (for example {miss[0]}); their calls and money are unknown, not zero. Use Ringba Sync.")
+    by = {"Publisher": ["publisher"], "Campaign": ["campaign"], "Buyer": ["buyer"], "Publisher + Campaign": ["publisher", "campaign"], "Date": ["day"]}[group]
+    tot = rb_aggregate(df, [])
+    t = rb_aggregate(df, by)
+    t = t.sort_values("calls", ascending=False, na_position="last") if group != "Date" else t.sort_values("day", ascending=False)
+    ui_stat_cards([("Incoming calls", _rb_int(tot["calls"].iloc[0]), "in this range", "info"), ("Revenue", _rb_money(tot["revenue"].iloc[0]), "Ringba conversion amount", "good"),
+                   ("Payout", _rb_money(tot["payout"].iloc[0]), "", ""), ("Profit", _rb_money(tot["profit"].iloc[0]), "Ringba gross profit", "good"),
+                   ("Margin", _rb_pct(tot["margin"].iloc[0]), "profit / revenue", ""), ("Conversion", _rb_pct(tot["conv_rate"].iloc[0]), "converted / incoming", "")])
+    show = by + ["calls", "completed", "connected", "paid", "converted", "no_connect", "duplicate", "blocked", "ivr_hangup", "rev_per_call", "revenue", "payout", "profit", "margin", "conv_rate", "tcl_seconds", "total_cost"]
+    st.dataframe(t[show], hide_index=True, width="stretch", column_config=_rb_fmt_cfg())
+    st.markdown("**Totals**")
+    st.dataframe(tot[["calls", "completed", "connected", "paid", "converted", "no_connect", "duplicate", "blocked", "ivr_hangup", "rev_per_call", "revenue", "payout", "profit", "margin", "conv_rate", "tcl_seconds", "total_cost"]],
+                 hide_index=True, width="stretch", column_config=_rb_fmt_cfg())
+    st.download_button("📥 Download this table as CSV", t[show].to_csv(index=False).encode("utf-8"), file_name="ringba_summary.csv", mime="text/csv", key="rbs_dl")
+    st.caption(RB_DEFINITIONS)
+
+
+def _rb_delta(cur, prev):
+    return cur - prev if (cur == cur and prev == prev) else float("nan")
+
+
+def _rb_page_econ(store, cfg, today):
+    s, e, note, preset = _rb_range_controls("rbe", store, cfg, today)
+    if s is None:
+        st.info(note)
+        return
+    ps, pe = rb_previous_range(s, e)
+    group = st.selectbox("Compare by", ["Publisher", "Campaign", "Buyer", "Publisher + Campaign"], key="rbe_group")
+    by = {"Publisher": ["publisher"], "Campaign": ["campaign"], "Buyer": ["buyer"], "Publisher + Campaign": ["publisher", "campaign"]}[group]
+    cur, prev = rb_frame(store, s, e), rb_frame(store, ps, pe)
+    d1, h1, m1 = rb_coverage(store, s, e)
+    d2, h2, m2 = rb_coverage(store, ps, pe)
+    st.caption(f"This period {pd.Timestamp(s):%b %d} - {pd.Timestamp(e):%b %d, %Y} ({d1} days) versus the {d2} days before it ({pd.Timestamp(ps):%b %d} - {pd.Timestamp(pe):%b %d}). " + note)
+    if m1 or m2:
+        st.warning(f"Not every day is loaded ({h1} of {d1} this period, {h2} of {d2} before). Missing days are unknown, not zero, so differences may be understated or overstated.")
+    tc, tp = rb_aggregate(cur, []), rb_aggregate(prev, [])
+    ui_stat_cards([
+        ("Revenue", _rb_money(tc["revenue"].iloc[0]), f"before: {_rb_money(tp['revenue'].iloc[0])}", "info"),
+        ("Profit", _rb_money(tc["profit"].iloc[0]), f"before: {_rb_money(tp['profit'].iloc[0])}", "good"),
+        ("Margin", _rb_pct(tc["margin"].iloc[0]), f"before: {_rb_pct(tp['margin'].iloc[0])}", ""),
+        ("Incoming calls", _rb_int(tc["calls"].iloc[0]), f"before: {_rb_int(tp['calls'].iloc[0])}", "")])
+    a, b = rb_aggregate(cur, by), rb_aggregate(prev, by)
+    t = a.merge(b[by + ["calls", "revenue", "profit", "margin"]], how="outer", on=by, suffixes=("", "_prev"))
+    t["d_revenue"] = [_rb_delta(x, y) for x, y in zip(t["revenue"], t["revenue_prev"])]
+    t["d_profit"] = [_rb_delta(x, y) for x, y in zip(t["profit"], t["profit_prev"])]
+    tot_rev = t["revenue"].sum(min_count=1)
+    t["revenue_share"] = t["revenue"] / tot_rev if tot_rev == tot_rev and tot_rev > 0 else float("nan")
+    t = t.sort_values("profit", ascending=False, na_position="last")
+    cc = _rb_fmt_cfg()
+    cc.update({"revenue_prev": st.column_config.NumberColumn("Revenue before", format="$%.2f"), "profit_prev": st.column_config.NumberColumn("Profit before", format="$%.2f"),
+               "calls_prev": st.column_config.NumberColumn("Calls before", format="%d"), "margin_prev": st.column_config.NumberColumn("Margin before", format="percent"),
+               "d_revenue": st.column_config.NumberColumn("Revenue change", format="$%.2f"), "d_profit": st.column_config.NumberColumn("Profit change", format="$%.2f"),
+               "revenue_share": st.column_config.NumberColumn("Share of revenue", format="percent")})
+    st.dataframe(t[by + ["calls", "revenue", "profit", "margin", "calls_prev", "revenue_prev", "profit_prev", "margin_prev", "d_revenue", "d_profit", "revenue_share"]],
+                 hide_index=True, width="stretch", column_config=cc)
+    dd = rb_aggregate(cur, ["day"]).sort_values("day")
+    if len(dd) > 1:
+        st.markdown('<div class="ui-sec">DAILY REVENUE AND PROFIT</div>', unsafe_allow_html=True)
+        st.line_chart(dd.set_index("day")[["revenue", "profit"]], height=240)
+    movers = t[(t["calls"].fillna(0) >= cfg["min_calls"]) & (t["calls_prev"].fillna(0) >= cfg["min_calls"])].dropna(subset=["d_profit"])
+    st.markdown('<div class="ui-sec">BIGGEST PROFIT MOVERS (groups with at least %d calls in both periods)</div>' % int(cfg["min_calls"]), unsafe_allow_html=True)
+    if len(movers):
+        mv = pd.concat([movers.nlargest(5, "d_profit"), movers.nsmallest(5, "d_profit")]).drop_duplicates()
+        st.dataframe(mv[by + ["profit_prev", "profit", "d_profit", "calls_prev", "calls"]], hide_index=True, width="stretch", column_config=cc)
+        st.caption("A change is an observation, not a cause: volume, mix, buyer demand and payout rules can all move profit. Groups with fewer calls are left out of this list.")
+    else:
+        st.caption("No group has enough calls in both periods to compare.")
+    st.caption(RB_DEFINITIONS)
+
+
+def _rb_qc_frame(df, available_columns, overrides):
+    if df is None or not overrides:
+        return None
+    cols = resolve_query_columns(available_columns, overrides)
+    if not cols.get("date"):
+        return None
+    return s12_prepare(get_query_frame(df, cols), cols)
+
+
+def _rb_page_qxp(store, cfg, today, df, available_columns, overrides):
+    m = _rb_qc_frame(df, available_columns, overrides)
+    if m is None or not len(m):
+        st.info("This page needs the QC sheet to be loaded with a readable Call Date column.")
+        return
+    qs, qe, daily = rb_qc_window(m, cfg)
+    if qs is None:
+        st.info("The QC sheet has no day with enough completed QC yet, so quality cannot be compared with money.")
+        return
+    st.info(f"Quality data (AI QC) exists from **{qs}** to **{qe}**. Days before that have money only; their quality is **not available** (it is not zero). "
+            f"The QC sheet's times are assumed to be in the same time zone as Ringba ({cfg['tz']}); the Reconciliation page shows whether that holds.")
+    s, e, note, preset = _rb_range_controls("rbq", store, cfg, today)
+    if s is None:
+        st.info(note)
+        return
+    s2, e2 = max(pd.Timestamp(s).date(), qs), min(pd.Timestamp(e).date(), qe)
+    if s2 > e2:
+        st.info("The selected dates do not overlap the QC window. Choose dates inside it.")
+        return
+    d, h, miss = rb_coverage(store, s2, e2)
+    st.caption(f"Compared days: {s2} to {e2} ({h} of {d} Ringba days loaded). " + note)
+    if miss:
+        st.warning(f"{len(miss)} Ringba day(s) in the window are not loaded (e.g. {miss[0]}); sync them first.")
+    t, meta = rb_quality_profit(rb_frame(store), m, cfg, s2, e2)
+    if not len(t):
+        st.info("No Ringba rows in this window.")
+        return
+    ui_stat_cards([("Publishers", f"{len(t):,}", f"{int(t['matched'].sum())} matched to the QC sheet", "info"),
+                   ("Network QC spam rate", _rb_pct(meta["network_spam_rate"]), "of QC-reviewed calls", ""),
+                   ("Review candidates", f"{int((t['signal'] == 'Review').sum())}", "high profit and clearly high spam", "warn" if (t['signal'] == 'Review').any() else "good"),
+                   ("Not matched", f"{len(meta['unmatched_ringba'])}", "Ringba names missing in the QC sheet", "warn" if meta["unmatched_ringba"] else "good")])
+    cc = _rb_fmt_cfg()
+    cc.update({"qc_rows": st.column_config.NumberColumn("QC sheet calls", format="%d"), "qc_done": st.column_config.NumberColumn("QC-reviewed", format="%d"),
+               "spam_rate": st.column_config.NumberColumn("QC spam rate", format="percent"), "spam_lo": st.column_config.NumberColumn("Spam low", format="percent"),
+               "spam_hi": st.column_config.NumberColumn("Spam high", format="percent"), "voip_rate": st.column_config.NumberColumn("VoIP rate", format="percent"),
+               "avg_score": st.column_config.NumberColumn("Avg score", format="%.1f"), "qc_coverage": st.column_config.NumberColumn("QC-reviewed / Ringba calls", format="percent"),
+               "spam_est_lo": st.column_config.NumberColumn("Spam calls (est. low)", format="%d"), "spam_est_hi": st.column_config.NumberColumn("Spam calls (est. high)", format="%d")})
+    order = {"Review": 0, "Monitor": 1, "No clear signal": 2, "Insufficient evidence": 3, "Not in the QC sheet": 4}
+    t = t.assign(_o=t["signal"].map(order)).sort_values(["_o", "profit"], ascending=[True, False], na_position="last")
+    st.dataframe(t[["publisher", "signal", "calls", "revenue", "profit", "margin", "qc_rows", "qc_done", "qc_coverage", "spam_rate", "spam_lo", "spam_hi", "spam_est_lo", "spam_est_hi",
+                    "voip_rate", "avg_score", "evidence"]], hide_index=True, width="stretch", column_config=cc)
+    try:
+        pl = t[t["matched"] & t["spam_rate"].notna() & t["profit"].notna()]
+        if len(pl) > 1 and hasattr(st, "scatter_chart"):
+            st.markdown('<div class="ui-sec">PROFIT VERSUS QC SPAM RATE (one dot per publisher)</div>', unsafe_allow_html=True)
+            st.scatter_chart(pl.rename(columns={"spam_rate": "QC spam rate", "profit": "Profit"}), x="QC spam rate", y="Profit")
+    except Exception:
+        pass
+    st.caption("How to read this: 'Review' means a human should look at this publisher's calls (high profit AND a spam rate whose whole interval is above the network's). It is not a verdict "
+               "and nothing is changed in Ringba. Spam-call estimates assume the QC-reviewed calls are typical of all the publisher's calls, which is not guaranteed. "
+               "A publisher below the minimum sample is shown as insufficient evidence, however extreme its percentages look.")
+    if meta["unmatched_ringba"] or meta["unmatched_qc"]:
+        with st.expander("Names that did not match between Ringba and the QC sheet"):
+            st.write("Only identical names (ignoring case and spacing) are matched automatically. To link two spellings, add them to the RINGBA_NAME_MAP secret, e.g. "
+                     '`RINGBA_NAME_MAP = \'{"Ringba spelling": "QC sheet spelling"}\'`.')
+            st.dataframe(pd.DataFrame({"Ringba only": pd.Series(meta["unmatched_ringba"]), "QC sheet only": pd.Series(meta["unmatched_qc"])}), hide_index=True, width="stretch")
+            if meta["suggestions"]:
+                st.write("Possible matches (suggestions only, nothing was applied):")
+                st.dataframe(pd.DataFrame([{"Ringba name": k, "Looks similar to": " | ".join(v)} for k, v in meta["suggestions"].items()]), hide_index=True, width="stretch")
+
+
+def _rb_page_recon(store, cfg, today, df, available_columns, overrides):
+    m = _rb_qc_frame(df, available_columns, overrides)
+    if m is None or not len(m):
+        st.info("This page needs the QC sheet to be loaded with a readable Call Date column.")
+        return
+    if not _rb_need_data(store):
+        return
+    s, e, note, preset = _rb_range_controls("rbr", store, cfg, today)
+    if s is None:
+        st.info(note)
+        return
+    t, med = rb_reconcile(rb_frame(store), m, s, e)
+    if not len(t):
+        st.info("No days to compare in this range.")
+        return
+    both = t.dropna(subset=["ringba_calls", "sheet_rows"])
+    ui_stat_cards([("Days compared", f"{len(both)}", "have both Ringba and sheet data", "info"), ("Typical sheet share", _rb_pct(med), "sheet rows / Ringba incoming (median day)", ""),
+                   ("Unusual days", f"{int(t['unusual'].sum())}", "far from the typical share", "warn" if t["unusual"].any() else "good")])
+    cc = {"ringba_calls": st.column_config.NumberColumn("Ringba incoming", format="%d"), "sheet_rows": st.column_config.NumberColumn("QC sheet rows", format="%d"),
+          "qc_done": st.column_config.NumberColumn("QC-reviewed", format="%d"), "sheet_share": st.column_config.NumberColumn("Sheet / Ringba", format="percent"),
+          "qc_share_of_sheet": st.column_config.NumberColumn("QC-reviewed / sheet", format="percent"), "revenue": st.column_config.NumberColumn("Ringba revenue", format="$%.2f")}
+    st.dataframe(t, hide_index=True, width="stretch", column_config=cc)
+    if len(both) > 1:
+        st.line_chart(both.set_index("day")[["ringba_calls", "sheet_rows"]], height=240)
+    st.caption("Ringba counts every incoming call (including IVR hang-ups and no-connects); the QC sheet may hold only some of them, so a share below 100% is normal. What matters is a day that is "
+               "far from the typical share (a feed gap, or a time-zone difference that moves calls to the neighbouring day). 'Unusual' is an observation, not a diagnosis. " + note)
+
+
+def _rb_page_sync(store, cfg, today):
+    pub = rb_status_public(cfg)
+    days_df = rb_days_df(store)
+    ok_days = int(days_df["status"].isin(["ok", "truncated"]).sum()) if len(days_df) else 0
+    wanted = len(rb_window_days(cfg, today))
+    last = days_df["fetched_at"].max() if len(days_df) else None
+    ui_stat_cards([("Token", "set" if pub["token_set"] else "missing", "RINGBA_API_TOKEN (never shown)", "good" if pub["token_set"] else "bad"),
+                   ("Days loaded", f"{ok_days:,} / {wanted:,}", f"{cfg['months']} months window", "good" if ok_days >= wanted - 1 else "warn"),
+                   ("Last sync", str(last) if last else "never", cfg["tz"], ""), ("Sheet backup", "on" if cfg["sheet_sync"] else "off", "RINGBA_SHEET_SYNC / ALERT_SHEET_SYNC", "good" if cfg["sheet_sync"] else "warn")])
+    for p in pub["problems"]:
+        st.error(p)
+    if not cfg["sheet_sync"]:
+        st.warning("The Ringba cache is stored locally and Streamlit Cloud erases local files on restart. Set RINGBA_SHEET_SYNC = \"true\" (or ALERT_SHEET_SYNC) to keep a backup in the Google Sheet.")
+    with st.expander("Who is acting? (identity and permissions)"):
+        lab = st.text_input("Your name (a label, not proof of identity)", key="s16_actor")
+        pw = st.text_input("Action password (if one is configured)", key="s16_pw", type="password")
+    ident = s16_identity(lab, pw)
+    can = s16_allowed("ringba_sync", ident) and not pub["problems"]
+    if not s16_allowed("ringba_sync", ident):
+        st.info("Syncing needs the operator level (enter the action password above).")
+    b1, b2, b3, b4 = st.columns(4)
+    r1 = b1.button("🔄 Refresh last %d days" % cfg["refresh_days"], key="rb_btn_recent", disabled=not can) and can
+    r2 = b2.button("⏬ Backfill missing days", key="rb_btn_back", disabled=not can) and can
+    r3 = b3.button("🔌 Test connection", key="rb_btn_test", disabled=not can) and can
+    r4 = b4.button("✅ Verify yesterday", key="rb_btn_verify", disabled=not can) and can
+    res = None
+    if r1 or r2:
+        bar = st.progress(0.0)
+        res = rb_sync(store, cfg, "recent" if r1 else "backfill", today=today, progress=lambda i, n, d: bar.progress(min(1.0, i / max(1, n))))
+        st.session_state["rb_last_sync"] = res
+        if res["fetched"] and cfg["sheet_sync"]:
+            try:
+                sp = _s9_open_spreadsheet()
+                ok, msg = rb_sheet_push(store, sp) if sp is not None else (False, "No sheet is open, so the backup was skipped.")
+                _s9_say(ok, msg, info=not ok)
+            except Exception as exc:
+                st.warning(f"Backup to the sheet failed ({type(exc).__name__}).")
+    if r3:
+        try:
+            rows, meta = rb_fetch_day((pd.Timestamp(today) - pd.Timedelta(days=1)).date(), cfg)
+            st.success(f"Connection works: Ringba returned {meta['n_records']} row(s) for yesterday.")
+        except RbError as exc:
+            st.error(RB_ERROR_TEXT.get(exc.kind, "Request failed."))
+    if r4:
+        try:
+            v = rb_verify_day(cfg, (pd.Timestamp(today) - pd.Timedelta(days=1)).date())
+            vmsg = (f"{v['day']}: detailed report {_rb_int(v['detail_calls'])} calls / {_rb_money(v['detail_revenue'])}; publisher-only report {_rb_int(v['publisher_calls'])} calls / "
+                    f"{_rb_money(v['publisher_revenue'])}. " + ("They agree." if v["match"] else "They DIFFER: the detailed report may be cut off.") + (" The row limit was reached." if v["truncated"] else ""))
+            if v["match"] and not v["truncated"]:
+                st.success(vmsg)
+            else:
+                st.warning(vmsg)
+            st.caption("Also compare this day's totals with the Ringba screen for the same day in the same time zone. If they differ by a fixed amount, the day boundary or time zone setting is wrong.")
+        except RbError as exc:
+            st.error(RB_ERROR_TEXT.get(exc.kind, "Request failed."))
+    res = res or st.session_state.get("rb_last_sync")
+    if res:
+        st.markdown(f"**Last run ({res['mode']}):** {res['fetched']} day(s) loaded, {res['rows']:,} rows" + (f", {res['remaining']} day(s) still to do" if res["remaining"] else "")
+                    + (f". Stopped: {res['stopped']}." if res["stopped"] else "."))
+        for d_, k in res["failed"][:10]:
+            st.warning(f"{d_}: {RB_ERROR_TEXT.get(k, k)}")
+        if res["truncated"]:
+            st.warning(f"{len(res['truncated'])} day(s) reached the {cfg['cap']}-row limit and may be incomplete (e.g. {res['truncated'][0]}). Raise RINGBA_MAX_ROWS or tell me, and I will split those days.")
+    if len(days_df):
+        with st.expander("Loaded days"):
+            st.dataframe(days_df.sort_values("day", ascending=False), hide_index=True, width="stretch")
+    st.caption("Read-only: this app only asks Ringba for reports. The token stays in Secrets; it is never shown, logged or stored. Days are cut at local midnight in "
+               f"{cfg['tz']} (RINGBA_TIMEZONE). The last {cfg['refresh_days']} days are re-fetched because Ringba payouts and conversions can change after the call.")
+
+
+def render_ringba_page(page, df, available_columns, overrides, timeline):
+    cfg = rb_config()
+    store = s9_get_store()
+    rb_init(store)
+    _rb_restore_once(store, cfg)
+    try:
+        today = pd.Timestamp.now(tz=cfg["tz"]).tz_localize(None).normalize()
+    except Exception:
+        today = pd.Timestamp.now().normalize()
+    if page == "RbSync":
+        _rb_page_sync(store, cfg, today)
+    elif page == "Money":
+        if _rb_need_data(store):
+            _rb_page_summary(store, cfg, today)
+    elif page == "Econ":
+        if _rb_need_data(store):
+            _rb_page_econ(store, cfg, today)
+    elif page == "QxP":
+        if _rb_need_data(store):
+            _rb_page_qxp(store, cfg, today, df, available_columns, overrides)
+    elif page == "Recon":
+        _rb_page_recon(store, cfg, today, df, available_columns, overrides)
+
+
+
+
 # ---------------------------------------------------------------
 # Main flow
 # ---------------------------------------------------------------
@@ -14389,3 +15314,19 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
             },
             timeline,
         )
+    # Ringba economics pages (read-only API + the QC sheet); not part of Classic view
+    if UI_PAGE in RB_PAGES:
+        try:
+            render_ringba_page(
+                UI_PAGE, df, available_columns,
+                {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None},
+                timeline,
+            )
+        except Exception as exc:
+            st.warning(f"This page could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
+elif UI_PAGE in RB_PAGES:
+    # the QC sheet is not loaded: the Ringba pages that only need the API still work
+    try:
+        render_ringba_page(UI_PAGE, None, [], {}, None)
+    except Exception as exc:
+        st.warning(f"This page could not be displayed ({type(exc).__name__}).")
