@@ -15379,7 +15379,8 @@ def tm_status_panel():
 #  * ONE detection engine: the existing AI QC report (canonical_flags / SPAM_PAT). This block only adds evidence rules, persistence and workflow.
 #  * SQL (the Step 9 SQLite store, migration v3, additive) is the permanent source of truth. Google Sheets is a best-effort mirror driven by a queue.
 #  * Target = ONE Caller ID (normalised). Never a publisher, buyer or campaign. Nothing is blocked without a human approval.
-#  * Nothing is ever recorded as BLOCKED unless an adapter has independently verified it. This build ships NO real Ringba adapter (see SP_ADAPTERS).
+#  * Nothing is ever recorded as BLOCKED unless an adapter has independently verified it (read-back of the Ringba block list). Dry-run stays ON until SPAM_DRY_RUN=false.
+#  * Ringba adapter: POST https://api.ringba.com/v2/{account}/blockedNumbers/ {phoneNumber, campaignId} (endpoint given by Ringba support), needs the separate RINGBA_BLOCK_TOKEN.
 #  * The AI assistant can only read; it has no path to approve or execute (sp_assistant_answer refuses).
 # =====================================================================================================================
 from urllib.parse import parse_qs as _sp_parse_qs
@@ -15466,6 +15467,16 @@ def sp_norm_caller(raw):
 def sp_mask(norm):
     d = re.sub(r"\D", "", str(norm or ""))
     return ("***" + d[-4:]) if len(d) >= 4 else ("" if not d else "***")
+
+
+def sp_disp(norm, full=False):
+    """Phone number for the screen: the full E.164 number when the operator asked for it (shown as +1 757 237 3353), else ***1234."""
+    d = re.sub(r"\D", "", str(norm or ""))
+    if not full or not d:
+        return sp_mask(norm)
+    if len(d) == 11 and d[0] == "1":
+        return f"+1 {d[1:4]} {d[4:7]} {d[7:]}"
+    return "+" + d
 
 
 def sp_norm_ts(v):
@@ -16009,12 +16020,203 @@ class SpAdapter:
         raise NotImplementedError
 
 
-SP_ADAPTERS = {}          # name -> SpAdapter instance. Intentionally empty: nothing here can really block a number.
+SP_ADAPTERS = {}          # name -> SpAdapter instance (extra adapters for tests / other systems). The Ringba adapter below is chosen from the settings.
+
+
+class SpRingbaError(Exception):
+    def __init__(self, kind, msg=""):
+        super().__init__(msg or kind)
+        self.kind, self.msg = kind, msg or kind
+
+
+def _sp_rb_http(method, url, token, payload, timeout):
+    """The real transport (tests pass a fake one). Returns (status, text). Raises SpRingbaError('network')."""
+    import urllib.request, urllib.error, socket
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Authorization": f"Token {token}", "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "network-intelligence-dashboard/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        return exc.code, body
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError):
+        raise SpRingbaError("network", "Could not reach Ringba (network error or timeout).")
+
+
+def _sp_rb_scrub(text, *tokens):
+    t = str(text)
+    for k in tokens:
+        if k:
+            t = t.replace(k, "[token removed]")
+    return t[:300]
+
+
+class SpRingbaAdapter(SpAdapter):
+    """Adds ONE phone number to Ringba's blocked-number list:  POST https://api.ringba.com/v2/{account}/blockedNumbers/  {"phoneNumber": "+1...", "campaignId": ""}
+    (empty campaignId = all campaigns).  The POST endpoint and body come from Ringba support (format +15556661234; no test mode; takes effect at once). Verification reads the list back with
+    GET .../blockedNumbers: Ringba support confirmed a list API exists and the generated Ringba API client lists GET /{account}/blockedNumbers, but the ANSWER format is not documented here, so it
+    is parsed defensively: if the GET fails or looks unexpected the proposal stays VERIFICATION_PENDING (never BLOCKED).  Only a Ringba ADMIN user's token can block (support answer).
+    The optional expiry field (exp_in_hour in the generated client) is NOT sent: its JSON name is unconfirmed, so every block here has no expiry; remove it in Ringba > Block Numbers if needed.  Needs RINGBA_BLOCK_TOKEN (a SEPARATE write token); the read-only
+    token can still be used to VERIFY. Never retries a POST by itself. No delete / unblock code exists."""
+    name = "ringba"
+
+    def __init__(self, transport=None):
+        self.transport = transport or _sp_rb_http
+
+    # ----- settings
+    def _s(self):
+        try:
+            tmo = max(3, int(float(_cfg("SPAM_BLOCK_TIMEOUT", "20"))))
+        except Exception:
+            tmo = 20
+        return {"account": _cfg("RINGBA_ACCOUNT_ID"), "block_token": _cfg("RINGBA_BLOCK_TOKEN"), "read_token": _cfg("RINGBA_API_TOKEN"),
+                "campaign": _cfg("SPAM_BLOCK_CAMPAIGN_ID"), "timeout": tmo}
+
+    def scope_text(self):
+        c = self._s()["campaign"]
+        return f"for campaign {c}" if c else "for ALL campaigns (account-wide)"
+
+    def capability(self):
+        s = self._s()
+        if not s["account"]:
+            return False, "RINGBA_ACCOUNT_ID is not set in Secrets."
+        if not s["block_token"]:
+            return False, "RINGBA_BLOCK_TOKEN is not set. Ringba only lets an ADMIN user block numbers, so automatic blocking needs the API token of an Admin user (a read-only token cannot)."
+        return True, "Ringba blockedNumbers API is configured."
+
+    def verify_capability(self):
+        s = self._s()
+        if not s["account"]:
+            return False, "RINGBA_ACCOUNT_ID is not set in Secrets."
+        if not (s["block_token"] or s["read_token"]):
+            return False, "No Ringba token is set (RINGBA_BLOCK_TOKEN or RINGBA_API_TOKEN)."
+        return True, "Ringba blocked-number list can be read."
+
+    # ----- calls
+    def _base(self):
+        return f"{RB_HOST}/{self._s()['account'].strip()}/blockedNumbers"
+
+    def _call(self, method, url, payload, token):
+        s = self._s()
+        try:
+            return self.transport(method, url, token, payload, s["timeout"])
+        except SpRingbaError:
+            raise
+        except Exception as exc:
+            raise SpRingbaError("network", f"Could not reach Ringba ({type(exc).__name__}).")
+
+    def _list(self):
+        """-> list of items from GET blockedNumbers. Raises SpRingbaError when the answer cannot be trusted (auth, HTTP error, unknown format, incomplete list)."""
+        s = self._s()
+        token = s["block_token"] or s["read_token"]
+        last = None
+        for url in (self._base(), self._base() + "/"):
+            status, text = self._call("GET", url, None, token)
+            if status in (401, 403):
+                raise SpRingbaError("auth", f"Ringba refused the token (HTTP {status}).")
+            if status == 404:
+                last = status
+                continue
+            if status >= 400:
+                raise SpRingbaError("http", f"Ringba returned HTTP {status} when reading the block list.")
+            try:
+                data = json.loads(text)
+            except Exception:
+                raise SpRingbaError("format", "Ringba's block list answer is not JSON; cannot verify.")
+            items, total = None, None
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                for k in ("blockedNumbers", "data", "items", "results", "numbers", "records"):
+                    if isinstance(data.get(k), list):
+                        items = data[k]
+                        break
+                if items is None:
+                    items = next((v for v in data.values() if isinstance(v, list)), None)
+                for k in ("totalCount", "total", "totalRecords", "count"):
+                    if isinstance(data.get(k), int) and not isinstance(data.get(k), bool):
+                        total = data[k]
+                        break
+            if items is None:
+                raise SpRingbaError("format", "Ringba's block list answer has an unknown shape; cannot verify.")
+            if total is not None and total > len(items):
+                raise SpRingbaError("incomplete", f"Ringba returned {len(items)} of {total} blocked numbers (paged); cannot verify from a partial list.")
+            return items
+        raise SpRingbaError("http", "Ringba returned HTTP 404 for the block list.")
+
+    @staticmethod
+    def _digits(v):
+        return re.sub(r"\D", "", str(v or ""))
+
+    def _present(self, items, norm):
+        want = self._digits(norm)[-10:]
+        camp = self._s()["campaign"] or ""
+        for it in items:
+            vals, itcamp = [], None
+            if isinstance(it, dict):
+                for k, v in it.items():
+                    kl = str(k).lower()
+                    if kl in ("campaignid", "campaign_id"):
+                        itcamp = v
+                    elif isinstance(v, (str, int)) and ("phone" in kl or "number" in kl or "e164" in kl):
+                        vals.append(v)
+            else:
+                vals.append(it)
+            if any(len(self._digits(v)) >= 10 and self._digits(v)[-10:] == want for v in vals):
+                if isinstance(it, dict) and any(str(k).lower() in ("campaignid", "campaign_id") for k in it):
+                    if (str(itcamp or "").strip()) != camp.strip():
+                        continue                      # blocked, but for a different scope than the one this proposal asked for
+                return True
+        return False
+
+    def block(self, norm):
+        if not re.fullmatch(r"\+1\d{10}", str(norm or "")):
+            raise ValueError("Only a normalised +1XXXXXXXXXX Caller ID can be blocked.")
+        s = self._s()
+        try:
+            if self._present(self._list(), norm):
+                return "already_listed"               # idempotent: never add the same number twice
+        except SpRingbaError:
+            pass                                      # best-effort pre-check; the read-back after the POST is the one that counts
+        status, text = self._call("POST", self._base() + "/", {"phoneNumber": norm, "campaignId": s["campaign"] or ""}, s["block_token"])
+        if status in (401, 403):
+            raise PermissionError(f"Ringba refused the block token (HTTP {status}). Only a Ringba Admin user's token can block numbers.")
+        if status in (400, 404, 405, 415, 422):
+            raise SpRingbaError("rejected", f"Ringba rejected the request (HTTP {status}): {_sp_rb_scrub(text, s['block_token'], s['read_token'])}")
+        if status == 409:
+            return "conflict_possibly_listed"
+        if status >= 300:
+            raise SpRingbaError("uncertain", f"Ringba answered HTTP {status}; the result is uncertain.")
+        return "posted"
+
+    def verify(self, norm):
+        return self._present(self._list(), norm)
+
+    def test(self):
+        """Read-only connection test. -> (ok, message)"""
+        ok, why = self.verify_capability()
+        if not ok:
+            return False, why
+        s = self._s()
+        try:
+            items = self._list()
+            return True, f"Ringba answered. {len(items):,} blocked number(s) are on the list. Block token: {'set' if s['block_token'] else 'NOT set (verify only)'}."
+        except SpRingbaError as exc:
+            return False, _sp_rb_scrub(exc.msg, s["block_token"], s["read_token"])
 
 
 def sp_adapter():
-    name = _cfg("SPAM_BLOCK_ADAPTER", "")
-    return SP_ADAPTERS.get(name) or SpAdapter()
+    name = _cfg("SPAM_BLOCK_ADAPTER", "").strip().lower()
+    if name in SP_ADAPTERS:
+        return SP_ADAPTERS[name]
+    if name in ("", "ringba") and _cfg("RINGBA_ACCOUNT_ID") and (_cfg("RINGBA_BLOCK_TOKEN") or _cfg("RINGBA_API_TOKEN")):
+        return SpRingbaAdapter()
+    return SpAdapter()
 
 
 def sp_manual_guidance(norm):
@@ -16116,7 +16318,7 @@ def sp_verify(store, pid, ident, now=None, adapter=None, _after_block=False):
     if not _after_block and p["exec_status"] not in ("VERIFICATION_PENDING", "MANUAL_REPORTED_UNVERIFIED", "MANUAL_ACTION_REQUIRED"):
         return {"ok": False, "exec_status": p["exec_status"], "message": f"Nothing to verify in status {p['exec_status']}."}
     ad = adapter or sp_adapter()
-    ok, why = ad.capability()
+    ok, why = (ad.verify_capability() if hasattr(ad, "verify_capability") else ad.capability())
     if not ok:
         return {"ok": False, "exec_status": p["exec_status"], "message": "Verification is not possible here: " + why}
     try:
@@ -16450,12 +16652,12 @@ def sp_counts(store):
 
 
 @_sp_needs_store
-def sp_incident_table(store, meta_url="", limit=1000):
+def sp_incident_table(store, meta_url="", limit=1000, full=False):
     rows = store._q("SELECT i.*, p.review_status AS p_review, p.exec_status AS p_exec, p.id AS p_id FROM sp_incidents i LEFT JOIN sp_proposals p ON p.id = "
                     "(SELECT id FROM sp_proposals WHERE caller_norm = i.caller_norm ORDER BY created_at DESC, rowid DESC LIMIT 1) ORDER BY i.call_ts DESC LIMIT ?", (int(limit),))
     out = []
     for r in rows:
-        out.append({"Incident": r["id"], "Call time": r["call_ts"], "Caller": sp_mask(r["caller_norm"]) or "(missing)", "Spam Status": r["classification"], "Category": r["category"],
+        out.append({"Incident": r["id"], "Call time": r["call_ts"], "Caller": sp_disp(r["caller_norm"], full) or "(missing)", "Spam Status": r["classification"], "Category": r["category"],
                     "Confidence": r["confidence"], "Publisher": r["publisher"], "Buyer": r["buyer"], "Campaign": r["campaign"], "Proposal": r["p_id"] or "",
                     "Block review": r["p_review"] or "", "Block execution": r["p_exec"] or "", "Sheet sync": r["sheet_state"], "Sheet row (at last sync)": r["sheet_row_hint"],
                     "Sheet link": sp_sheet_link(meta_url, r), "Sheet error": r["sheet_error"] or ""})
@@ -16492,6 +16694,11 @@ def render_spam_page(df, available_columns, overrides, timeline):
         pw = st.text_input("Action password (needed to approve or execute)", key="sp_pw", type="password")
     ident = s16_identity(lab, pw)
     st.markdown(f"**You are:** {ident['label']} · {ident['via']} · level **{ident['level']}**" + ("" if ident["level"] == "operator" else "  — approving / executing needs the operator level (set ALERT_ACTION_PASSWORD, then enter it)."))
+    full = False
+    if ident["level"] in ("operator", "open"):
+        full = bool(st.checkbox("Show full phone numbers", value=False, key="sp_full"))
+    else:
+        st.caption("Phone numbers are shown as ***1234 until you enter the action password above (then a 'Show full phone numbers' option appears).")
     meta = st.session_state.get("meta", {}) or {}
     tab_default = str(meta.get("tab", "") or "")
     fp = f"{len(df)}|{hash(tuple(df.columns))}"
@@ -16522,21 +16729,21 @@ def render_spam_page(df, available_columns, overrides, timeline):
     sp_cards(sp_counts(store))
     t_inc, t_prop, t_cal, t_allow, t_sync, t_cap = st.tabs(["Incidents", "Block proposals", "Callers", "Allowlist", "Sheet sync", "Ringba capability"])
     with t_inc:
-        it = sp_incident_table(store, meta.get("url", ""))
+        it = sp_incident_table(store, meta.get("url", ""), full=full)
         st.dataframe(it, hide_index=True, width="stretch")
     with t_prop:
-        _sp_tab_proposals(store, df, ident, now)
+        _sp_tab_proposals(store, df, ident, now, full)
     with t_cal:
         rc = pd.DataFrame(store._q("SELECT caller_norm, COUNT(*) AS spam_calls, SUM(classification='CONFIRMED_SPAM') AS confirmed, SUM(classification='SUSPICIOUS') AS suspicious, "
                                    "COUNT(DISTINCT publisher) AS publishers, MAX(call_ts) AS last_call FROM sp_incidents WHERE caller_norm<>'' GROUP BY caller_norm ORDER BY confirmed DESC, spam_calls DESC LIMIT 300"))
         if len(rc):
-            rc["caller_norm"] = rc["caller_norm"].map(sp_mask)
+            rc["caller_norm"] = rc["caller_norm"].map(lambda x: sp_disp(x, full))
         st.dataframe(rc, hide_index=True, width="stretch")
         st.caption("Single-incident numbers stay on this watch list. Only repeat offenders (SPAM_MIN_CONFIRMED, default 2 confirmed calls) get an automatic proposal; Publisher / buyer / campaign are shown for investigation only and are never blocking targets.")
     with t_allow:
         al = pd.DataFrame(store._q("SELECT caller_norm, note, added_by, added_at, active FROM sp_allowlist ORDER BY added_at DESC"))
         if len(al):
-            al["caller_norm"] = al["caller_norm"].map(sp_mask)
+            al["caller_norm"] = al["caller_norm"].map(lambda x: sp_disp(x, full))
         st.dataframe(al, hide_index=True, width="stretch")
         num = st.text_input("Caller ID to allow-list", key="sp_al_num")
         note = st.text_input("Why", key="sp_al_note")
@@ -16551,13 +16758,27 @@ def render_spam_page(df, available_columns, overrides, timeline):
         st.caption("SQL is the source of truth. A failed or partial sheet update stays queued and is retried; nothing is ever duplicated. Rows are matched by the call's identity key (never by Caller ID alone or a row number).")
         st.dataframe(pd.DataFrame(store._q("SELECT incident_id, state, attempts, last_error, last_try FROM sp_sync_queue WHERE state <> 'done' ORDER BY queued_at LIMIT 200")), hide_index=True, width="stretch")
     with t_cap:
-        ok, why = sp_adapter().capability()
-        st.write(f"**Dry-run mode:** {'ON (nothing can change in Ringba)' if sp_dry_run() else 'OFF'} · **Automatic Ringba blocking:** {'supported' if ok else 'NOT supported in this build'}")
-        st.info(why)
+        ad = sp_adapter()
+        ok, why = ad.capability()
+        st.write(f"**Dry-run mode:** {'ON (nothing can change in Ringba)' if sp_dry_run() else 'OFF - approved blocks run for real'} · "
+                 f"**Automatic Ringba blocking:** {'ready' if ok else 'not ready'}" + (f" · **Scope:** {ad.scope_text()}" if hasattr(ad, "scope_text") else ""))
+        if ok:
+            st.info(why)
+        else:
+            st.warning(why)
+        if isinstance(ad, SpRingbaAdapter):
+            if st.button("Test Ringba block-list connection (read only)", key="sp_rb_test"):
+                good, msg = ad.test()
+                if good:
+                    st.success(msg)
+                else:
+                    st.warning("Could not read the Ringba block list: " + msg + " Blocking may still work, but it would stay VERIFICATION_PENDING until the number can be confirmed.")
+        st.caption("Endpoint used: POST /v2/{account}/blockedNumbers/ with phoneNumber (E.164) and campaignId (empty = all campaigns). One number per request. Secrets: RINGBA_BLOCK_TOKEN (separate write token), "
+                   "optional SPAM_BLOCK_CAMPAIGN_ID, SPAM_DRY_RUN (keep true until you have tested).")
         st.caption(sp_manual_guidance("<number>"))
 
 
-def _sp_tab_proposals(store, df, ident, now):
+def _sp_tab_proposals(store, df, ident, now, full=False):
     cn = st.radio("Show", ["Pending approval", "Approved", "Rejected", "All"], horizontal=True, key="sp_show")
     rv = {"Pending approval": ["PENDING_APPROVAL"], "Approved": ["APPROVED"], "Rejected": ["REJECTED"], "All": None}[cn]
     lst = sp_list(store, rv)
@@ -16565,11 +16786,23 @@ def _sp_tab_proposals(store, df, ident, now):
         st.info("No proposals here.")
         return
     show = lst[["id", "caller_norm", "review_status", "exec_status", "risk_score", "n_confirmed", "n_calls", "decided_by", "decided_at", "expires_at"]].copy()
-    show["caller_norm"] = show["caller_norm"].map(sp_mask)
-    st.dataframe(show, hide_index=True, width="stretch")
-    pid = st.selectbox("Proposal", list(lst["id"]), key="sp_pick")
+    show["caller_norm"] = show["caller_norm"].map(lambda x: sp_disp(x, full))
+    ids = list(lst["id"])
+    sel = None
+    try:                                                         # click a row to choose it (Streamlit 1.35+); older versions fall back to the drop-down
+        ev = st.dataframe(show, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="sp_tbl")
+        rows_ = list(getattr(getattr(ev, "selection", None), "rows", []) or [])
+        sel = rows_[0] if rows_ and 0 <= rows_[0] < len(ids) else None
+    except TypeError:
+        st.dataframe(show, hide_index=True, width="stretch")
+    if sel is not None:
+        pid = ids[sel]
+        st.caption("Selected from the table. Click the same row again to clear it and use the drop-down instead.")
+    else:
+        st.caption("Click a row in the table to choose a proposal, or pick one here:")
+        pid = st.selectbox("Proposal", ids, key="sp_pick")
     p = sp_get(store, pid)
-    st.write(f"**{sp_mask(p['caller_norm'])}** · review **{p['review_status']}** · execution **{p['exec_status'] or '-'}** · risk {p['risk_score']} · expires {p['expires_at']}")
+    st.write(f"**{sp_disp(p['caller_norm'], full)}** · review **{p['review_status']}** · execution **{p['exec_status'] or '-'}** · risk {p['risk_score']} · expires {p['expires_at']}")
     st.json(json.loads(p["evidence"] or "{}"))
     st.markdown("**Related calls (evidence)**")
     st.dataframe(sp_calls_for(store, p["caller_norm"]), hide_index=True, width="stretch")
@@ -16583,9 +16816,16 @@ def _sp_tab_proposals(store, df, ident, now):
     if c[2].button("Reject", key="sp_rj"):
         ok, msg = sp_decide(store, pid, False, ident, note, now)
         _s9_say(ok, msg)
-    if c[3].button("Execute", key="sp_ex"):
-        r = sp_execute(store, pid, ident, now)
-        _s9_say(r["ok"], r["message"], info=r["exec_status"] in ("MANUAL_ACTION_REQUIRED",))
+    live = not sp_dry_run()
+    confirm = True
+    if live:
+        confirm = bool(st.checkbox(f"I confirm: block {sp_disp(p['caller_norm'], full)} (this one number) in Ringba now", value=False, key="sp_live_ok"))
+    if c[3].button("Execute (LIVE)" if live else "Execute (dry run)", key="sp_ex"):
+        if not confirm:
+            st.warning("Tick the confirmation box first. Nothing was sent to Ringba.")
+        else:
+            r = sp_execute(store, pid, ident, now)
+            _s9_say(r["ok"], r["message"], info=r["exec_status"] in ("MANUAL_ACTION_REQUIRED", "VERIFICATION_PENDING"))
     if c[4].button("Verify", key="sp_vf"):
         r = sp_verify(store, pid, ident, now)
         _s9_say(r["ok"], r["message"], info=True)
@@ -16593,7 +16833,7 @@ def _sp_tab_proposals(store, df, ident, now):
         ok, msg = sp_report_manual(store, pid, ident, note, now)
         _s9_say(ok, msg)
     if p["exec_status"] == "MANUAL_ACTION_REQUIRED":
-        st.info(sp_manual_guidance(p["caller_norm"]))
+        st.info(sp_manual_guidance(p["caller_norm"] if full else sp_mask(p["caller_norm"])) + ("" if full else " (Tick 'Show full phone numbers' to see the whole number.)"))
     st.markdown("**Audit trail for this proposal**")
     ar = s16_audit_rows(store, 50, ref=pid)
     if len(ar):
