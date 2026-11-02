@@ -62,6 +62,7 @@ UI_SECTIONS = [
         ("Recs", "💡", "Recommendations", "Stored recommendations with their evidence, decisions and measured outcome."),
         ("DailyBrief", "📰", "Daily Briefing", "The operations briefing for a day: what changed, what is open, what is not known."),
         ("Governance", "🛡️", "Governance", "Approval requests, dry-run gateway and the tamper-evident audit log."),
+        ("SpamBlock", "🚫", "Spam & Blocking", "Spam incidents from AI QC, one-Caller-ID block proposals with manual approval, and the Google Sheet spam columns."),
     ]),
     ("", [("__all__", "🧾", "Classic view", "Everything on one long page (the previous layout).")]),
 ]
@@ -7058,6 +7059,14 @@ def ops_respond(question, qf, cols, today, sidebar_tl, ctx, nl_prev, tz=DEFAULT_
         if translated:
             a.caveats.append(f"I read your question as: “{english}”.")
         return a, ctx, nl_prev
+    try:
+        spa = sp_assistant_answer(resolved) if _depth == 0 else None
+    except Exception:
+        spa = None
+    if spa is not None:                              # spam incidents / block proposals: read only; approving or executing through chat is refused
+        if translated:
+            spa.caveats.insert(0, f"I read your question as: “{resolved}”.")
+        return spa, ctx, nl_prev
     s9a = ops_s9_answer(resolved, qf, cols, today, tz) if _depth == 0 else None
     if s9a is not None:                              # Step 9: stored alerts / call-volume forecast (Python only, read only)
         if translated:
@@ -10948,7 +10957,7 @@ def s9_action_allowed(entered):
 def s9_get_store():
     s = st.session_state.get("s9_store")
     if s is None:
-        s = S9Store()
+        s = tm_make_store()
         st.session_state["s9_store"] = s
     return s
 
@@ -14903,6 +14912,1724 @@ def render_ringba_page(page, df, available_columns, overrides, timeline):
 
 
 
+# =====================================================================================================================
+# TURSO MIRROR: keeps the local SQLite database (the one the app always works on) copied to a hosted Turso database, and restores it after a restart.
+#  * The app keeps using the local file exactly as before. Turso is a durable COPY (SQL stays the source of truth; Sheets stays a mirror of SQL).
+#  * Change capture = SQLite triggers into the local table tm_dirty (exact, cheap, no polling). Push = INSERT OR REPLACE of the changed rows only.
+#  * Restore = only when the local database has NO data rows (fresh container after a Streamlit restart). It never overwrites a database that has data.
+#  * A Turso outage NEVER stops the app: the error is recorded, the dirty list stays, and the next write / "Push now" retries. Pushes are idempotent.
+#  * Nothing is ever deleted on Turso by this code. The token is never shown, logged or stored (errors are scrubbed).
+#  * Talks to Turso over its HTTP API (Hrana v2 pipeline, https://<db>.turso.io/v2/pipeline) with urllib: no extra package to install.
+# Secrets: TURSO_DATABASE_URL (libsql://name-org.turso.io), TURSO_AUTH_TOKEN, optional TURSO_MIRROR=false to switch it off, TURSO_TIMEOUT (seconds, default 10).
+# =====================================================================================================================
+import base64 as _tm_b64
+import urllib.request as _tm_ureq
+import urllib.error as _tm_uerr
+
+TM_BATCH = 80                 # statements per HTTP request
+TM_SKIP_TABLES = ("tm_dirty", "tm_state")
+
+
+def tm_configured():
+    return bool(_cfg("TURSO_DATABASE_URL") and _cfg("TURSO_AUTH_TOKEN")) and _cfg("TURSO_MIRROR", "true").lower() not in ("0", "false", "no", "off")
+
+
+def tm_http_url(url):
+    u = str(url or "").strip()
+    for a in ("libsql://", "wss://", "ws://", "https://", "http://"):
+        if u.lower().startswith(a):
+            u = u[len(a):]
+            break
+    return "https://" + u.strip("/")
+
+
+def _tm_scrub(text, token=""):
+    t = str(text)
+    if token:
+        t = t.replace(token, "[token removed]")
+    t = re.sub(r"(?i)bearer\s+[A-Za-z0-9._\-]+", "Bearer [token removed]", t)
+    t = re.sub(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*", "[token removed]", t)
+    return t[:400]
+
+
+class TursoError(Exception):
+    def __init__(self, kind, msg):
+        super().__init__(msg)
+        self.kind, self.msg = kind, msg
+
+
+def _tm_default_transport(url, headers, body, timeout):
+    req = _tm_ureq.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with _tm_ureq.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except _tm_uerr.HTTPError as e:
+        return e.code, (e.read() or b"")
+
+
+def _tm_enc(v):
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, bool):
+        return {"type": "integer", "value": str(int(v))}
+    if isinstance(v, int):
+        return {"type": "integer", "value": str(v)}
+    if isinstance(v, float):
+        return {"type": "float", "value": v}
+    if isinstance(v, (bytes, bytearray)):
+        return {"type": "blob", "base64": _tm_b64.b64encode(bytes(v)).decode()}
+    return {"type": "text", "value": str(v)}
+
+
+def _tm_dec(d):
+    t = d.get("type")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(d["value"])
+    if t == "float":
+        return float(d["value"])
+    if t == "blob":
+        return _tm_b64.b64decode(d.get("base64", ""))
+    return d.get("value")
+
+
+class TursoClient:
+    """Minimal Hrana-over-HTTP client. run(list of (sql, args)) executes them IN ORDER on one stream; with atomic=True they are wrapped in BEGIN/COMMIT."""
+
+    def __init__(self, url, token, timeout=20, transport=None):
+        self.base = tm_http_url(url)
+        self.token = token
+        self.timeout = timeout
+        self.transport = transport or _tm_default_transport
+
+    def run(self, stmts, atomic=False):
+        reqs = []
+        if atomic:
+            reqs.append({"type": "execute", "stmt": {"sql": "BEGIN"}})
+        for sql, args in stmts:
+            reqs.append({"type": "execute", "stmt": {"sql": sql, "args": [_tm_enc(a) for a in (args or ())]}})
+        if atomic:
+            reqs.append({"type": "execute", "stmt": {"sql": "COMMIT"}})
+        reqs.append({"type": "close"})
+        body = json.dumps({"requests": reqs}).encode()
+        headers = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json", "User-Agent": "ringba-analytics/1.0"}
+        try:
+            status, raw = self.transport(self.base + "/v2/pipeline", headers, body, self.timeout)
+        except TursoError:
+            raise
+        except Exception as exc:
+            raise TursoError("network", f"Could not reach Turso ({type(exc).__name__}): {_tm_scrub(exc, self.token)}")
+        if status in (401, 403):
+            raise TursoError("auth", f"Turso refused the token (HTTP {status}). Create a new read/write token and update TURSO_AUTH_TOKEN.")
+        if status == 404:
+            raise TursoError("url", "Turso database URL not found (HTTP 404). Check TURSO_DATABASE_URL.")
+        if status >= 400:
+            raise TursoError("http", f"Turso returned HTTP {status}: {_tm_scrub(raw[:200].decode('utf-8', 'replace'), self.token)}")
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise TursoError("bad_response", "Turso returned something that is not JSON.")
+        results = data.get("results") or []
+        out = []
+        for i, r in enumerate(results):
+            if r.get("type") == "error":
+                err = (r.get("error") or {}).get("message", "error")
+                raise TursoError("sql", f"Turso rejected a statement: {_tm_scrub(err, self.token)}")
+        for r in results:
+            res = ((r.get("response") or {}).get("result")) if r.get("type") == "ok" else None
+            if res is not None and "cols" in res:
+                cols = [c.get("name") for c in res["cols"]]
+                out.append([dict(zip(cols, [_tm_dec(v) for v in row])) for row in res.get("rows", [])])
+            else:
+                out.append([])
+        n_expected = len(reqs) - 1
+        if len([r for r in results if r.get("type") == "ok"]) < n_expected:
+            raise TursoError("bad_response", "Turso answered fewer statements than were sent; nothing is treated as saved.")
+        return out[1:-1] if atomic else out[:len(stmts)]
+
+    def query(self, sql, args=()):
+        return self.run([(sql, args)])[0]
+
+
+class S9TursoStore(S9Store):
+    """S9Store + a Turso copy. Every table in the local database is mirrored (alerts, audit, Ringba cache, spam incidents, proposals ...)."""
+
+    def __init__(self, path=None, client=None):
+        super().__init__(path)
+        self._tm_client = client
+        self._tm_tables = set()
+        self._tm_remote_ready = False
+        self._tm_last_ok = ""
+        self._tm_last_error = ""
+        self._tm_last_push = ""
+        self._tm_restored = 0
+        self._tm_busy = False
+        self._tm_next_try = 0.0
+        self._tm_status = "starting"
+        self._tm_start()
+
+    # ----- plumbing
+    def _tm_cli(self):
+        if self._tm_client is None:
+            try:
+                tmo = int(float(_cfg("TURSO_TIMEOUT", "10")))
+            except Exception:
+                tmo = 20
+            self._tm_client = TursoClient(_cfg("TURSO_DATABASE_URL"), _cfg("TURSO_AUTH_TOKEN"), timeout=max(3, tmo))
+        return self._tm_client
+
+    def _tm_fail(self, exc):
+        tok = _cfg("TURSO_AUTH_TOKEN")
+        self._tm_last_error = _tm_scrub(getattr(exc, "msg", None) or f"{type(exc).__name__}: {exc}", tok)
+        self._tm_status = "error"
+        self._tm_next_try = time.time() + 60          # do not make every save wait for a dead connection: retry about once a minute
+
+    def _tm_local_tables(self, c):
+        return [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
+                if r[0] not in TM_SKIP_TABLES]
+
+    def _tm_ensure_triggers(self, mark_existing=True):
+        """Install change-capture triggers on every table that has none yet (spam / Ringba tables appear later than the first start)."""
+        def fn(c):
+            c.execute("CREATE TABLE IF NOT EXISTS tm_dirty (tbl TEXT NOT NULL, rid INTEGER NOT NULL, PRIMARY KEY (tbl, rid))")
+            c.execute("CREATE TABLE IF NOT EXISTS tm_state (key TEXT PRIMARY KEY, value TEXT)")
+            known = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'tm_ai_%'").fetchall()}
+            new = []
+            for t in self._tm_local_tables(c):
+                if "tm_ai_" + t in known:
+                    continue
+                q = '"' + t.replace('"', '""') + '"'
+                c.execute(f'CREATE TRIGGER IF NOT EXISTS "tm_ai_{t}" AFTER INSERT ON {q} BEGIN INSERT OR REPLACE INTO tm_dirty(tbl, rid) VALUES (\'{t}\', NEW.rowid); END')
+                c.execute(f'CREATE TRIGGER IF NOT EXISTS "tm_au_{t}" AFTER UPDATE ON {q} BEGIN INSERT OR REPLACE INTO tm_dirty(tbl, rid) VALUES (\'{t}\', NEW.rowid); END')
+                new.append(t)
+            if mark_existing:
+                for t in new:
+                    q = '"' + t.replace('"', '""') + '"'
+                    c.execute(f"INSERT OR REPLACE INTO tm_dirty(tbl, rid) SELECT '{t}', rowid FROM {q}")
+            return new
+        with self._lock:
+            c = self._conn()
+            try:
+                return fn_tx(c, fn)
+            finally:
+                self._close(c)
+
+    def _tm_data_rows(self):
+        c = self._conn()
+        try:
+            return sum(c.execute('SELECT COUNT(*) FROM "' + t.replace('"', '""') + '"').fetchone()[0] for t in self._tm_local_tables(c))
+        finally:
+            self._close(c)
+
+    def _tm_schema_stmts(self):
+        c = self._conn()
+        try:
+            out = []
+            for r in c.execute("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND type IN ('table','index') ORDER BY type DESC, name").fetchall():
+                if r[1] in TM_SKIP_TABLES or str(r[1]).startswith("tm_"):
+                    continue
+                sql = r[2]
+                sql = re.sub(r"(?i)^CREATE\s+TABLE\s+(?!IF NOT EXISTS)", "CREATE TABLE IF NOT EXISTS ", sql)
+                sql = re.sub(r"(?i)^CREATE\s+UNIQUE\s+INDEX\s+(?!IF NOT EXISTS)", "CREATE UNIQUE INDEX IF NOT EXISTS ", sql)
+                sql = re.sub(r"(?i)^CREATE\s+INDEX\s+(?!IF NOT EXISTS)", "CREATE INDEX IF NOT EXISTS ", sql)
+                out.append((sql, ()))
+            return out
+        finally:
+            self._close(c)
+
+    def _tm_ensure_remote(self):
+        """Create the same tables and indexes on Turso (IF NOT EXISTS, safe to repeat; new local tables are added on the next call)."""
+        sig = hashlib.sha1(json.dumps([s for s, _ in self._tm_schema_stmts()]).encode()).hexdigest()
+        if self._tm_remote_ready == sig:
+            return
+        self._tm_cli().run(self._tm_schema_stmts())
+        self._tm_remote_ready = sig
+
+    # ----- start / restore
+    def _tm_start(self):
+        if not self.persistent:
+            self._tm_status = "off (in-memory database)"
+            return
+        try:
+            self._tm_ensure_triggers(mark_existing=False)
+            local_rows = self._tm_data_rows()
+            self._tm_ensure_remote()
+            remote_rows = self._tm_remote_count()
+            if local_rows == 0 and remote_rows > 0:
+                self._tm_restore()
+            elif local_rows > 0 and remote_rows == 0:
+                self._tm_mark_all_dirty()         # first time Turso is switched on for an existing database: send everything once
+            self._tm_status = "connected"
+            self._tm_last_ok = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._tm_last_error = ""
+            self._tm_flush()
+        except TursoError as exc:
+            self._tm_fail(exc)
+        except Exception as exc:
+            self._tm_fail(exc)
+
+    def _tm_remote_tables(self):
+        rows = self._tm_cli().query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        return [r["name"] for r in rows if r["name"] not in TM_SKIP_TABLES and not str(r["name"]).startswith("tm_")]
+
+    def _tm_remote_count(self):
+        tabs = self._tm_remote_tables()
+        if not tabs:
+            return 0
+        res = self._tm_cli().run([(f'SELECT COUNT(*) AS n FROM "{t}"', ()) for t in tabs])
+        return sum(int(r[0]["n"]) for r in res if r)
+
+    def _tm_mark_all_dirty(self):
+        def fn(c):
+            for t in self._tm_local_tables(c):
+                c.execute(f"INSERT OR REPLACE INTO tm_dirty(tbl, rid) SELECT '{t}', rowid FROM \"{t}\"")
+        with self._lock:
+            c = self._conn()
+            try:
+                fn_tx(c, fn)
+            finally:
+                self._close(c)
+
+    def _tm_restore(self):
+        """Local database has no data and Turso has: copy Turso -> local. Never runs when the local database has data."""
+        cli = self._tm_cli()
+        remote = self._tm_remote_tables()
+        n = 0
+        with self._lock:
+            c = self._conn()
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                try:
+                    local = set(self._tm_local_tables(c))
+                    for t in remote:
+                        if t not in local:
+                            # a table the local schema does not have yet (created lazily, e.g. spam tables): build it from Turso's own definition
+                            ddl = cli.query("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (t,))
+                            if ddl and ddl[0]["sql"]:
+                                c.execute(ddl[0]["sql"])
+                                for ix in cli.query("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL", (t,)):
+                                    c.execute(ix["sql"])
+                            else:
+                                continue
+                        off = 0
+                        while True:
+                            rows = cli.query(f'SELECT rowid AS "__rid", * FROM "{t}" ORDER BY rowid LIMIT 400 OFFSET {off}')
+                            if not rows:
+                                break
+                            for r in rows:
+                                cols = [k for k in r.keys() if k != "__rid"]
+                                q = ",".join('"' + k + '"' for k in cols)
+                                c.execute(f'INSERT OR REPLACE INTO "{t}" ({q}) VALUES ({",".join("?" * len(cols))})', [r[k] for k in cols])
+                                n += 1
+                            off += len(rows)
+                            if len(rows) < 400:
+                                break
+                    c.execute("DELETE FROM tm_dirty")
+                    c.execute("COMMIT")
+                except BaseException:
+                    c.execute("ROLLBACK")
+                    raise
+            finally:
+                self._close(c)
+        self._tm_restored = n
+        self._tm_sync_user_version()
+
+    def _tm_sync_user_version(self):
+        pass
+
+    # ----- push
+    def _tm_pending(self):
+        try:
+            return self._q("SELECT COUNT(*) AS n FROM tm_dirty")[0]["n"]
+        except Exception:
+            return 0
+
+    def _tm_flush(self, force=False):
+        """Push the changed rows. Returns (ok, pushed). Never raises."""
+        if not self.persistent or self._tm_busy or not (self._tm_status in ("connected", "error", "starting")):
+            return False, 0
+        if not force and time.time() < self._tm_next_try:
+            return False, 0
+        self._tm_busy = True
+        pushed = 0
+        try:
+            self._tm_ensure_triggers(mark_existing=True)
+            self._tm_ensure_remote()
+            while True:
+                dirty = self._q("SELECT tbl, rid FROM tm_dirty ORDER BY tbl, rid LIMIT ?", (TM_BATCH,))
+                if not dirty:
+                    break
+                stmts, sent = [], []
+                for d in dirty:
+                    rows = self._q(f'SELECT * FROM "{d["tbl"]}" WHERE rowid = ?', (d["rid"],))
+                    if not rows:
+                        sent.append(d)                    # row no longer exists locally: nothing to send, and Turso rows are never deleted by this code
+                        continue
+                    r = rows[0]
+                    cols = list(r.keys())
+                    stmts.append((f'INSERT OR REPLACE INTO "{d["tbl"]}" ({",".join(chr(34) + k + chr(34) for k in cols)}) VALUES ({",".join("?" * len(cols))})', [r[k] for k in cols]))
+                    sent.append(d)
+                if stmts:
+                    self._tm_cli().run(stmts, atomic=True)
+                    pushed += len(stmts)
+                self._tm_clear(sent)
+            self._tm_status = "connected"
+            self._tm_last_ok = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            if pushed:
+                self._tm_last_push = self._tm_last_ok
+            self._tm_last_error = ""
+            return True, pushed
+        except Exception as exc:
+            self._tm_fail(exc)
+            return False, pushed
+        finally:
+            self._tm_busy = False
+
+    def _tm_clear(self, sent):
+        def fn(c):
+            for d in sent:
+                c.execute("DELETE FROM tm_dirty WHERE tbl=? AND rid=?", (d["tbl"], d["rid"]))
+        with self._lock:
+            c = self._conn()
+            try:
+                fn_tx(c, fn)
+            finally:
+                self._close(c)
+
+    def _tx(self, fn):
+        if self.persistent and not getattr(self, "_tm_busy", False):
+            try:
+                self._tm_ensure_triggers(mark_existing=True)
+            except Exception:
+                pass
+        r = super()._tx(fn)
+        if self.persistent and not getattr(self, "_tm_busy", False) and getattr(self, "_tm_status", "off").split(" ")[0] in ("connected", "error", "starting"):
+            self._tm_flush()
+        return r
+
+    # ----- public
+    def tm_info(self):
+        return {"status": self._tm_status, "pending": self._tm_pending() if self.persistent else 0, "last_ok": self._tm_last_ok, "last_push": self._tm_last_push,
+                "last_error": self._tm_last_error, "restored_rows": self._tm_restored, "url": tm_http_url(_cfg("TURSO_DATABASE_URL")).replace("https://", "")}
+
+    def tm_push_now(self):
+        if self._tm_status.startswith("off"):
+            return False, 0
+        return self._tm_flush(force=True)
+
+    def tm_test(self):
+        """Read-only connection test: does Turso accept the token, and can it run a query."""
+        try:
+            self._tm_cli().query("SELECT 1 AS ok")
+            return True, "Turso accepted the URL and token."
+        except TursoError as exc:
+            return False, exc.msg
+        except Exception as exc:
+            return False, _tm_scrub(f"{type(exc).__name__}: {exc}", _cfg("TURSO_AUTH_TOKEN"))
+
+
+def fn_tx(c, fn):
+    """One short local transaction on an already open connection."""
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        r = fn(c)
+        c.execute("COMMIT")
+        return r
+    except BaseException:
+        c.execute("ROLLBACK")
+        raise
+
+
+def tm_make_store():
+    return S9TursoStore() if tm_configured() else S9Store()
+
+
+def tm_status_panel():
+    """Small status box on the Spam & Blocking page. Shows state, never the token."""
+    s = s9_get_store()
+    with st.expander("Turso copy of the database", expanded=False):
+        if not isinstance(s, S9TursoStore):
+            st.caption("Not connected. Add TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in Secrets to keep your approvals and history across restarts. Until then they are erased when the app restarts.")
+            return
+        i = s.tm_info()
+        st.write(f"Status: **{i['status']}** · waiting to send: **{i['pending']}** · last successful contact: {i['last_ok'] or 'none yet'} · last data sent: {i['last_push'] or 'none yet'}")
+        if i["restored_rows"]:
+            st.info(f"After a restart, {i['restored_rows']:,} rows were restored from Turso.")
+        if i["last_error"]:
+            st.warning(f"Last Turso problem: {i['last_error']} The app keeps working; changes are sent when Turso is reachable.")
+        c1, c2 = st.columns(2)
+        if c1.button("Test Turso connection", key="tm_test"):
+            ok, msg = s.tm_test()
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+        if c2.button("Send waiting changes now", key="tm_push"):
+            ok, n = s.tm_push_now()
+            if ok:
+                st.success(f"Done. {n} row(s) sent.")
+            else:
+                st.error(s.tm_info()["last_error"] or "Nothing was sent.")
+
+
+# =====================================================================================================================
+# SPAM INCIDENTS, INDIVIDUAL CALLER-ID BLOCK PROPOSALS, AND GOOGLE-SHEET SPAM-STATUS SYNC   (functions are prefixed sp_)
+#
+#  * ONE detection engine: the existing AI QC report (canonical_flags / SPAM_PAT). This block only adds evidence rules, persistence and workflow.
+#  * SQL (the Step 9 SQLite store, migration v3, additive) is the permanent source of truth. Google Sheets is a best-effort mirror driven by a queue.
+#  * Target = ONE Caller ID (normalised). Never a publisher, buyer or campaign. Nothing is blocked without a human approval.
+#  * Nothing is ever recorded as BLOCKED unless an adapter has independently verified it. This build ships NO real Ringba adapter (see SP_ADAPTERS).
+#  * The AI assistant can only read; it has no path to approve or execute (sp_assistant_answer refuses).
+# =====================================================================================================================
+from urllib.parse import parse_qs as _sp_parse_qs
+
+SP_COLUMNS = ["Spam Status", "Spam Category", "Spam Confidence", "Spam Evidence", "Spam Incident ID",
+              "Block Review Status", "Block Approved By", "Block Approved At", "Block Execution Status", "Blocked At"]
+SP_CLASSES = ("CONFIRMED_SPAM", "SUSPICIOUS", "NOT_SPAM", "NEEDS_REVIEW")
+SP_REVIEW = ("PENDING_APPROVAL", "APPROVED", "REJECTED", "EXPIRED", "CANCELLED")
+SP_EXEC = ("", "NOT_EXECUTED", "EXECUTING", "DRY_RUN", "BLOCKED", "FAILED", "VERIFICATION_PENDING", "MANUAL_ACTION_REQUIRED", "MANUAL_REPORTED_UNVERIFIED")
+SP_START_OK = ("", "NOT_EXECUTED", "DRY_RUN", "FAILED", "MANUAL_ACTION_REQUIRED")     # exec states a run may start from
+SP_ERR_STATES = ("FAILED", "VERIFICATION_PENDING", "MANUAL_ACTION_REQUIRED", "MANUAL_REPORTED_UNVERIFIED")
+SP_CONFIRM_CONF = 85         # QC Spam Confidence at or above this (with the explicit QC spam call type) = CONFIRMED_SPAM
+SP_SUSPECT_CONF = 50
+SP_REVIEW_CONF = 60          # QC says "not spam" but gives a high spam confidence -> NEEDS_REVIEW
+SP_MIN_CONFIRMED = 2         # distinct CONFIRMED_SPAM calls from the same Caller ID before a proposal is created automatically
+SP_EXPIRE_HOURS = 72
+SP_NOTE = ("Target = one Caller ID only. Nothing is blocked without a person's approval, the AI assistant cannot approve or run anything, and a number is never shown as "
+           "BLOCKED until the external state has been verified. Dry-run mode is ON unless SPAM_DRY_RUN=false.")
+
+SP_DDL = [
+    """CREATE TABLE IF NOT EXISTS sp_incidents (
+        id TEXT PRIMARY KEY, call_key TEXT NOT NULL UNIQUE, key_kind TEXT, call_id TEXT, call_ts TEXT, caller_raw TEXT, caller_norm TEXT,
+        buyer TEXT, publisher TEXT, campaign TEXT, source_tab TEXT, classification TEXT NOT NULL, category TEXT, confidence INTEGER,
+        evidence TEXT, rules TEXT, qc_fp TEXT, first_seen TEXT, last_seen TEXT, times_seen INTEGER DEFAULT 1,
+        sheet_hash TEXT, sheet_state TEXT DEFAULT 'pending', sheet_gid TEXT, sheet_row_hint INTEGER, sheet_last_ok TEXT, sheet_error TEXT)""",
+    "CREATE INDEX IF NOT EXISTS sp_inc_caller ON sp_incidents(caller_norm, classification)",
+    "CREATE INDEX IF NOT EXISTS sp_inc_ts ON sp_incidents(call_ts)",
+    """CREATE TABLE IF NOT EXISTS sp_allowlist (caller_norm TEXT PRIMARY KEY, note TEXT, added_by TEXT, added_at TEXT, active INTEGER DEFAULT 1)""",
+    """CREATE TABLE IF NOT EXISTS sp_proposals (
+        id TEXT PRIMARY KEY, caller_norm TEXT NOT NULL, review_status TEXT NOT NULL, exec_status TEXT DEFAULT '', risk_score INTEGER, risk TEXT,
+        evidence TEXT, evidence_hash TEXT, approved_hash TEXT, incident_ids TEXT, n_confirmed INTEGER, n_suspicious INTEGER, n_calls INTEGER,
+        created_by TEXT, created_at TEXT, expires_at TEXT, decided_by TEXT, decided_verified INTEGER DEFAULT 0, decided_at TEXT, decision_note TEXT,
+        exec_attempts INTEGER DEFAULT 0, exec_started_at TEXT, executed_at TEXT, verified_at TEXT, verification TEXT, blocked_at TEXT,
+        result TEXT, last_error TEXT, dry_run INTEGER DEFAULT 1, manual_note TEXT, updated_at TEXT)""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS sp_one_open_proposal ON sp_proposals(caller_norm) WHERE review_status IN ('PENDING_APPROVAL','APPROVED')",
+    "CREATE INDEX IF NOT EXISTS sp_prop_status ON sp_proposals(review_status, exec_status)",
+    """CREATE TABLE IF NOT EXISTS sp_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, proposal_id TEXT, ts TEXT, actor TEXT, outcome TEXT, detail TEXT)""",
+    """CREATE TABLE IF NOT EXISTS sp_sync_queue (incident_id TEXT PRIMARY KEY, desired_hash TEXT, state TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, last_try TEXT, queued_at TEXT)""",
+    """CREATE TABLE IF NOT EXISTS sp_sync_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ok INTEGER, written INTEGER, unchanged INTEGER, pending INTEGER, detail TEXT)""",
+]
+S16_PERMS.update({"spam_view": "viewer", "spam_scan": "open", "spam_allowlist": "strict", "spam_approve": "strict", "spam_execute": "strict", "spam_sync": "open"})
+
+
+def sp_init(store):
+    """Create the spam tables (CREATE ... IF NOT EXISTS, additive, re-runnable) the first time a store is used. Like the Ringba cache tables this leaves the Step 9
+    schema version (PRAGMA user_version) untouched, so existing databases and earlier tests are unaffected."""
+    if getattr(store, "_sp_ready", False):
+        return
+    store._tx(lambda c: [c.execute(stmt) for stmt in SP_DDL])
+    store._sp_ready = True
+
+
+def _sp_needs_store(fn):
+    import functools
+
+    @functools.wraps(fn)
+    def wrap(store, *a, **k):
+        sp_init(store)
+        return fn(store, *a, **k)
+    return wrap
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# normalisation, matching key, QC parsing
+# ---------------------------------------------------------------------------------------------------------------------
+def sp_norm_caller(raw):
+    """Individual Caller ID -> E.164 style '+1XXXXXXXXXX' (North-American numbers) or '+<digits>' for other valid lengths; '' when missing / unusable
+    ('0', blank, 'anonymous', too short, one repeated digit). A missing Caller ID is never a reason to call something spam."""
+    s = str(raw if raw is not None else "").strip()
+    if not s or re.search(r"anonymous|unknown|restricted|private|blocked|null|nan", s, re.I):
+        return ""
+    d = re.sub(r"\D", "", s)
+    if d.startswith("00"):
+        d = d[2:]
+    if len(d) == 10:
+        d = "1" + d
+    if len(d) < 11 or len(d) > 15 or len(set(d)) == 1:
+        return ""
+    if d.startswith("1") and len(d) != 11:
+        return ""
+    return "+" + d
+
+
+def sp_mask(norm):
+    d = re.sub(r"\D", "", str(norm or ""))
+    return ("***" + d[-4:]) if len(d) >= 4 else ("" if not d else "***")
+
+
+def sp_norm_ts(v):
+    s = str(v if v is not None else "").strip()
+    if not s:
+        return ""
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            t = pd.to_datetime(s, errors="coerce")
+        if pd.isna(t):
+            return s.lower()
+        return t.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return s.lower()
+
+
+def sp_rec_token(url):
+    u = str(url if url is not None else "").strip()
+    if not u:
+        return ""
+    try:
+        k = _sp_parse_qs(urlparse(u).query).get("k")
+        if k and k[0]:
+            return k[0]
+    except Exception:
+        pass
+    return u
+
+
+def sp_call_key(call_id="", recording="", call_ts="", caller="", buyer="", publisher="", campaign="", duration=""):
+    """Collision-resistant identity of ONE call, usable on the SQL side and on the sheet side (the same function reads both).
+    1) the Ringba Call ID when the sheet has such a column;  2) the recording-link token + exact call time + digits of the Caller ID (the sheet has no Call ID column);
+    3) a composite of time, Caller ID, buyer, publisher, campaign and duration.  Never the Caller ID alone, never a row number. -> (key, kind)"""
+    cid = str(call_id if call_id is not None else "").strip()
+    if cid and cid.lower() not in ("nan", "none", "null", "n/a"):
+        return "cid:" + cid.lower(), "call_id"
+    ts = sp_norm_ts(call_ts)
+    digits = re.sub(r"\D", "", str(caller if caller is not None else ""))
+    tok = sp_rec_token(recording)
+    if tok:
+        return "rec:" + hashlib.sha1(tok.encode()).hexdigest()[:20] + "|" + ts + "|" + digits, "recording"
+    basis = "|".join([ts, digits, str(buyer).strip().lower(), str(publisher).strip().lower(), str(campaign).strip().lower(), str(duration).strip()])
+    return "cmp:" + hashlib.sha1(basis.encode()).hexdigest()[:24], "composite"
+
+
+def sp_incident_id(call_key):
+    return "SPM-" + hashlib.sha1(str(call_key).encode()).hexdigest()[:10].upper()
+
+
+def sp_parse_qc(text):
+    """The QC report fields this block needs (reuses the app's own parser)."""
+    p = parse_qc_text(text or "")
+    conf = None
+    m = re.search(r"(\d{1,3})", str(p.get("Spam Confidence", "")))
+    if m:
+        conf = max(0, min(100, int(m.group(1))))
+    flag = str(p.get("Spam/Robot", "")).strip().upper()
+    return {"call_type": str(p.get("Call Type", "")).strip(), "reason": str(p.get("Call Type Reason", "")).strip(), "spam_flag": flag if flag in ("YES", "NO") else "",
+            "conf": conf, "issue": str(p.get("QC Issue", "")).strip(), "outcome": str(p.get("Outcome", "")).strip()}
+
+
+_SP_CATS = [("SCAM_FRAUD", r"scam|fraud|irs\b|gift card|warranty|debt|loan|credit card|phish|tech support|social security"),
+            ("AUTOMATED_ROBOCALL", r"robo|automated|recorded|robot|auto-?dial|prerecorded|pre-recorded|ivr"),
+            ("SOLICITATION_LISTING", r"yellow pages|listing|google business|directory|seo\b|marketing|advertis|solicit|promot|vendor|sales pitch|selling")]
+
+
+def sp_category(qc):
+    t = " ".join([qc.get("reason", ""), qc.get("issue", "")]).lower()
+    for name, rx in _SP_CATS:
+        if re.search(rx, t):
+            return name
+    return "OTHER_SPAM"
+
+
+def sp_classify(qc_text, ctx=None):
+    """Deterministic, evidence-based classification of ONE call from its existing AI QC report.
+    Returns None when there is no usable QC report (not assessed - never guessed), else
+    {classification, category, confidence, evidence[], supporting[], rules[]}.
+    DECISION BASIS = the QC spam finding only. Short duration, low score, VoIP, quick hang-up and a missing Caller ID are listed as `supporting`
+    signals for the human reader and are NEVER used to decide the class."""
+    ctx = ctx or {}
+    text = str(qc_text if qc_text is not None else "")
+    if not re.search(r"Call Type\s*:", text, re.I):
+        return None
+    q = sp_parse_qc(text)
+    ct = q["call_type"].upper()
+    ct_spam = bool(re.search(r"^SPAM", ct))
+    yes = q["spam_flag"] == "YES" or bool(re.search(SPAM_PAT, text, re.I)) and q["spam_flag"] != "NO"
+    no = q["spam_flag"] == "NO"
+    conf = q["conf"]
+    rules = []
+    if not (ct_spam or yes):
+        if conf is not None and conf >= SP_REVIEW_CONF:
+            klass = "NEEDS_REVIEW"
+            rules.append(f"R2: QC says not spam but gives a spam confidence of {conf}%")
+        else:
+            return {"classification": "NOT_SPAM", "category": "", "confidence": conf or 0, "evidence": [], "supporting": [], "rules": ["R1: no QC spam indicator"]}
+    elif no and ct_spam:
+        klass = "NEEDS_REVIEW"
+        rules.append("R3: QC call type says SPAM but the Spam/Robot field says NO (contradiction)")
+    elif re.search(r"QUALIFIED", ct) and not re.search(r"NON", ct):
+        klass = "NEEDS_REVIEW"
+        rules.append("R4: QC marks the call QUALIFIED and spam at the same time (contradiction)")
+    elif conf is None:
+        klass = "NEEDS_REVIEW"
+        rules.append("R5: a QC spam indicator without a spam confidence")
+    elif conf < SP_SUSPECT_CONF:
+        klass = "NEEDS_REVIEW"
+        rules.append(f"R6: QC spam indicator with a low confidence ({conf}% < {SP_SUSPECT_CONF}%)")
+    elif conf >= SP_CONFIRM_CONF and ct_spam and (yes or q["spam_flag"] == ""):
+        klass = "CONFIRMED_SPAM"
+        rules.append(f"R7: QC call type SPAM + Spam/Robot YES + confidence {conf}% >= {SP_CONFIRM_CONF}%")
+    else:
+        klass = "SUSPICIOUS"
+        why = "call type is not SPAM" if conf >= SP_CONFIRM_CONF else f"confidence {conf}% < {SP_CONFIRM_CONF}%"
+        rules.append(f"R8: QC spam indicator but {why}")
+    ev = [f"QC call type: {q['call_type'] or 'n/a'}", f"QC Spam/Robot: {q['spam_flag'] or 'n/a'}" + (f" ({conf}%)" if conf is not None else "")]
+    if q["reason"] and not is_unavailable(q["reason"]):
+        ev.append("QC reason: " + q["reason"][:160])
+    if q["issue"] and not is_unavailable(q["issue"]):
+        ev.append("QC issue: " + q["issue"][:120])
+    sup = []
+    if re.search(VOIP_PAT, str(ctx.get("line_type", "")), re.I):
+        sup.append("VoIP line (supporting only)")
+    d = ctx.get("duration_sec")
+    if d is not None and d == d and d < 30:
+        sup.append(f"short call, {int(d)}s (supporting only)")
+    if str(ctx.get("hangup", "")).strip():
+        sup.append(f"hang-up by {str(ctx.get('hangup')).strip()[:20]} (supporting only)")
+    return {"classification": klass, "category": sp_category(q) if klass != "NEEDS_REVIEW" or yes or ct_spam else "", "confidence": int(conf or 0),
+            "evidence": ev, "supporting": sup, "rules": rules}
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# settings
+# ---------------------------------------------------------------------------------------------------------------------
+def sp_dry_run():
+    """Dry-run is the default and stays ON unless SPAM_DRY_RUN is explicitly false."""
+    return _cfg("SPAM_DRY_RUN", "true").lower() not in ("0", "false", "no", "off")
+
+
+def sp_min_confirmed():
+    try:
+        return max(1, int(_cfg("SPAM_MIN_CONFIRMED", str(SP_MIN_CONFIRMED))))
+    except Exception:
+        return SP_MIN_CONFIRMED
+
+
+def sp_sheet_sync_on():
+    return _cfg("SPAM_SHEET_SYNC", "true").lower() not in ("0", "false", "no", "off")
+
+
+def sp_dup_policy():
+    return "all" if _cfg("SPAM_SHEET_DUP_POLICY", "skip").lower() == "all" else "skip"
+
+
+def sp_sysid():
+    return {"label": "auto-detector", "verified": False, "level": "operator", "via": "system"}
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# frame -> incidents (idempotent)
+# ---------------------------------------------------------------------------------------------------------------------
+def sp_columns(df):
+    low = {str(c).strip().lower(): c for c in df.columns}
+
+    def pick(*names):
+        for n in names:
+            if n.lower() in low:
+                return low[n.lower()]
+        return None
+    return {"date": pick("Call Date"), "buyer": pick("Buyer"), "publisher": pick("Publisher"), "campaign": pick("Campaign", "get_campaign_category"),
+            "caller": pick("Caller ID"), "duration": pick("Duration"), "recording": pick("Recording"), "hangup": pick("Hangup By"),
+            "qc": pick("AI QC Report"), "line": pick("Line Type"), "call_id": pick("Call ID", "CallId", "Ringba Call ID", "Inbound Call ID", "inboundCallId"),
+            "tab": pick("Source Tab")}
+
+
+def sp_row_keys(df, c):
+    """Vectorised-enough: [(key, kind)] per row, using the same sp_call_key as the sheet side."""
+    g = lambda k: df[c[k]].astype(str).tolist() if c.get(k) else [""] * len(df)
+    return [sp_call_key(*a) for a in zip(g("call_id"), g("recording"), g("date"), g("caller"), g("buyer"), g("publisher"), g("campaign"), g("duration"))]
+
+
+def sp_history(df, c):
+    """Per Caller ID across ALL loaded calls: total calls and qualified calls (from the existing QC pattern). Used for repeat tracking and false-positive guards."""
+    if not c.get("caller"):
+        return pd.DataFrame(columns=["calls", "qualified"])
+    norm = df[c["caller"]].map(sp_norm_caller)
+    qual = df[c["qc"]].astype(str).str.contains(QUAL_PAT, case=False, na=False, regex=True) if c.get("qc") else pd.Series(False, index=df.index)
+    h = pd.DataFrame({"n": norm, "q": qual})
+    h = h[h["n"] != ""]
+    return h.groupby("n").agg(calls=("q", "size"), qualified=("q", "sum"))
+
+
+@_sp_needs_store
+def sp_ingest(store, df, now, actor=None, tab_default=""):
+    """Scan the loaded calls with the existing QC reports and persist incidents. Idempotent: the same call is never stored twice (UNIQUE call key); a changed QC
+    report on an existing call updates it and queues a sheet update. Returns a summary dict."""
+    actor = actor or sp_sysid()
+    c = sp_columns(df)
+    out = {"rows": len(df), "not_assessed": 0, "not_spam": 0, "new": 0, "updated": 0, "unchanged": 0, "duplicate_rows": 0, "missing_caller": 0, "by_class": {}}
+    if not c.get("qc") or not c.get("caller"):
+        out["error"] = "The sheet needs 'AI QC Report' and 'Caller ID' columns."
+        return out
+    now_s = s16_ts(now)
+    seen = set()
+    dur = df[c["duration"]].map(parse_duration) if c.get("duration") else None
+    qcs = df[c["qc"]].astype(str)
+    cand = qcs.str.contains(SPAM_PAT, case=False, na=False, regex=True) | qcs.str.contains(r"Spam Confidence:\s*(?:[6-9]\d|100)\s*%", case=False, na=False, regex=True)
+    out["not_assessed"] = int((~qcs.str.contains(r"Call Type\s*:", case=False, na=False, regex=True)).sum())
+    rows = []
+    for i in np.flatnonzero(cand.to_numpy()):
+        row = df.iloc[i]
+        g_ = lambda k: str(row[c[k]]) if c.get(k) else ""
+        key, kind = sp_call_key(g_("call_id"), g_("recording"), g_("date"), g_("caller"), g_("buyer"), g_("publisher"), g_("campaign"), g_("duration"))
+        if key in seen:
+            out["duplicate_rows"] += 1
+            continue
+        seen.add(key)
+        d_ = None
+        if dur is not None:
+            try:
+                d_ = float(dur.iloc[i])
+            except Exception:
+                d_ = None
+        r = sp_classify(row[c["qc"]], {"line_type": row[c["line"]] if c.get("line") else "", "duration_sec": d_, "hangup": row[c["hangup"]] if c.get("hangup") else ""})
+        if not r or r["classification"] == "NOT_SPAM":
+            out["not_spam"] += 1
+            continue
+        raw = str(row[c["caller"]]).strip()
+        norm = sp_norm_caller(raw)
+        if not norm:
+            out["missing_caller"] += 1
+        rows.append((key, kind, row, raw, norm, r))
+
+    def fn(cx):
+        for key, kind, row, raw, norm, r in rows:
+            iid = sp_incident_id(key)
+            qc_fp = hashlib.sha1((str(row[c["qc"]]).strip() + "|" + r["classification"]).encode()).hexdigest()[:16]
+            ev = s16_json({"evidence": r["evidence"], "supporting": r["supporting"], "decision_basis": "AI QC spam finding only; duration, score, VoIP, hang-up and a missing Caller ID never decide the class"})
+            tab = str(row[c["tab"]]).strip() if c.get("tab") else tab_default
+            ex = cx.execute("SELECT qc_fp, classification, source_tab FROM sp_incidents WHERE call_key = ?", (key,)).fetchone()
+            moved = bool(ex is not None and tab and (ex["source_tab"] or "") != tab)      # the same call (same key) now sits in another tab: follow it
+            if ex is None:
+                cx.execute("""INSERT INTO sp_incidents(id, call_key, key_kind, call_id, call_ts, caller_raw, caller_norm, buyer, publisher, campaign, source_tab, classification, category,
+                           confidence, evidence, rules, qc_fp, first_seen, last_seen, times_seen, sheet_state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'pending')""",
+                           (iid, key, kind, (str(row[c["call_id"]]).strip() if c.get("call_id") else ""), sp_norm_ts(row[c["date"]]) if c.get("date") else "", raw, norm,
+                            str(row[c["buyer"]]).strip() if c.get("buyer") else "", str(row[c["publisher"]]).strip() if c.get("publisher") else "",
+                            str(row[c["campaign"]]).strip() if c.get("campaign") else "", tab, r["classification"], r["category"], r["confidence"], ev,
+                            json.dumps(r["rules"]), qc_fp, now_s, now_s))
+                s16_audit(cx, now_s, actor["label"], actor["verified"], "spam_detected", iid, f"{r['classification']} {r['category']} conf {r['confidence']} caller {sp_mask(norm)}")
+                out["new"] += 1
+            elif ex["qc_fp"] != qc_fp:
+                cx.execute("UPDATE sp_incidents SET classification=?, category=?, confidence=?, evidence=?, rules=?, qc_fp=?, last_seen=?, times_seen=times_seen+1, sheet_state='pending', source_tab=? WHERE call_key=?",
+                           (r["classification"], r["category"], r["confidence"], ev, json.dumps(r["rules"]), qc_fp, now_s, tab if moved else (ex["source_tab"] or tab), key))
+                if moved:
+                    out["moved"] = out.get("moved", 0) + 1
+                s16_audit(cx, now_s, actor["label"], actor["verified"], "spam_reclassified", iid, f"{ex['classification']} -> {r['classification']}")
+                out["updated"] += 1
+            else:
+                if moved:
+                    cx.execute("UPDATE sp_incidents SET last_seen=?, times_seen=times_seen+1, source_tab=?, sheet_state='pending', sheet_row_hint=NULL, sheet_gid=NULL WHERE call_key=?", (now_s, tab, key))
+                    s16_audit(cx, now_s, actor["label"], actor["verified"], "spam_tab_changed", iid, f"call now found in tab '{tab[:60]}' (was '{(ex['source_tab'] or '')[:60]}')")
+                    out["moved"] = out.get("moved", 0) + 1
+                else:
+                    cx.execute("UPDATE sp_incidents SET last_seen=?, times_seen=times_seen+1 WHERE call_key=?", (now_s, key))
+                out["unchanged"] += 1
+            out["by_class"][r["classification"]] = out["by_class"].get(r["classification"], 0) + 1
+    store._tx(fn)
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# allowlist, risk, proposals
+# ---------------------------------------------------------------------------------------------------------------------
+@_sp_needs_store
+def sp_allowlisted(store, norm):
+    if not norm:
+        return False
+    cfg_list = {sp_norm_caller(x) for x in re.split(r"[,\s;]+", str(_cfg("SPAM_ALLOWLIST", "") or "")) if x.strip()}
+    if norm in cfg_list:
+        return True
+    return bool(store._q("SELECT 1 FROM sp_allowlist WHERE caller_norm = ? AND active = 1", (norm,)))
+
+
+@_sp_needs_store
+def sp_allow_add(store, norm_or_raw, note, ident, now=None):
+    try:
+        s16_require("spam_allowlist", ident)
+    except PermissionError as exc:
+        return False, str(exc)
+    norm = sp_norm_caller(norm_or_raw)
+    if not norm:
+        return False, "That is not a usable Caller ID."
+    now_s = s16_ts(now)
+
+    def fn(c):
+        c.execute("INSERT INTO sp_allowlist(caller_norm, note, added_by, added_at, active) VALUES (?,?,?,?,1) ON CONFLICT(caller_norm) DO UPDATE SET active=1, note=excluded.note, added_by=excluded.added_by, added_at=excluded.added_at",
+                  (norm, s16_scrub(note, 200), ident["label"], now_s))
+        s16_audit(c, now_s, ident["label"], ident["verified"], "spam_allowlist_add", norm, f"{sp_mask(norm)} {note}")
+        # an open proposal for an allow-listed number is cancelled
+        for r in c.execute("SELECT id FROM sp_proposals WHERE caller_norm=? AND review_status IN ('PENDING_APPROVAL','APPROVED') AND exec_status NOT IN ('BLOCKED')", (norm,)).fetchall():
+            c.execute("UPDATE sp_proposals SET review_status='CANCELLED', result=?, updated_at=? WHERE id=?", ("cancelled: the Caller ID was allow-listed", now_s, r["id"]))
+            s16_audit(c, now_s, ident["label"], ident["verified"], "spam_proposal_cancelled", r["id"], "allow-listed")
+    store._tx(fn)
+    sp_queue_refresh(store)
+    return True, "Added to the allowlist. It will never receive a block proposal."
+
+
+@_sp_needs_store
+def sp_allow_remove(store, norm, ident, now=None):
+    try:
+        s16_require("spam_allowlist", ident)
+    except PermissionError as exc:
+        return False, str(exc)
+    now_s = s16_ts(now)
+    store._tx(lambda c: (c.execute("UPDATE sp_allowlist SET active=0 WHERE caller_norm=?", (norm,)), s16_audit(c, now_s, ident["label"], ident["verified"], "spam_allowlist_remove", norm, sp_mask(norm))))
+    return True, "Removed from the allowlist."
+
+
+@_sp_needs_store
+def sp_caller_stats(store, norm, hist=None):
+    inc = store._q("SELECT id, classification, confidence, publisher, buyer, campaign FROM sp_incidents WHERE caller_norm = ?", (norm,))
+    conf = [i for i in inc if i["classification"] == "CONFIRMED_SPAM"]
+    h = hist.loc[norm] if (hist is not None and norm in hist.index) else None
+    return {"n_confirmed": len(conf), "n_suspicious": sum(1 for i in inc if i["classification"] == "SUSPICIOUS"), "n_review": sum(1 for i in inc if i["classification"] == "NEEDS_REVIEW"),
+            "avg_conf": (sum(i["confidence"] or 0 for i in conf) / len(conf)) if conf else 0.0,
+            "publishers": len({i["publisher"] for i in conf if i["publisher"]}), "calls": int(h["calls"]) if h is not None else None,
+            "qualified": int(h["qualified"]) if h is not None else None, "incident_ids": sorted(i["id"] for i in conf)}
+
+
+def sp_risk(stats):
+    """Deterministic score 0-100 used only to RANK the queue (eligibility is the separate gate below)."""
+    s = min(60, 30 * stats["n_confirmed"])
+    s += 20 if stats["avg_conf"] >= 95 else (10 if stats["avg_conf"] >= 90 else 0)
+    s += min(10, 5 * stats["n_suspicious"])
+    s += 10 if stats["publishers"] >= 2 else 0
+    if (stats.get("qualified") or 0) > 0:
+        s -= 40
+    return int(max(0, min(100, s)))
+
+
+@_sp_needs_store
+def sp_eligibility(store, norm, hist=None, manual=False):
+    """(ok, reason, stats). Gate for a block proposal. Never based on duration, score, VoIP, hang-up or a missing Caller ID."""
+    st_ = sp_caller_stats(store, norm, hist) if norm else {"n_confirmed": 0}
+    if not norm:
+        return False, "No usable Caller ID, so there is nothing to block.", st_
+    if sp_allowlisted(store, norm):
+        return False, "The Caller ID is on the allowlist.", st_
+    if st_["n_confirmed"] < 1:
+        return False, "No CONFIRMED_SPAM call for this Caller ID.", st_
+    if (st_.get("qualified") or 0) > 0:
+        return False, f"This Caller ID also made {st_['qualified']} QUALIFIED call(s): conflicting history, a person must review it first.", st_
+    need = 1 if manual else sp_min_confirmed()
+    if st_["n_confirmed"] < need:
+        return False, f"Only {st_['n_confirmed']} confirmed spam call(s); {need} needed for an automatic proposal.", st_
+    return True, "eligible", st_
+
+
+@_sp_needs_store
+def sp_evidence_hash(store, norm):
+    rows = store._q("SELECT id, classification, qc_fp FROM sp_incidents WHERE caller_norm = ? AND classification = 'CONFIRMED_SPAM' ORDER BY id", (norm,))
+    basis = norm + "|" + ("allow" if sp_allowlisted(store, norm) else "ok") + "|" + "|".join(f"{r['id']}:{r['classification']}:{r['qc_fp']}" for r in rows)
+    return hashlib.sha256(basis.encode()).hexdigest()[:32]
+
+
+@_sp_needs_store
+def sp_calls_for(store, norm):
+    return pd.DataFrame(store._q("SELECT id AS incident, call_ts AS call_time, classification, confidence, category, publisher, buyer, campaign, evidence "
+                                 "FROM sp_incidents WHERE caller_norm = ? ORDER BY call_ts", (norm,)))
+
+
+@_sp_needs_store
+def sp_create_proposal(store, norm, now, hist=None, manual=False, ident=None):
+    """(proposal_id | None, message). Idempotent: one open proposal per Caller ID (unique index). A rejected number is not re-proposed unless there is NEW evidence."""
+    ident = ident or sp_sysid()
+    ok, why, stats = sp_eligibility(store, norm, hist, manual=manual)
+    if not ok:
+        return None, why
+    now_s = s16_ts(now)
+    ev_hash = sp_evidence_hash(store, norm)
+    exp = (pd.Timestamp(now_s) + pd.Timedelta(hours=SP_EXPIRE_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    risk = sp_risk(stats)
+    evidence = {"caller": sp_mask(norm), "n_confirmed": stats["n_confirmed"], "n_suspicious": stats["n_suspicious"], "avg_confidence": round(stats["avg_conf"], 1),
+                "publishers_involved": stats["publishers"], "calls_seen": stats["calls"], "qualified_calls": stats["qualified"], "manual": bool(manual)}
+
+    def fn(c):
+        open_ = c.execute("SELECT id FROM sp_proposals WHERE caller_norm=? AND review_status IN ('PENDING_APPROVAL','APPROVED')", (norm,)).fetchone()
+        if open_:
+            return open_["id"], "existing"
+        last = c.execute("SELECT id, review_status, n_confirmed FROM sp_proposals WHERE caller_norm=? ORDER BY created_at DESC, rowid DESC LIMIT 1", (norm,)).fetchone()
+        if last and last["review_status"] == "REJECTED" and (last["n_confirmed"] or 0) >= stats["n_confirmed"] and not manual:
+            return None, "A person rejected this Caller ID and there is no new evidence."
+        pid = "BLK-" + hashlib.sha1((norm + "|" + ev_hash + "|" + now_s).encode()).hexdigest()[:10].upper()
+        c.execute("""INSERT INTO sp_proposals(id, caller_norm, review_status, exec_status, risk_score, risk, evidence, evidence_hash, incident_ids, n_confirmed, n_suspicious, n_calls,
+                    created_by, created_at, expires_at, dry_run, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (pid, norm, "PENDING_APPROVAL", "", risk, json.dumps({"rule": f"{stats['n_confirmed']} confirmed spam call(s), avg confidence {stats['avg_conf']:.0f}%"}), s16_json(evidence), ev_hash,
+                   json.dumps(stats["incident_ids"]), stats["n_confirmed"], stats["n_suspicious"], stats["calls"] or 0, ident["label"], now_s, exp, int(sp_dry_run()), now_s))
+        s16_audit(c, now_s, ident["label"], ident["verified"], "spam_proposal_created", pid, f"caller {sp_mask(norm)} risk {risk} confirmed {stats['n_confirmed']}")
+        return pid, "created"
+    r = store._tx(fn)
+    sp_queue_refresh(store)
+    return r
+
+
+@_sp_needs_store
+def sp_scan(store, df, now, actor=None, tab_default=""):
+    """ONE call does the whole automatic part: ingest incidents -> repeat tracking -> create proposals for eligible Caller IDs -> expire old ones -> refresh the sheet queue.
+    Never approves, never executes."""
+    summ = sp_ingest(store, df, now, actor, tab_default)
+    if summ.get("error"):
+        return summ
+    c = sp_columns(df)
+    hist = sp_history(df, c)
+    sp_expire(store, now)
+    created, existing, skipped = 0, 0, {}
+    for r in store._q("SELECT DISTINCT caller_norm FROM sp_incidents WHERE classification='CONFIRMED_SPAM' AND caller_norm <> ''"):
+        pid, how = sp_create_proposal(store, r["caller_norm"], now, hist)
+        if how == "created":
+            created += 1
+        elif how == "existing":
+            existing += 1
+        elif pid is None:
+            skipped[how] = skipped.get(how, 0) + 1
+    summ.update({"proposals_created": created, "proposals_existing": existing, "proposals_skipped": skipped})
+    sp_queue_refresh(store)
+    return summ
+
+
+@_sp_needs_store
+def sp_expire(store, now):
+    now_s = s16_ts(now)
+
+    def fn(c):
+        n = 0
+        for r in c.execute("SELECT id FROM sp_proposals WHERE review_status IN ('PENDING_APPROVAL','APPROVED') AND exec_status NOT IN ('BLOCKED','VERIFICATION_PENDING','EXECUTING','MANUAL_REPORTED_UNVERIFIED') AND expires_at < ?", (now_s,)).fetchall():
+            c.execute("UPDATE sp_proposals SET review_status='EXPIRED', updated_at=? WHERE id=?", (now_s, r["id"]))
+            s16_audit(c, now_s, "system", 0, "spam_proposal_expired", r["id"], "expired")
+            n += 1
+        return n
+    n = store._tx(fn)
+    if n:
+        sp_queue_refresh(store)
+    return n
+
+
+@_sp_needs_store
+def sp_get(store, pid):
+    r = store._q("SELECT * FROM sp_proposals WHERE id = ?", (str(pid),))
+    return r[0] if r else None
+
+
+@_sp_needs_store
+def sp_list(store, review=None, exec_=None, limit=500):
+    where, args = [], []
+    if review:
+        where.append("review_status IN (" + ",".join("?" * len(review)) + ")")
+        args += list(review)
+    if exec_ is not None:
+        where.append("exec_status IN (" + ",".join("?" * len(exec_)) + ")")
+        args += list(exec_)
+    sql = "SELECT * FROM sp_proposals" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY risk_score DESC, created_at DESC LIMIT ?"
+    return pd.DataFrame(store._q(sql, tuple(args) + (int(limit),)))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# approval, execution gateway, verification
+# ---------------------------------------------------------------------------------------------------------------------
+@_sp_needs_store
+def sp_decide(store, pid, approve, ident, note="", now=None):
+    """Approve or reject a PENDING_APPROVAL proposal. Operator level only (the action password must be configured AND supplied). Returns (ok, message)."""
+    try:
+        s16_require("spam_approve", ident)
+    except PermissionError as exc:
+        return False, str(exc)
+    now_s = s16_ts(now)
+
+    def fn(c):
+        r = c.execute("SELECT * FROM sp_proposals WHERE id = ?", (str(pid),)).fetchone()
+        if not r:
+            return False, "Unknown proposal."
+        if r["review_status"] != "PENDING_APPROVAL":
+            return False, f"Only a PENDING_APPROVAL proposal can be decided (this one is {r['review_status']})."
+        if r["expires_at"] < now_s:
+            c.execute("UPDATE sp_proposals SET review_status='EXPIRED', updated_at=? WHERE id=?", (now_s, pid))
+            s16_audit(c, now_s, "system", 0, "spam_proposal_expired", pid, "expired before a decision")
+            return False, "This proposal has expired."
+        if approve and sp_allowlisted(store, r["caller_norm"]):
+            return False, "The Caller ID is on the allowlist; it cannot be approved for blocking."
+        cur_hash = sp_evidence_hash(store, r["caller_norm"])
+        if approve and cur_hash != r["evidence_hash"]:
+            return False, "The evidence changed since this proposal was created. It was not approved; the next scan creates a fresh proposal."
+        c.execute("UPDATE sp_proposals SET review_status=?, exec_status=?, decided_by=?, decided_verified=?, decided_at=?, decision_note=?, approved_hash=?, updated_at=? WHERE id=?",
+                  ("APPROVED" if approve else "REJECTED", "NOT_EXECUTED" if approve else "", ident["label"], int(ident["verified"]), now_s, s16_scrub(note, 300),
+                   cur_hash if approve else None, now_s, pid))
+        s16_audit(c, now_s, ident["label"], ident["verified"], "spam_proposal_approved" if approve else "spam_proposal_rejected", pid,
+                  note + ("" if ident["verified"] else " [identity unverified: shared-secret gate]"))
+        return True, ("Approved. Nothing is blocked yet: use Execute (a dry run unless SPAM_DRY_RUN=false)." if approve else "Rejected. The number will not be proposed again without new evidence.")
+    r = store._tx(fn)
+    sp_queue_refresh(store)
+    return r
+
+
+@_sp_needs_store
+def sp_cancel(store, pid, ident, now=None):
+    try:
+        s16_require("spam_approve", ident)
+    except PermissionError as exc:
+        return False, str(exc)
+    now_s = s16_ts(now)
+
+    def fn(c):
+        r = c.execute("SELECT review_status, exec_status FROM sp_proposals WHERE id=?", (pid,)).fetchone()
+        if not r or r["review_status"] not in ("PENDING_APPROVAL", "APPROVED") or r["exec_status"] in ("BLOCKED", "EXECUTING", "VERIFICATION_PENDING"):
+            return False, "This proposal cannot be cancelled now."
+        c.execute("UPDATE sp_proposals SET review_status='CANCELLED', updated_at=? WHERE id=?", (now_s, pid))
+        s16_audit(c, now_s, ident["label"], ident["verified"], "spam_proposal_cancelled", pid, "")
+        return True, "Cancelled."
+    r = store._tx(fn)
+    sp_queue_refresh(store)
+    return r
+
+
+class SpAdapter:
+    """Interface of a Ringba number-block adapter. block() and verify() must be separate calls: verify() reads the external block list back.
+    The default adapter is UNSUPPORTED: the Ringba documentation reachable from this build does not give the endpoint or payload and the configured token is read-only."""
+    name = "none"
+
+    def capability(self):
+        return False, ("No verified Ringba endpoint for blocking ONE Caller ID is configured. The Ringba help pages describe Numbers > Manage Blocked Numbers > Individual "
+                       "(account-wide or one campaign) and an API 'number block' endpoint, but its path and payload are not documented in what this build can read, "
+                       "and the Ringba token used here is read-only.")
+
+    def block(self, norm):
+        raise NotImplementedError
+
+    def verify(self, norm):
+        raise NotImplementedError
+
+
+SP_ADAPTERS = {}          # name -> SpAdapter instance. Intentionally empty: nothing here can really block a number.
+
+
+def sp_adapter():
+    name = _cfg("SPAM_BLOCK_ADAPTER", "")
+    return SP_ADAPTERS.get(name) or SpAdapter()
+
+
+def sp_manual_guidance(norm):
+    return (f"Manual step in Ringba: Numbers > Manage Blocked Numbers > Individual Blocked Numbers > add {norm} (choose the account-wide or campaign scope your policy requires), "
+            "or use the block icon on the Call Details report. Then press 'I blocked it manually'. It stays UNVERIFIED (not BLOCKED) until verified.")
+
+
+def _sp_attempt(c, pid, now_s, ident, outcome, detail):
+    c.execute("INSERT INTO sp_attempts(proposal_id, ts, actor, outcome, detail) VALUES (?,?,?,?,?)", (pid, now_s, s16_scrub(ident["label"], 80), outcome, s16_scrub(detail, 400)))
+    s16_audit(c, now_s, ident["label"], ident["verified"], "spam_exec_" + outcome, pid, detail)
+
+
+@_sp_needs_store
+def sp_execute(store, pid, ident, now=None, adapter=None, dry_run=None):
+    """THE single execution gateway. Order: permission -> proposal exists -> duplicate / state -> approved -> expiry -> allowlist -> evidence unchanged since approval ->
+    atomic claim -> dry run (stop, nothing changed) | adapter capability -> block -> independent verify. BLOCKED only after verify() is True.
+    Returns {'ok', 'exec_status', 'message'}."""
+    now_s = s16_ts(now)
+    dry = sp_dry_run() if dry_run is None else bool(dry_run)
+
+    def refuse(outcome, msg, status=None):
+        store._tx(lambda c: _sp_attempt(c, str(pid), now_s, ident, outcome, msg))
+        return {"ok": False, "exec_status": status, "message": msg}
+    try:
+        s16_require("spam_execute", ident)
+    except PermissionError as exc:
+        return refuse("refused_permission", str(exc))
+    p = sp_get(store, pid)
+    if not p:
+        return {"ok": False, "exec_status": None, "message": "Unknown proposal."}
+    if p["exec_status"] == "BLOCKED":
+        return refuse("duplicate_ignored", "Duplicate ignored: this number is already verified as blocked.", "BLOCKED")
+    if p["review_status"] != "APPROVED":
+        return refuse("refused_not_approved", f"Only an APPROVED proposal can run (this one is {p['review_status']}).", p["exec_status"])
+    if p["exec_status"] not in SP_START_OK:
+        return refuse("refused_state", f"Not startable from execution status {p['exec_status']} (EXECUTING = already running; VERIFICATION_PENDING = use Verify).", p["exec_status"])
+    if p["expires_at"] < now_s:
+        store._tx(lambda c: (c.execute("UPDATE sp_proposals SET review_status='EXPIRED', updated_at=? WHERE id=?", (now_s, pid)), s16_audit(c, now_s, "system", 0, "spam_proposal_expired", pid, "expired before execution")))
+        sp_queue_refresh(store)
+        return refuse("refused_expired", "This approval has expired and cannot run.", p["exec_status"])
+    norm = p["caller_norm"]
+    if sp_allowlisted(store, norm):
+        return refuse("refused_allowlist", "The Caller ID is on the allowlist.", p["exec_status"])
+    if not p["approved_hash"] or sp_evidence_hash(store, norm) != p["approved_hash"] or sp_evidence_hash(store, norm) != p["evidence_hash"]:
+        def stale(c):
+            c.execute("UPDATE sp_proposals SET review_status='CANCELLED', result=?, updated_at=? WHERE id=?", ("cancelled: the proposal or its evidence changed after approval", now_s, pid))
+            _sp_attempt(c, str(pid), now_s, ident, "refused_modified", "evidence or target changed after approval; re-approval required")
+        store._tx(stale)
+        sp_queue_refresh(store)
+        return {"ok": False, "exec_status": p["exec_status"], "message": "The proposal or its evidence changed after it was approved. It was cancelled; a new proposal needs a new approval."}
+
+    def claim(c):
+        n = c.execute("UPDATE sp_proposals SET exec_status='EXECUTING', exec_attempts=exec_attempts+1, exec_started_at=?, updated_at=?, dry_run=? "
+                      "WHERE id=? AND review_status='APPROVED' AND exec_status IN ('','NOT_EXECUTED','DRY_RUN','FAILED','MANUAL_ACTION_REQUIRED')", (now_s, now_s, int(dry), pid)).rowcount
+        if n:
+            _sp_attempt(c, str(pid), now_s, ident, "started", "dry run" if dry else "live")
+        return n
+    if not store._tx(claim):
+        return refuse("duplicate_ignored", "Duplicate ignored: another run already claimed this proposal.", "EXECUTING")
+
+    def finish(status, msg, extra=None, outcome=None):
+        sets, args = ["exec_status=?", "result=?", "updated_at=?"], [status, s16_scrub(msg, 500), now_s]
+        for k, v in (extra or {}).items():
+            sets.append(k + "=?")
+            args.append(v)
+        store._tx(lambda c: (c.execute("UPDATE sp_proposals SET " + ", ".join(sets) + " WHERE id=?", tuple(args) + (pid,)), _sp_attempt(c, str(pid), now_s, ident, (outcome or status).lower(), msg)))
+        sp_queue_refresh(store)
+        return {"ok": status in ("BLOCKED", "DRY_RUN"), "exec_status": status, "message": msg}
+    if dry:
+        return finish("DRY_RUN", f"Dry run - nothing was changed in Ringba. Would have added {sp_mask(norm)} as an individual blocked number.", None, "dry_run")
+    ad = adapter or sp_adapter()
+    ok, why = ad.capability()
+    if not ok:
+        return finish("MANUAL_ACTION_REQUIRED", "Automatic blocking is not supported here. " + why + " " + sp_manual_guidance(norm), {"last_error": s16_scrub(why, 300)})
+    try:
+        ad.block(norm)
+    except Exception as exc:
+        kind = getattr(exc, "kind", "")
+        if kind == "rejected" or isinstance(exc, (PermissionError, ValueError)):
+            return finish("FAILED", f"Ringba refused the block request ({type(exc).__name__}). Nothing is recorded as blocked.", {"last_error": type(exc).__name__})
+        return finish("VERIFICATION_PENDING", f"The block call did not finish cleanly ({type(exc).__name__}: timeout or unknown). The external state is UNCERTAIN; verify it before anything is recorded as blocked.",
+                      {"executed_at": now_s, "last_error": type(exc).__name__})
+    return sp_verify(store, pid, ident, now, ad, _after_block=True)
+
+
+@_sp_needs_store
+def sp_verify(store, pid, ident, now=None, adapter=None, _after_block=False):
+    """Independent external check. BLOCKED only when the adapter reads the block list back and finds the number. Recovery path for VERIFICATION_PENDING."""
+    now_s = s16_ts(now)
+    try:
+        s16_require("spam_execute", ident)
+    except PermissionError as exc:
+        return {"ok": False, "exec_status": None, "message": str(exc)}
+    p = sp_get(store, pid)
+    if not p:
+        return {"ok": False, "exec_status": None, "message": "Unknown proposal."}
+    if p["exec_status"] == "BLOCKED":
+        return {"ok": True, "exec_status": "BLOCKED", "message": "Already verified as blocked."}
+    if not _after_block and p["exec_status"] not in ("VERIFICATION_PENDING", "MANUAL_REPORTED_UNVERIFIED", "MANUAL_ACTION_REQUIRED"):
+        return {"ok": False, "exec_status": p["exec_status"], "message": f"Nothing to verify in status {p['exec_status']}."}
+    ad = adapter or sp_adapter()
+    ok, why = ad.capability()
+    if not ok:
+        return {"ok": False, "exec_status": p["exec_status"], "message": "Verification is not possible here: " + why}
+    try:
+        found = ad.verify(p["caller_norm"])
+    except Exception as exc:
+        found = None
+        err = type(exc).__name__
+    else:
+        err = ""
+    if found is True:
+        store._tx(lambda c: (c.execute("UPDATE sp_proposals SET exec_status='BLOCKED', blocked_at=?, verified_at=?, verification=?, result=?, updated_at=? WHERE id=?",
+                                       (now_s, now_s, "verified: number found on the Ringba block list", "verified blocked", now_s, pid)),
+                             _sp_attempt(c, str(pid), now_s, ident, "verified_blocked", "number found in the external block list")))
+        sp_queue_refresh(store)
+        return {"ok": True, "exec_status": "BLOCKED", "message": "Verified: the number is on the Ringba block list."}
+    msg = "Could not verify (" + err + "); still VERIFICATION_PENDING." if err else "The block list does not (yet) contain the number; still VERIFICATION_PENDING."
+    store._tx(lambda c: (c.execute("UPDATE sp_proposals SET exec_status='VERIFICATION_PENDING', verification=?, last_error=?, updated_at=? WHERE id=?", (s16_scrub(msg, 200), err, now_s, pid)),
+                         _sp_attempt(c, str(pid), now_s, ident, "verification_pending", msg)))
+    sp_queue_refresh(store)
+    return {"ok": False, "exec_status": "VERIFICATION_PENDING", "message": msg}
+
+
+@_sp_needs_store
+def sp_report_manual(store, pid, ident, note="", now=None):
+    """A person says they blocked the number by hand in Ringba. Recorded as MANUAL_REPORTED_UNVERIFIED - never BLOCKED, because nothing independent confirmed it."""
+    try:
+        s16_require("spam_execute", ident)
+    except PermissionError as exc:
+        return False, str(exc)
+    now_s = s16_ts(now)
+
+    def fn(c):
+        n = c.execute("UPDATE sp_proposals SET exec_status='MANUAL_REPORTED_UNVERIFIED', manual_note=?, executed_at=?, updated_at=? WHERE id=? AND review_status='APPROVED' "
+                      "AND exec_status IN ('','NOT_EXECUTED','DRY_RUN','FAILED','MANUAL_ACTION_REQUIRED')", (s16_scrub(note, 300), now_s, now_s, pid)).rowcount
+        if n:
+            _sp_attempt(c, str(pid), now_s, ident, "manual_reported", note)
+        return n
+    if not store._tx(fn):
+        return False, "Only an APPROVED proposal that has not been blocked can be reported as manually blocked."
+    sp_queue_refresh(store)
+    return True, "Recorded as MANUAL_REPORTED_UNVERIFIED. It is not shown as BLOCKED until verified."
+
+
+@_sp_needs_store
+def sp_reconcile_stale(store, now, minutes=15):
+    """A run stuck in EXECUTING (crash / timeout) becomes VERIFICATION_PENDING: the external state is unknown, nothing is retried automatically."""
+    now_s = s16_ts(now)
+    limit = (pd.Timestamp(now_s) - pd.Timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def fn(c):
+        n = 0
+        for r in c.execute("SELECT id FROM sp_proposals WHERE exec_status='EXECUTING' AND COALESCE(exec_started_at, created_at) < ?", (limit,)).fetchall():
+            c.execute("UPDATE sp_proposals SET exec_status='VERIFICATION_PENDING', last_error='stuck in EXECUTING', updated_at=? WHERE id=?", (now_s, r["id"]))
+            s16_audit(c, now_s, "system", 0, "spam_exec_uncertain", r["id"], "stuck in EXECUTING")
+            n += 1
+        return n
+    n = store._tx(fn)
+    if n:
+        sp_queue_refresh(store)
+    return n
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# SQL -> Google Sheet mirror (queue driven, idempotent)
+# ---------------------------------------------------------------------------------------------------------------------
+def sp_desired(inc, prop, allow=False):
+    """The 10 sheet cells for one incident, derived ONLY from SQL. Detection (first 5) and blocking (last 5) are kept apart."""
+    review = prop["review_status"] if prop else ("ALLOWLISTED" if allow else "")
+    exec_ = (prop["exec_status"] or ("NOT_EXECUTED" if prop["review_status"] == "APPROVED" else "")) if prop else ""
+    approved = prop and prop["decided_at"] and prop["review_status"] == "APPROVED"
+    try:
+        ev = json.loads(inc["evidence"] or "{}").get("evidence", [])
+    except Exception:
+        ev = []
+    return {"Spam Status": inc["classification"], "Spam Category": inc["category"] or "", "Spam Confidence": f"{int(inc['confidence'] or 0)}%",
+            "Spam Evidence": s16_scrub("; ".join(ev[:4]), 300), "Spam Incident ID": inc["id"],
+            "Block Review Status": review, "Block Approved By": (prop["decided_by"] or "") if approved else "", "Block Approved At": (prop["decided_at"] or "") if approved else "",
+            "Block Execution Status": exec_, "Blocked At": (prop["blocked_at"] or "") if (prop and prop["exec_status"] == "BLOCKED") else ""}
+
+
+def sp_desired_hash(d):
+    return hashlib.sha1(json.dumps([d[k] for k in SP_COLUMNS]).encode()).hexdigest()[:20]
+
+
+def sp_latest_prop(props, norm):
+    return props.get(norm)
+
+
+@_sp_needs_store
+def sp_queue_refresh(store, now=None):
+    """SQL only (no network): recompute every incident's desired sheet cells and queue the ones that differ from what was last written. Safe to call any time."""
+    now_s = s16_ts(now)
+    incs = store._q("SELECT * FROM sp_incidents")
+    props = {}
+    for p in store._q("SELECT * FROM sp_proposals ORDER BY created_at, rowid"):
+        props[p["caller_norm"]] = p
+    q = {r["incident_id"]: r for r in store._q("SELECT * FROM sp_sync_queue")}
+    allow = {r["caller_norm"] for r in store._q("SELECT caller_norm FROM sp_allowlist WHERE active = 1")}
+
+    def fn(c):
+        n = 0
+        for i in incs:
+            h = sp_desired_hash(sp_desired(i, props.get(i["caller_norm"]), i["caller_norm"] in allow))
+            cur = q.get(i["id"])
+            if i["sheet_hash"] == h and i["sheet_state"] == "synced":
+                if cur and cur["state"] != "done":
+                    c.execute("UPDATE sp_sync_queue SET state='done', desired_hash=? WHERE incident_id=?", (h, i["id"]))
+                continue
+            if cur is None:
+                c.execute("INSERT INTO sp_sync_queue(incident_id, desired_hash, state, attempts, queued_at) VALUES (?,?,?,0,?)", (i["id"], h, "pending", now_s))
+                n += 1
+            elif cur["desired_hash"] != h or cur["state"] == "done":
+                c.execute("UPDATE sp_sync_queue SET desired_hash=?, state='pending', queued_at=? WHERE incident_id=?", (h, now_s, i["id"]))
+                n += 1
+        return n
+    return store._tx(fn)
+
+
+def sp_a1(col0):
+    n, s = col0 + 1, ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def sp_sheet_layout(values):
+    """Locate the identity columns and the spam columns. NEVER touches an existing non-spam column.
+    Returns (plan, error). plan: {idx:{field:col}, spam:{name:col}, new:[names], start:int, nrows:int}"""
+    if not values or not values[0]:
+        return None, "The tab is empty."
+    heads = [str(h).strip() for h in values[0]]
+    low = {h.lower(): i for i, h in enumerate(heads) if h}
+
+    def pick(*names):
+        for n in names:
+            if n.lower() in low:
+                return low[n.lower()]
+        return None
+    idx = {"date": pick("Call Date"), "caller": pick("Caller ID"), "buyer": pick("Buyer"), "publisher": pick("Publisher"), "campaign": pick("Campaign", "get_campaign_category"),
+           "duration": pick("Duration"), "recording": pick("Recording"), "call_id": pick("Call ID", "CallId", "Ringba Call ID", "Inbound Call ID", "inboundCallId")}
+    if idx["date"] is None or idx["caller"] is None:
+        return None, "The tab has no 'Call Date' / 'Caller ID' header, so rows cannot be matched safely."
+    spam = {n: low[n.lower()] for n in SP_COLUMNS if n.lower() in low}
+    # "after the current columns": past the last header AND past any column that holds data under a blank header (the live export has two such columns, P and Q,
+    # which carry AI-provider diagnostics on some rows). New columns are only ever placed in columns that are empty in every row.
+    last = max([i for i, h in enumerate(heads) if h] or [-1])
+    for r in values[1:]:
+        for j in range(len(r) - 1, last, -1):
+            if str(r[j]).strip() and j not in spam.values():
+                last = j
+                break
+    new = [n for n in SP_COLUMNS if n not in spam]
+    start = max(last, max(spam.values()) if spam else -1) + 1
+    if new:
+        for r in values[1:]:
+            for j in range(start, start + len(new)):
+                if j < len(r) and str(r[j]).strip():
+                    return None, f"Column {sp_a1(j)} already holds data; the spam columns would overwrite it, so nothing was written."
+        for k, n in enumerate(new):
+            spam[n] = start + k
+    return {"idx": idx, "spam": spam, "new": new, "start": start, "nrows": len(values)}, ""
+
+
+def sp_sheet_index(values, plan):
+    """key -> [row numbers (1-based)], incident-id -> [rows], plus a per-row caller digit string for verification."""
+    idx, spam = plan["idx"], plan["spam"]
+    by_key, by_id, digits = {}, {}, {}
+
+    def g(r, k):
+        j = idx.get(k)
+        return r[j] if (j is not None and j < len(r)) else ""
+    for n, r in enumerate(values[1:], start=2):
+        if not any(str(x).strip() for x in r):
+            continue
+        key, _k = sp_call_key(g(r, "call_id"), g(r, "recording"), g(r, "date"), g(r, "caller"), g(r, "buyer"), g(r, "publisher"), g(r, "campaign"), g(r, "duration"))
+        by_key.setdefault(key, []).append(n)
+        digits[n] = re.sub(r"\D", "", str(g(r, "caller")))
+        j = spam["Spam Incident ID"]
+        v = str(r[j]).strip() if j < len(r) else ""
+        if v:
+            by_id.setdefault(v, []).append(n)
+    return by_key, by_id, digits
+
+
+def sp_sheet_plan(rows_pending, values, plan, policy="skip"):
+    """Decide, for each pending incident, which sheet rows to write. Returns (targets{incident_id: [rows]}, problems{incident_id: (state, message)})."""
+    by_key, by_id, digits = sp_sheet_index(values, plan)
+    targets, problems = {}, {}
+    for inc in rows_pending:
+        want = re.sub(r"\D", "", str(inc["caller_raw"]))
+        rows = by_id.get(inc["id"]) or by_key.get(inc["call_key"]) or []
+        if not rows:
+            problems[inc["id"]] = ("not_found", "No sheet row matches this call (identity key not present yet / row changed).")
+            continue
+        rows = [r for r in rows if digits.get(r) == want]
+        if not rows:
+            problems[inc["id"]] = ("mismatch", "A row matched the call key but its Caller ID differs; not written.")
+            continue
+        same_call = inc.get("key_kind") in ("recording", "call_id")      # a recording token / Ringba Call ID belongs to ONE call: rows sharing it are the same call listed twice
+        if len(rows) > 1 and policy != "all" and not same_call and not by_id.get(inc["id"]):
+            problems[inc["id"]] = ("ambiguous", f"{len(rows)} sheet rows share this call's composite key (rows {', '.join(map(str, rows[:6]))}); skipped so a wrong row can never be updated (SPAM_SHEET_DUP_POLICY=all flags them all).")
+            continue
+        targets[inc["id"]] = rows
+    return targets, problems
+
+
+@_sp_needs_store
+def sp_sheet_sync(store, spreadsheet, now=None, default_tab="", max_incidents=2000):
+    """Mirror pending incident status into the existing call rows (extra columns only). Never raises: failures are recorded and retried next time.
+    Returns {'ok','written','unchanged','pending','problems','error'}."""
+    now_s = s16_ts(now)
+    res = {"ok": True, "written": 0, "unchanged": 0, "pending": 0, "problems": {}, "error": ""}
+    try:
+        sp_queue_refresh(store, now)
+        pend = store._q("SELECT i.*, q.desired_hash AS q_hash FROM sp_incidents i JOIN sp_sync_queue q ON q.incident_id = i.id WHERE q.state <> 'done' ORDER BY i.call_ts LIMIT ?", (int(max_incidents),))
+        if not pend:
+            store._tx(lambda c: c.execute("INSERT INTO sp_sync_log(ts, ok, written, unchanged, pending, detail) VALUES (?,?,?,?,?,?)", (now_s, 1, 0, 0, 0, "nothing pending")))
+            return res
+        props = {}
+        for p in store._q("SELECT * FROM sp_proposals ORDER BY created_at, rowid"):
+            props[p["caller_norm"]] = p
+        allow = {r["caller_norm"] for r in store._q("SELECT caller_norm FROM sp_allowlist WHERE active = 1")}
+        tabs = {}
+        for i in pend:
+            tabs.setdefault(i["source_tab"] or default_tab, []).append(i)
+        for tab, items in tabs.items():
+            try:
+                ws = get_worksheet(spreadsheet, tab) if tab else spreadsheet.sheet1
+                v1 = ws.get_all_values()
+                plan, err = sp_sheet_layout(v1)
+                if err:
+                    raise RuntimeError(err)
+                targets, problems = sp_sheet_plan(items, v1, plan, sp_dup_policy())
+                v2 = ws.get_all_values()                                    # second read: if the sheet moved while we planned, write nothing this round
+                if v2 != v1:
+                    t2, p2 = sp_sheet_plan(items, v2, plan, sp_dup_policy())
+                    if t2 != targets:
+                        raise RuntimeError("The sheet changed while it was being read (rows moved); nothing was written. It will be retried.")
+                ranges, done = [], {}
+                spam = plan["spam"]
+                if plan["new"]:
+                    cols_needed = max(spam.values()) + 1
+                    if getattr(ws, "col_count", cols_needed) < cols_needed:
+                        ws.add_cols(cols_needed - ws.col_count)
+                    for n in plan["new"]:
+                        ranges.append({"range": f"{sp_a1(spam[n])}1", "values": [[n]]})
+                for inc in items:
+                    if inc["id"] in problems:
+                        continue
+                    d = sp_desired(inc, props.get(inc["caller_norm"]), inc["caller_norm"] in allow)
+                    h = sp_desired_hash(d)
+                    rows_ = targets.get(inc["id"], [])
+                    changed = False
+                    for r in rows_:
+                        cur = v1[r - 1]
+                        same = all((str(cur[spam[n]]).strip() if spam[n] < len(cur) else "") == str(d[n]) for n in SP_COLUMNS)
+                        if same:
+                            continue
+                        changed = True
+                        order = sorted(SP_COLUMNS, key=lambda n: spam[n])
+                        contiguous = all(spam[order[k + 1]] == spam[order[k]] + 1 for k in range(len(order) - 1))
+                        if contiguous:
+                            ranges.append({"range": f"{sp_a1(spam[order[0]])}{r}:{sp_a1(spam[order[-1]])}{r}", "values": [[d[n] for n in order]]})
+                        else:
+                            ranges += [{"range": f"{sp_a1(spam[n])}{r}", "values": [[d[n]]]} for n in SP_COLUMNS]
+                    done[inc["id"]] = (h, rows_[0] if rows_ else None, changed)
+                for k in range(0, len(ranges), 200):
+                    ws.batch_update(ranges[k:k + 200], value_input_option="RAW")
+                gid = str(getattr(ws, "id", "") or "")
+
+                def mark(c):
+                    for iid, (h, row, changed) in done.items():
+                        c.execute("UPDATE sp_incidents SET sheet_hash=?, sheet_state='synced', sheet_gid=?, sheet_row_hint=?, sheet_last_ok=?, sheet_error='' WHERE id=?", (h, gid, row, now_s, iid))
+                        c.execute("UPDATE sp_sync_queue SET state='done', attempts=attempts+1, last_error='', last_try=?, desired_hash=? WHERE incident_id=?", (now_s, h, iid))
+                    for iid, (st_, msg) in problems.items():
+                        c.execute("UPDATE sp_incidents SET sheet_state=?, sheet_error=? WHERE id=?", (st_, s16_scrub(msg, 300), iid))
+                        c.execute("UPDATE sp_sync_queue SET state=?, attempts=attempts+1, last_error=?, last_try=? WHERE incident_id=?", (st_, s16_scrub(msg, 300), now_s, iid))
+                store._tx(mark)
+                res["written"] += sum(1 for v in done.values() if v[2])
+                res["unchanged"] += sum(1 for v in done.values() if not v[2])
+                res["problems"].update({k: v[0] for k, v in problems.items()})
+            except Exception as exc:
+                msg = f"{type(exc).__name__}: {s16_scrub(str(exc), 200)}"
+                res["ok"], res["error"] = False, msg
+                ids = [i["id"] for i in items]
+
+                def failed(c, ids=ids, msg=msg):
+                    for x in ids:
+                        c.execute("UPDATE sp_sync_queue SET state='failed', attempts=attempts+1, last_error=?, last_try=? WHERE incident_id=?", (msg, now_s, x))
+                        c.execute("UPDATE sp_incidents SET sheet_state='failed', sheet_error=? WHERE id=?", (msg, x))
+                store._tx(failed)
+    except Exception as exc:                                            # the SQL side is never affected by a sheet problem
+        res["ok"], res["error"] = False, f"{type(exc).__name__}: {s16_scrub(str(exc), 200)}"
+    res["pending"] = store._q("SELECT COUNT(*) n FROM sp_sync_queue WHERE state <> 'done'")[0]["n"]
+    store._tx(lambda c: c.execute("INSERT INTO sp_sync_log(ts, ok, written, unchanged, pending, detail) VALUES (?,?,?,?,?,?)",
+                                  (now_s, int(res["ok"]), res["written"], res["unchanged"], res["pending"], s16_scrub(res["error"] or json.dumps(res["problems"]), 300))))
+    return res
+
+
+@_sp_needs_store
+def sp_sync_status(store):
+    last_ok = store._q("SELECT ts FROM sp_sync_log WHERE ok = 1 ORDER BY id DESC LIMIT 1")
+    last = store._q("SELECT ts, ok, detail FROM sp_sync_log ORDER BY id DESC LIMIT 1")
+    q = store._q("SELECT state, COUNT(*) n FROM sp_sync_queue GROUP BY state")
+    return {"last_success": last_ok[0]["ts"] if last_ok else "never", "last_run": last[0] if last else None, "queue": {r["state"]: r["n"] for r in q}}
+
+
+def sp_sheet_link(meta_url, inc):
+    if not meta_url or not inc.get("sheet_row_hint"):
+        return ""
+    base = str(meta_url).split("#")[0].split("/edit")[0]
+    return f"{base}/edit#gid={inc.get('sheet_gid') or 0}&range=A{int(inc['sheet_row_hint'])}"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# dashboard numbers + page
+# ---------------------------------------------------------------------------------------------------------------------
+@_sp_needs_store
+def sp_counts(store):
+    one = lambda sql: store._q(sql)[0]["n"]
+    return {"incidents": one("SELECT COUNT(*) n FROM sp_incidents"),
+            "confirmed_calls": one("SELECT COUNT(*) n FROM sp_incidents WHERE classification='CONFIRMED_SPAM'"),
+            "confirmed_callers": one("SELECT COUNT(DISTINCT caller_norm) n FROM sp_incidents WHERE classification='CONFIRMED_SPAM' AND caller_norm<>''"),
+            "repeat_suspicious": one("SELECT COUNT(*) n FROM (SELECT caller_norm FROM sp_incidents WHERE caller_norm<>'' AND classification IN ('CONFIRMED_SPAM','SUSPICIOUS') GROUP BY caller_norm HAVING COUNT(*) >= 2)"),
+            "pending": one("SELECT COUNT(*) n FROM sp_proposals WHERE review_status='PENDING_APPROVAL'"),
+            "rejected": one("SELECT COUNT(*) n FROM sp_proposals WHERE review_status='REJECTED'"),
+            "approved_not_executed": one("SELECT COUNT(*) n FROM sp_proposals WHERE review_status='APPROVED' AND exec_status IN ('','NOT_EXECUTED','DRY_RUN')"),
+            "blocked": one("SELECT COUNT(*) n FROM sp_proposals WHERE exec_status='BLOCKED'"),
+            "failed_unverified": one("SELECT COUNT(*) n FROM sp_proposals WHERE exec_status IN ('FAILED','VERIFICATION_PENDING','MANUAL_ACTION_REQUIRED','MANUAL_REPORTED_UNVERIFIED')")}
+
+
+@_sp_needs_store
+def sp_incident_table(store, meta_url="", limit=1000):
+    rows = store._q("SELECT i.*, p.review_status AS p_review, p.exec_status AS p_exec, p.id AS p_id FROM sp_incidents i LEFT JOIN sp_proposals p ON p.id = "
+                    "(SELECT id FROM sp_proposals WHERE caller_norm = i.caller_norm ORDER BY created_at DESC, rowid DESC LIMIT 1) ORDER BY i.call_ts DESC LIMIT ?", (int(limit),))
+    out = []
+    for r in rows:
+        out.append({"Incident": r["id"], "Call time": r["call_ts"], "Caller": sp_mask(r["caller_norm"]) or "(missing)", "Spam Status": r["classification"], "Category": r["category"],
+                    "Confidence": r["confidence"], "Publisher": r["publisher"], "Buyer": r["buyer"], "Campaign": r["campaign"], "Proposal": r["p_id"] or "",
+                    "Block review": r["p_review"] or "", "Block execution": r["p_exec"] or "", "Sheet sync": r["sheet_state"], "Sheet row (at last sync)": r["sheet_row_hint"],
+                    "Sheet link": sp_sheet_link(meta_url, r), "Sheet error": r["sheet_error"] or ""})
+    return pd.DataFrame(out)
+
+
+def sp_cards(cn):
+    a = st.columns(5)
+    b = st.columns(4)
+    for col, (lab, k) in zip(a, [("Detected incidents", "incidents"), ("Confirmed spam Caller IDs", "confirmed_callers"), ("Repeated suspicious numbers", "repeat_suspicious"),
+                                 ("Pending approvals", "pending"), ("Rejected", "rejected")]):
+        col.metric(lab, f"{cn[k]:,}")
+    for col, (lab, k) in zip(b, [("Approved, not executed", "approved_not_executed"), ("Verified blocked", "blocked"), ("Failed / unverified / manual", "failed_unverified"),
+                                 ("Confirmed spam calls", "confirmed_calls")]):
+        col.metric(lab, f"{cn[k]:,}")
+
+
+def render_spam_page(df, available_columns, overrides, timeline):
+    st.caption(SP_NOTE)
+    try:
+        tm_status_panel()
+    except Exception:
+        pass
+    store = s9_get_store()
+    if store.warning:
+        st.warning(store.warning)
+    tz = st.session_state.get("date_tz", DEFAULT_TIMEZONE)
+    try:
+        now = pd.Timestamp.now(tz=tz).tz_localize(None)
+    except Exception:
+        now = pd.Timestamp.now()
+    with st.expander("Who is acting? (identity and permissions)"):
+        lab = st.text_input("Your name (a label, not proof of identity)", key="sp_actor")
+        pw = st.text_input("Action password (needed to approve or execute)", key="sp_pw", type="password")
+    ident = s16_identity(lab, pw)
+    st.markdown(f"**You are:** {ident['label']} · {ident['via']} · level **{ident['level']}**" + ("" if ident["level"] == "operator" else "  — approving / executing needs the operator level (set ALERT_ACTION_PASSWORD, then enter it)."))
+    meta = st.session_state.get("meta", {}) or {}
+    tab_default = str(meta.get("tab", "") or "")
+    fp = f"{len(df)}|{hash(tuple(df.columns))}"
+    if st.session_state.get("sp_scanned") != fp:
+        try:
+            st.session_state["sp_summary"] = sp_scan(store, df, now, tab_default=tab_default)
+            st.session_state["sp_scanned"] = fp
+        except Exception as exc:
+            st.warning(f"The spam scan could not run ({type(exc).__name__}). Nothing was changed.")
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Scan calls now", key="sp_scan_btn"):
+        st.session_state["sp_summary"] = sp_scan(store, df, now, tab_default=tab_default)
+        st.session_state["sp_scanned"] = fp
+    sp_reconcile_stale(store, now)
+    if c2.button("Sync spam status to the Google Sheet", key="sp_sync_btn") or (sp_sheet_sync_on() and st.session_state.get("sp_autosync") != fp and meta.get("url")):
+        st.session_state["sp_autosync"] = fp
+        try:
+            ss = _s9_open_spreadsheet()
+            r = sp_sheet_sync(store, ss, now, default_tab=tab_default) if ss is not None else {"ok": False, "error": "No sheet is loaded."}
+            _s9_say(r["ok"], f"Sheet sync: {r.get('written', 0)} row(s) written, {r.get('unchanged', 0)} already up to date, {r.get('pending', 0)} still pending." if r["ok"] else f"Sheet sync failed (SQL is unaffected, it will retry): {r['error']}")
+        except Exception as exc:
+            st.warning(f"Sheet sync failed ({type(exc).__name__}). SQL is unaffected; it will retry.")
+    sm = st.session_state.get("sp_summary") or {}
+    if sm:
+        st.caption(f"Last scan: {sm.get('new', 0)} new, {sm.get('updated', 0)} changed, {sm.get('unchanged', 0)} unchanged incidents · {sm.get('proposals_created', 0)} proposal(s) created · "
+                   f"{sm.get('duplicate_rows', 0)} duplicate sheet rows ignored · {sm.get('missing_caller', 0)} incident(s) without a usable Caller ID (never proposed) · "
+                   f"{sm.get('not_assessed', 0)} call(s) without a QC report were not assessed.")
+    sp_cards(sp_counts(store))
+    t_inc, t_prop, t_cal, t_allow, t_sync, t_cap = st.tabs(["Incidents", "Block proposals", "Callers", "Allowlist", "Sheet sync", "Ringba capability"])
+    with t_inc:
+        it = sp_incident_table(store, meta.get("url", ""))
+        st.dataframe(it, hide_index=True, width="stretch")
+    with t_prop:
+        _sp_tab_proposals(store, df, ident, now)
+    with t_cal:
+        rc = pd.DataFrame(store._q("SELECT caller_norm, COUNT(*) AS spam_calls, SUM(classification='CONFIRMED_SPAM') AS confirmed, SUM(classification='SUSPICIOUS') AS suspicious, "
+                                   "COUNT(DISTINCT publisher) AS publishers, MAX(call_ts) AS last_call FROM sp_incidents WHERE caller_norm<>'' GROUP BY caller_norm ORDER BY confirmed DESC, spam_calls DESC LIMIT 300"))
+        if len(rc):
+            rc["caller_norm"] = rc["caller_norm"].map(sp_mask)
+        st.dataframe(rc, hide_index=True, width="stretch")
+        st.caption("Single-incident numbers stay on this watch list. Only repeat offenders (SPAM_MIN_CONFIRMED, default 2 confirmed calls) get an automatic proposal; Publisher / buyer / campaign are shown for investigation only and are never blocking targets.")
+    with t_allow:
+        al = pd.DataFrame(store._q("SELECT caller_norm, note, added_by, added_at, active FROM sp_allowlist ORDER BY added_at DESC"))
+        if len(al):
+            al["caller_norm"] = al["caller_norm"].map(sp_mask)
+        st.dataframe(al, hide_index=True, width="stretch")
+        num = st.text_input("Caller ID to allow-list", key="sp_al_num")
+        note = st.text_input("Why", key="sp_al_note")
+        if st.button("Add to allowlist", key="sp_al_add"):
+            ok, msg = sp_allow_add(store, num, note, ident, now)
+            _s9_say(ok, msg)
+    with t_sync:
+        s = sp_sync_status(store)
+        st.write(f"**Last successful sync:** {s['last_success']} · **Queue:** {s['queue'] or 'empty'}")
+        if s["last_run"]:
+            st.caption(f"Last run {s['last_run']['ts']}: {'OK' if s['last_run']['ok'] else 'FAILED'} - {s['last_run']['detail']}")
+        st.caption("SQL is the source of truth. A failed or partial sheet update stays queued and is retried; nothing is ever duplicated. Rows are matched by the call's identity key (never by Caller ID alone or a row number).")
+        st.dataframe(pd.DataFrame(store._q("SELECT incident_id, state, attempts, last_error, last_try FROM sp_sync_queue WHERE state <> 'done' ORDER BY queued_at LIMIT 200")), hide_index=True, width="stretch")
+    with t_cap:
+        ok, why = sp_adapter().capability()
+        st.write(f"**Dry-run mode:** {'ON (nothing can change in Ringba)' if sp_dry_run() else 'OFF'} · **Automatic Ringba blocking:** {'supported' if ok else 'NOT supported in this build'}")
+        st.info(why)
+        st.caption(sp_manual_guidance("<number>"))
+
+
+def _sp_tab_proposals(store, df, ident, now):
+    cn = st.radio("Show", ["Pending approval", "Approved", "Rejected", "All"], horizontal=True, key="sp_show")
+    rv = {"Pending approval": ["PENDING_APPROVAL"], "Approved": ["APPROVED"], "Rejected": ["REJECTED"], "All": None}[cn]
+    lst = sp_list(store, rv)
+    if not len(lst):
+        st.info("No proposals here.")
+        return
+    show = lst[["id", "caller_norm", "review_status", "exec_status", "risk_score", "n_confirmed", "n_calls", "decided_by", "decided_at", "expires_at"]].copy()
+    show["caller_norm"] = show["caller_norm"].map(sp_mask)
+    st.dataframe(show, hide_index=True, width="stretch")
+    pid = st.selectbox("Proposal", list(lst["id"]), key="sp_pick")
+    p = sp_get(store, pid)
+    st.write(f"**{sp_mask(p['caller_norm'])}** · review **{p['review_status']}** · execution **{p['exec_status'] or '-'}** · risk {p['risk_score']} · expires {p['expires_at']}")
+    st.json(json.loads(p["evidence"] or "{}"))
+    st.markdown("**Related calls (evidence)**")
+    st.dataframe(sp_calls_for(store, p["caller_norm"]), hide_index=True, width="stretch")
+    if p["result"]:
+        st.caption("Result: " + p["result"])
+    c = st.columns(6)
+    note = c[0].text_input("Decision note", key="sp_note")
+    if c[1].button("Approve", key="sp_ap"):
+        ok, msg = sp_decide(store, pid, True, ident, note, now)
+        _s9_say(ok, msg)
+    if c[2].button("Reject", key="sp_rj"):
+        ok, msg = sp_decide(store, pid, False, ident, note, now)
+        _s9_say(ok, msg)
+    if c[3].button("Execute", key="sp_ex"):
+        r = sp_execute(store, pid, ident, now)
+        _s9_say(r["ok"], r["message"], info=r["exec_status"] in ("MANUAL_ACTION_REQUIRED",))
+    if c[4].button("Verify", key="sp_vf"):
+        r = sp_verify(store, pid, ident, now)
+        _s9_say(r["ok"], r["message"], info=True)
+    if c[5].button("I blocked it manually", key="sp_mn"):
+        ok, msg = sp_report_manual(store, pid, ident, note, now)
+        _s9_say(ok, msg)
+    if p["exec_status"] == "MANUAL_ACTION_REQUIRED":
+        st.info(sp_manual_guidance(p["caller_norm"]))
+    st.markdown("**Audit trail for this proposal**")
+    ar = s16_audit_rows(store, 50, ref=pid)
+    if len(ar):
+        st.dataframe(ar, hide_index=True, width="stretch")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# assistant (read only). Approving / blocking / executing through chat is refused, always.
+# ---------------------------------------------------------------------------------------------------------------------
+_SP_Q_ACTION = re.compile(r"\b(un)?block\b.{0,50}\b(numbers?|callers?|caller ids?|phones?|spam\w*)\b|\b(spam\w*|numbers?|callers?|phones?)\b.{0,40}\b(un)?block\b(?!ed|\s+(?:proposals?|approvals?|queues?|status|reviews?|executions?|history|lists?)\b)|"
+                          r"\b(approve|execute|reject|authori[sz]e|run)\b.{0,30}\b(block|blocks|blocking)\b|\b(approve|execute|reject|authori[sz]e)\b.{0,30}\b(spam|block)\w*\b.{0,15}\bproposals?\b|"
+                          r"\b(approve|execute|reject)\b.{0,15}\b(all|every|the|these|those|this)\b.{0,25}\b(spam|block)\w*\b", re.I)
+_SP_Q_READ = re.compile(r"\bspam\b.{0,40}\b(incidents?|callers?|numbers?|calls?)\b|\b(pending|open)\b.{0,20}\b(block|spam)\b.{0,20}\b(approvals?|proposals?)\b|\bblocked numbers?\b|"
+                        r"\bnumbers?\b.{0,20}\bblocked\b|\bspam\b.{0,20}\b(sheet|sync)\b|\bblock proposals?\b", re.I)
+
+
+def sp_assistant_answer(question):
+    """OpsAnswer for a spam / block question, else None. READ ONLY."""
+    q = str(question or "")
+    if _SP_Q_ACTION.search(q):
+        return OpsAnswer(status="unsupported", kind="spam_action_refused", scope="Spam blocking (nothing was changed)",
+                         answer=("I can't approve, run or undo a block, and I can't block any number from chat. Blocking is limited to ONE Caller ID at a time, needs a person with the operator "
+                                 "password to approve it on the Spam & Blocking page, and is shown as BLOCKED only after the external result is verified."))
+    if not _SP_Q_READ.search(q):
+        return None
+    store = s9_get_store()
+    cn = sp_counts(store)
+    a = OpsAnswer(status="ok", kind="spam_status", scope="Spam incidents and block proposals (SQL; read only; calculated by Python)")
+    a.sources = ["sp_counts"]
+    a.answer = (f"{cn['incidents']:,} spam incident(s) on file ({cn['confirmed_calls']:,} confirmed calls from {cn['confirmed_callers']:,} Caller IDs). Block proposals: "
+                f"{cn['pending']} pending approval, {cn['approved_not_executed']} approved but not executed, {cn['blocked']} verified blocked, {cn['rejected']} rejected, "
+                f"{cn['failed_unverified']} failed / unverified / needing manual action.")
+    a.caveats.append("Read only: approving or executing a block is done by a person on the Spam & Blocking page.")
+    return a
+
+
 # ---------------------------------------------------------------
 # Main flow
 # ---------------------------------------------------------------
@@ -15113,6 +16840,11 @@ if st.session_state.get("sheet_loaded", False) and "df" in st.session_state:
             )
         except Exception as exc:
             st.warning(f"This page could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
+    if ui_page_is("SpamBlock"):
+        try:
+            render_spam_page(df, available_columns, {"qc": selected_qc_col, "line_type": selected_voip_col, "date": date_col_name if date_cols else None}, timeline)
+        except Exception as exc:                      # the spam page must never take the rest of the dashboard down
+            st.warning(f"The Spam & Blocking page could not be displayed ({type(exc).__name__}). The rest of the dashboard is unaffected.")
     top_issues_slot = st.container()  # filled further down, once the group-by choice is known
     if len(work_df) == 0 and UI_PAGE in ("Reports", "Trends", "Compare", "Explorer"):
         st.warning("No calls match the current filters (date range / search). Try a wider range.")
