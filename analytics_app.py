@@ -188,8 +188,61 @@ def ui_nav_css():
     return "".join(out)
 
 
+# ---------------------------------------------------------------
+# TOP MENU. The page menu moved from the sidebar to a bar at the top of the page that stays in view while you scroll (sticky).
+# Row 1 = the section (Overview, Network Money, ...), row 2 = the pages of that section. Nothing else changes: the same page keys, labels and pages as before;
+# the sidebar keeps the brand and the data source / filters. Pure look-and-navigation code.
+# ---------------------------------------------------------------
+UI_TOPNAV_NAV = '[data-testid="stVerticalBlock"]:not(:has([data-testid="stVerticalBlock"])):has(.ui-topnav-anchor)'      # the innermost block that holds the menu (never the page itself)
+UI_TOPNAV_CSS = """
+[data-testid="stHeader"]{background:var(--ui-bg)!important}
+.block-container{padding-top:4.6rem!important}
+@@NAV@@{position:sticky;top:3.75rem;z-index:999;background:var(--ui-card);border:1px solid var(--ui-border);border-radius:14px;padding:8px 12px 10px 12px;gap:.35rem;
+box-shadow:0 4px 14px rgba(15,23,42,.10)}
+[data-testid="stLayoutWrapper"]:has(> [data-testid="stVerticalBlock"] .ui-topnav-anchor){position:sticky;top:3.75rem;z-index:999}
+@@NAV@@ .ui-topnav-anchor{display:none}
+@@NAV@@ [data-testid="stElementContainer"],@@NAV@@ .element-container{margin:0!important}
+@@NAV@@ [role="radiogroup"]{gap:6px!important;flex-wrap:wrap!important;margin:0!important}
+@@NAV@@ [role="radiogroup"]>label{padding:6px 13px!important;border-radius:10px!important;margin:0!important;cursor:pointer;background:#eef2f7;transition:background .12s}
+@@NAV@@ [role="radiogroup"]>label>div:first-child,@@NAV@@ [role="radiogroup"]>label>span:first-child{display:none!important}
+@@NAV@@ [role="radiogroup"]>label>input[type="radio"]{position:absolute;opacity:0;pointer-events:none}
+@@NAV@@ [role="radiogroup"]>label:hover{background:#dbe5f3}
+@@NAV@@ [role="radiogroup"]>label p{font-size:.9rem!important;font-weight:600!important;margin:0!important;color:#334155!important}
+@@NAV@@ [role="radiogroup"]>label:has(input:checked){background:var(--ui-accent)!important;box-shadow:0 3px 10px rgba(37,99,235,.30)}
+@@NAV@@ [role="radiogroup"]>label:has(input:checked) *{color:#ffffff!important}
+.st-key-ui_nav_group [role="radiogroup"]>label{background:#e3eaf5;text-transform:uppercase;letter-spacing:.04em}
+.st-key-ui_nav_group [role="radiogroup"]>label p{font-size:.78rem!important;font-weight:750!important}
+.st-key-ui_nav_group [role="radiogroup"]>label:has(input:checked){background:var(--ui-navy)!important}
+"""
+
+
+def ui_topnav_groups():
+    """[(section name, [page labels])] in menu order; the last section is the one-page 'Classic view'."""
+    return [((sec.title() if sec else "Classic view"), [UI_LABELS[k] for (k, _i, _t, _d) in items]) for sec, items in UI_SECTIONS]
+
+
+def ui_topnav_css():
+    css = UI_TOPNAV_CSS.replace("@@NAV@@", UI_TOPNAV_NAV)
+    for gi, (_g, labels) in enumerate(ui_topnav_groups()):
+        if len(labels) == 1:                                   # a section with a single page needs no second row
+            css += f".st-key-ui_nav_page_{gi}{{display:none!important}}"
+    return css
+
+
+def ui_nav_top():
+    """The two-row top menu. Returns the chosen page LABEL (ui_nav() maps it to the page key)."""
+    groups = ui_topnav_groups()
+    names = [g for g, _l in groups]
+    with st.container():
+        st.markdown('<div class="ui-topnav-anchor"></div>', unsafe_allow_html=True)
+        g = st.radio("Section", names, index=0, horizontal=True, key="ui_nav_group", label_visibility="collapsed")
+        gi = names.index(g) if g in names else 0
+        choice = st.radio("Navigate", groups[gi][1], index=0, horizontal=True, key=f"ui_nav_page_{gi}", label_visibility="collapsed")
+    return choice
+
+
 def ui_inject_theme():
-    st.markdown("<style>" + UI_CSS + ui_nav_css() + "</style>", unsafe_allow_html=True)
+    st.markdown("<style>" + UI_CSS + ui_nav_css() + ui_topnav_css() + "</style>", unsafe_allow_html=True)
 
 
 def ui_page_is(*keys):
@@ -204,7 +257,7 @@ def ui_nav():
                         '<div class="ui-brand-s">Campaign &amp; publisher QC</div></div></div>', unsafe_allow_html=True)
     labels = [UI_LABELS[k] for _s, items in UI_SECTIONS for (k, _i, _t, _d) in items]
     back = {v: k for k, v in UI_LABELS.items()}
-    choice = st.sidebar.radio("Navigate", labels, index=0, key="ui_nav_choice", label_visibility="collapsed")
+    choice = ui_nav_top()                       # the menu now lives in a sticky bar at the top of the page
     UI_PAGE = back.get(choice, "Dashboard") if isinstance(choice, str) else "Dashboard"
     st.session_state["ui_page"] = UI_PAGE
     st.sidebar.markdown('<div class="ui-side-title">DATA SOURCE &amp; FILTERS</div>', unsafe_allow_html=True)
@@ -15389,13 +15442,13 @@ SP_COLUMNS = ["Spam Status", "Spam Category", "Spam Confidence", "Spam Evidence"
               "Block Review Status", "Block Approved By", "Block Approved At", "Block Execution Status", "Blocked At"]
 SP_CLASSES = ("CONFIRMED_SPAM", "SUSPICIOUS", "NOT_SPAM", "NEEDS_REVIEW")
 SP_REVIEW = ("PENDING_APPROVAL", "APPROVED", "REJECTED", "EXPIRED", "CANCELLED")
-SP_EXEC = ("", "NOT_EXECUTED", "EXECUTING", "DRY_RUN", "BLOCKED", "FAILED", "VERIFICATION_PENDING", "MANUAL_ACTION_REQUIRED", "MANUAL_REPORTED_UNVERIFIED")
+SP_EXEC = ("", "NOT_EXECUTED", "EXECUTING", "DRY_RUN", "BLOCKED", "FAILED", "VERIFICATION_PENDING", "MANUAL_ACTION_REQUIRED", "MANUAL_REPORTED_UNVERIFIED", "UNBLOCKED")
 SP_START_OK = ("", "NOT_EXECUTED", "DRY_RUN", "FAILED", "MANUAL_ACTION_REQUIRED")     # exec states a run may start from
 SP_ERR_STATES = ("FAILED", "VERIFICATION_PENDING", "MANUAL_ACTION_REQUIRED", "MANUAL_REPORTED_UNVERIFIED")
 SP_CONFIRM_CONF = 85         # QC Spam Confidence at or above this (with the explicit QC spam call type) = CONFIRMED_SPAM
 SP_SUSPECT_CONF = 50
 SP_REVIEW_CONF = 60          # QC says "not spam" but gives a high spam confidence -> NEEDS_REVIEW
-SP_MIN_CONFIRMED = 2         # distinct CONFIRMED_SPAM calls from the same Caller ID before a proposal is created automatically
+SP_MIN_CONFIRMED = 1         # distinct CONFIRMED_SPAM calls from the same Caller ID before a proposal is created automatically (1 = a single confirmed spam call is enough; SPAM_MIN_CONFIRMED can raise it)
 SP_EXPIRE_HOURS = 72
 SP_NOTE = ("Target = one Caller ID only. Nothing is blocked without a person's approval, the AI assistant cannot approve or run anything, and a number is never shown as "
            "BLOCKED until the external state has been verified. Dry-run mode is ON unless SPAM_DRY_RUN=false.")
@@ -15419,9 +15472,11 @@ SP_DDL = [
     "CREATE INDEX IF NOT EXISTS sp_prop_status ON sp_proposals(review_status, exec_status)",
     """CREATE TABLE IF NOT EXISTS sp_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, proposal_id TEXT, ts TEXT, actor TEXT, outcome TEXT, detail TEXT)""",
     """CREATE TABLE IF NOT EXISTS sp_sync_queue (incident_id TEXT PRIMARY KEY, desired_hash TEXT, state TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, last_try TEXT, queued_at TEXT)""",
+    """CREATE TABLE IF NOT EXISTS sp_caller_hist (caller_norm TEXT PRIMARY KEY, calls INTEGER, qualified INTEGER, updated_at TEXT)""",
+    """CREATE TABLE IF NOT EXISTS sp_blocks (caller_norm TEXT PRIMARY KEY, block_id TEXT, proposal_id TEXT, blocked_at TEXT, unblocked_at TEXT, unblocked_by TEXT)""",
     """CREATE TABLE IF NOT EXISTS sp_sync_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ok INTEGER, written INTEGER, unchanged INTEGER, pending INTEGER, detail TEXT)""",
 ]
-S16_PERMS.update({"spam_view": "viewer", "spam_scan": "open", "spam_allowlist": "strict", "spam_approve": "strict", "spam_execute": "strict", "spam_sync": "open"})
+S16_PERMS.update({"spam_view": "viewer", "spam_scan": "open", "spam_allowlist": "strict", "spam_approve": "strict", "spam_execute": "strict", "spam_sync": "open", "spam_export": "strict", "spam_bulk": "strict", "spam_unblock": "strict"})
 
 
 def sp_init(store):
@@ -15470,12 +15525,10 @@ def sp_mask(norm):
 
 
 def sp_disp(norm, full=False):
-    """Phone number for the screen: the full E.164 number when the operator asked for it (shown as +1 757 237 3353), else ***1234."""
+    """Phone number for the screen: the full E.164 number when the operator asked for it (+17572373353, no spaces), else ***1234."""
     d = re.sub(r"\D", "", str(norm or ""))
     if not full or not d:
         return sp_mask(norm)
-    if len(d) == 11 and d[0] == "1":
-        return f"+1 {d[1:4]} {d[4:7]} {d[7:]}"
     return "+" + d
 
 
@@ -15804,6 +15857,9 @@ def sp_caller_stats(store, norm, hist=None):
     inc = store._q("SELECT id, classification, confidence, publisher, buyer, campaign FROM sp_incidents WHERE caller_norm = ?", (norm,))
     conf = [i for i in inc if i["classification"] == "CONFIRMED_SPAM"]
     h = hist.loc[norm] if (hist is not None and norm in hist.index) else None
+    if h is None and hist is None:
+        sh = store._q("SELECT calls, qualified FROM sp_caller_hist WHERE caller_norm = ?", (norm,))
+        h = sh[0] if sh else None
     return {"n_confirmed": len(conf), "n_suspicious": sum(1 for i in inc if i["classification"] == "SUSPICIOUS"), "n_review": sum(1 for i in inc if i["classification"] == "NEEDS_REVIEW"),
             "avg_conf": (sum(i["confidence"] or 0 for i in conf) / len(conf)) if conf else 0.0,
             "publishers": len({i["publisher"] for i in conf if i["publisher"]}), "calls": int(h["calls"]) if h is not None else None,
@@ -15847,9 +15903,16 @@ def sp_evidence_hash(store, norm):
 
 
 @_sp_needs_store
-def sp_calls_for(store, norm):
-    return pd.DataFrame(store._q("SELECT id AS incident, call_ts AS call_time, classification, confidence, category, publisher, buyer, campaign, evidence "
-                                 "FROM sp_incidents WHERE caller_norm = ? ORDER BY call_ts", (norm,)))
+def sp_calls_for(store, norm, notes=None):
+    d = pd.DataFrame(store._q("SELECT id AS incident, call_ts AS call_time, classification, confidence, category, publisher, buyer, campaign, evidence, call_key "
+                              "FROM sp_incidents WHERE caller_norm = ? ORDER BY call_ts", (norm,)))
+    if notes is None:
+        return d.drop(columns=["call_key"], errors="ignore")
+    if len(d):                                                # readable columns instead of the raw evidence JSON
+        d["short_summary"] = d["call_key"].map(lambda k: notes.get(k, {}).get("summary", ""))
+        d["note"] = d["call_key"].map(lambda k: notes.get(k, {}).get("note", ""))
+        d["why_flagged"] = d["evidence"].map(sp_why)
+    return d.drop(columns=["call_key", "evidence"], errors="ignore")
 
 
 @_sp_needs_store
@@ -15894,6 +15957,13 @@ def sp_scan(store, df, now, actor=None, tab_default=""):
         return summ
     c = sp_columns(df)
     hist = sp_history(df, c)
+    try:                                                    # remember each spam caller's call / QUALIFIED-call counts so the export and later checks do not need the sheet
+        have = {r["caller_norm"] for r in store._q("SELECT DISTINCT caller_norm FROM sp_incidents WHERE caller_norm <> ''")}
+        rows_h = [(n, int(r["calls"]), int(r["qualified"])) for n, r in hist.iterrows() if n in have]
+        now_h = s16_ts(now)
+        store._tx(lambda cx: [cx.execute("INSERT OR REPLACE INTO sp_caller_hist(caller_norm, calls, qualified, updated_at) VALUES (?,?,?,?)", (n, a, b, now_h)) for n, a, b in rows_h])
+    except Exception:
+        pass
     sp_expire(store, now)
     created, existing, skipped = 0, 0, {}
     for r in store._q("SELECT DISTINCT caller_norm FROM sp_incidents WHERE classification='CONFIRMED_SPAM' AND caller_norm <> ''"):
@@ -15949,7 +16019,7 @@ def sp_list(store, review=None, exec_=None, limit=500):
 # approval, execution gateway, verification
 # ---------------------------------------------------------------------------------------------------------------------
 @_sp_needs_store
-def sp_decide(store, pid, approve, ident, note="", now=None):
+def sp_decide(store, pid, approve, ident, note="", now=None, _refresh=True):
     """Approve or reject a PENDING_APPROVAL proposal. Operator level only (the action password must be configured AND supplied). Returns (ok, message)."""
     try:
         s16_require("spam_approve", ident)
@@ -15979,7 +16049,8 @@ def sp_decide(store, pid, approve, ident, note="", now=None):
                   note + ("" if ident["verified"] else " [identity unverified: shared-secret gate]"))
         return True, ("Approved. Nothing is blocked yet: use Execute (a dry run unless SPAM_DRY_RUN=false)." if approve else "Rejected. The number will not be proposed again without new evidence.")
     r = store._tx(fn)
-    sp_queue_refresh(store)
+    if _refresh:
+        sp_queue_refresh(store)
     return r
 
 
@@ -16174,15 +16245,24 @@ class SpRingbaAdapter(SpAdapter):
                 return True
         return False
 
+    last_block_id = None
+
     def block(self, norm):
         if not re.fullmatch(r"\+1\d{10}", str(norm or "")):
             raise ValueError("Only a normalised +1XXXXXXXXXX Caller ID can be blocked.")
         s = self._s()
+        self.last_block_id = None
         try:
-            if self._present(self._list(), norm):
+            items = self._list()
+            if self._present(items, norm):
+                try:
+                    self.last_block_id = self.find_id(norm)
+                except Exception:
+                    self.last_block_id = None
                 return "already_listed"               # idempotent: never add the same number twice
         except SpRingbaError:
             pass                                      # best-effort pre-check; the read-back after the POST is the one that counts
+        self.last_block_id = None
         status, text = self._call("POST", self._base() + "/", {"phoneNumber": norm, "campaignId": s["campaign"] or ""}, s["block_token"])
         if status in (401, 403):
             raise PermissionError(f"Ringba refused the block token (HTTP {status}). Only a Ringba Admin user's token can block numbers.")
@@ -16192,7 +16272,57 @@ class SpRingbaAdapter(SpAdapter):
             return "conflict_possibly_listed"
         if status >= 300:
             raise SpRingbaError("uncertain", f"Ringba answered HTTP {status}; the result is uncertain.")
+        self.last_block_id = self._id_from_post(text)
         return "posted"
+
+    @staticmethod
+    def _id_from_post(text):
+        """The POST answer carries the id of the new block (top-level blockedNumberId, or blockedNumbers[0].id). None when it is not there."""
+        try:
+            d = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(d, dict):
+            return None
+        v = d.get("blockedNumberId")
+        if not v and isinstance(d.get("blockedNumbers"), list) and d["blockedNumbers"] and isinstance(d["blockedNumbers"][0], dict):
+            v = d["blockedNumbers"][0].get("id")
+        v = str(v or "").strip()
+        return v if re.fullmatch(r"[A-Za-z0-9_-]{6,80}", v) else None
+
+    def find_id(self, norm):
+        """The block id of a number already on the list (read from the list), or None."""
+        want = self._digits(norm)[-10:]
+        for it in self._list():
+            if isinstance(it, dict) and any(len(self._digits(v)) >= 10 and self._digits(v)[-10:] == want for k, v in it.items() if isinstance(v, (str, int)) and "phone" in str(k).lower()):
+                v = str(it.get("id") or it.get("blockedNumberId") or "").strip()
+                if re.fullmatch(r"[A-Za-z0-9_-]{6,80}", v):
+                    return v
+        return None
+
+    def unblock(self, norm, block_id=None):
+        """Removes ONE number from Ringba's block list:  DELETE https://api.ringba.com/v2/{account}/blockedNumbers/{blockedNumberId}  (answer {"isSuccessful": true}).
+        The only place in this adapter that deletes anything. Returns 'deleted' or 'not_found' (already gone). Needs the Admin token (RINGBA_BLOCK_TOKEN)."""
+        s = self._s()
+        if not s["block_token"]:
+            raise PermissionError("RINGBA_BLOCK_TOKEN is not set; only an Admin user's token can remove a block.")
+        bid = str(block_id or "").strip() or self.find_id(norm)
+        if not bid or not re.fullmatch(r"[A-Za-z0-9_-]{6,80}", bid):
+            raise SpRingbaError("noid", "The Ringba block id for this number is not known and was not found on the list, so it cannot be removed from here. Remove it in Ringba > Block Numbers.")
+        status, text = self._call("DELETE", self._base() + "/" + bid, None, s["block_token"])
+        if status in (401, 403):
+            raise PermissionError(f"Ringba refused the token (HTTP {status}). Only a Ringba Admin user's token can remove a block.")
+        if status == 404:
+            return "not_found"
+        if status >= 300:
+            raise SpRingbaError("uncertain", f"Ringba answered HTTP {status}; the result is uncertain.")
+        try:
+            ok = bool(json.loads(text).get("isSuccessful"))
+        except Exception:
+            ok = False
+        if not ok:
+            raise SpRingbaError("rejected", "Ringba did not confirm the removal (isSuccessful was not true).")
+        return "deleted"
 
     def verify(self, norm):
         return self._present(self._list(), norm)
@@ -16293,13 +16423,28 @@ def sp_execute(store, pid, ident, now=None, adapter=None, dry_run=None):
         return finish("MANUAL_ACTION_REQUIRED", "Automatic blocking is not supported here. " + why + " " + sp_manual_guidance(norm), {"last_error": s16_scrub(why, 300)})
     try:
         ad.block(norm)
+        _sp_remember_block(store, norm, pid, getattr(ad, "last_block_id", None), now_s)       # keep Ringba's block id: it is what makes Unblock possible
     except Exception as exc:
         kind = getattr(exc, "kind", "")
         if kind == "rejected" or isinstance(exc, (PermissionError, ValueError)):
-            return finish("FAILED", f"Ringba refused the block request ({type(exc).__name__}). Nothing is recorded as blocked.", {"last_error": type(exc).__name__})
+            res = finish("FAILED", f"Ringba refused the block request ({type(exc).__name__}). Nothing is recorded as blocked.", {"last_error": type(exc).__name__})
+            if isinstance(exc, PermissionError):
+                res["auth"] = True                       # the token was refused: a batch must stop here
+            return res
         return finish("VERIFICATION_PENDING", f"The block call did not finish cleanly ({type(exc).__name__}: timeout or unknown). The external state is UNCERTAIN; verify it before anything is recorded as blocked.",
                       {"executed_at": now_s, "last_error": type(exc).__name__})
     return sp_verify(store, pid, ident, now, ad, _after_block=True)
+
+
+def _sp_remember_block(store, norm, pid, block_id, now_s):
+    """Best effort: a failure here must never change the outcome of a block."""
+    if not block_id:
+        return
+    try:
+        store._tx(lambda c: c.execute("INSERT INTO sp_blocks(caller_norm, block_id, proposal_id, blocked_at) VALUES (?,?,?,?) ON CONFLICT(caller_norm) DO UPDATE SET block_id=excluded.block_id, "
+                                      "proposal_id=excluded.proposal_id, blocked_at=excluded.blocked_at, unblocked_at=NULL, unblocked_by=NULL", (norm, str(block_id), pid, now_s)))
+    except Exception:
+        pass
 
 
 @_sp_needs_store
@@ -16651,16 +16796,68 @@ def sp_counts(store):
             "failed_unverified": one("SELECT COUNT(*) n FROM sp_proposals WHERE exec_status IN ('FAILED','VERIFICATION_PENDING','MANUAL_ACTION_REQUIRED','MANUAL_REPORTED_UNVERIFIED')")}
 
 
+def sp_call_notes(df, full=False):
+    """call_key -> {'summary','note'} read from the sheet rows that are loaded NOW (nothing is copied into SQL). Used to show what each spam call was about, so a person can check
+    which calls a block would be based on. Text is shortened and phone numbers / links / e-mail addresses are masked unless `full` (operator) is on."""
+    if df is None or not len(df):
+        return {}
+    c = sp_columns(df)
+    low = {str(x).strip().lower(): x for x in df.columns}
+
+    def pick(*names):
+        for n in names:
+            if n.lower() in low:
+                return low[n.lower()]
+        return None
+    sc, nc = pick("ShortSummary", "Short Summary", "Summary"), pick("Note", "Notes")
+    if not sc and not nc:
+        return {}
+    keys = sp_row_keys(df, c)
+    sv = df[sc].astype(str).tolist() if sc else [""] * len(df)
+    nv = df[nc].astype(str).tolist() if nc else [""] * len(df)
+    clean = (lambda t: str(t).strip()[:400]) if full else (lambda t: s16_scrub(str(t).strip(), 400))
+    out = {}
+    for (k, _kind), a, b in zip(keys, sv, nv):
+        a, b = ("" if a.strip().lower() in ("nan", "none") else a), ("" if b.strip().lower() in ("nan", "none") else b)
+        if k not in out:
+            out[k] = {"summary": clean(a), "note": clean(b)}
+    return out
+
+
+def sp_why(evidence_json, limit=220):
+    """The QC evidence phrases stored with an incident, as one short line."""
+    try:
+        ev = json.loads(evidence_json or "{}").get("evidence", [])
+    except Exception:
+        ev = []
+    return " · ".join(str(x) for x in ev[:3])[:limit]
+
+
+def sp_proposal_context(store, norms, notes, full=False):
+    """caller_norm -> (latest confirmed call's summary, why flagged), for the proposals table."""
+    out, norms = {}, [n for n in dict.fromkeys(norms) if n]
+    for i in range(0, len(norms), 500):
+        part = norms[i:i + 500]
+        for r in store._q("SELECT caller_norm, call_key, evidence FROM sp_incidents WHERE classification='CONFIRMED_SPAM' AND caller_norm IN (" + ",".join("?" * len(part)) + ") ORDER BY call_ts", tuple(part)):
+            nt = (notes or {}).get(r["call_key"], {})
+            out[r["caller_norm"]] = (nt.get("summary", "") or nt.get("note", ""), sp_why(r["evidence"]))
+    return out
+
+
 @_sp_needs_store
-def sp_incident_table(store, meta_url="", limit=1000, full=False):
+def sp_incident_table(store, meta_url="", limit=1000, full=False, notes=None):
     rows = store._q("SELECT i.*, p.review_status AS p_review, p.exec_status AS p_exec, p.id AS p_id FROM sp_incidents i LEFT JOIN sp_proposals p ON p.id = "
                     "(SELECT id FROM sp_proposals WHERE caller_norm = i.caller_norm ORDER BY created_at DESC, rowid DESC LIMIT 1) ORDER BY i.call_ts DESC LIMIT ?", (int(limit),))
     out = []
     for r in rows:
-        out.append({"Incident": r["id"], "Call time": r["call_ts"], "Caller": sp_disp(r["caller_norm"], full) or "(missing)", "Spam Status": r["classification"], "Category": r["category"],
-                    "Confidence": r["confidence"], "Publisher": r["publisher"], "Buyer": r["buyer"], "Campaign": r["campaign"], "Proposal": r["p_id"] or "",
-                    "Block review": r["p_review"] or "", "Block execution": r["p_exec"] or "", "Sheet sync": r["sheet_state"], "Sheet row (at last sync)": r["sheet_row_hint"],
-                    "Sheet link": sp_sheet_link(meta_url, r), "Sheet error": r["sheet_error"] or ""})
+        d = {"Incident": r["id"], "Call time": r["call_ts"], "Caller": sp_disp(r["caller_norm"], full) or "(missing)", "Spam Status": r["classification"]}
+        if notes is not None:                                 # what the call was about, from the loaded sheet (blank when the call is not in the loaded data)
+            nt = notes.get(r["call_key"], {})
+            d.update({"Short summary": nt.get("summary", ""), "Note": nt.get("note", ""), "Why flagged (QC evidence)": sp_why(r["evidence"])})
+        d.update({"Category": r["category"], "Confidence": r["confidence"], "Publisher": r["publisher"], "Buyer": r["buyer"], "Campaign": r["campaign"], "Proposal": r["p_id"] or "",
+                  "Block review": r["p_review"] or "", "Block execution": r["p_exec"] or "", "Sheet sync": r["sheet_state"], "Sheet row (at last sync)": r["sheet_row_hint"],
+                  "Sheet link": sp_sheet_link(meta_url, r), "Sheet error": r["sheet_error"] or ""})
+        out.append(d)
     return pd.DataFrame(out)
 
 
@@ -16727,19 +16924,30 @@ def render_spam_page(df, available_columns, overrides, timeline):
                    f"{sm.get('duplicate_rows', 0)} duplicate sheet rows ignored · {sm.get('missing_caller', 0)} incident(s) without a usable Caller ID (never proposed) · "
                    f"{sm.get('not_assessed', 0)} call(s) without a QC report were not assessed.")
     sp_cards(sp_counts(store))
-    t_inc, t_prop, t_cal, t_allow, t_sync, t_cap = st.tabs(["Incidents", "Block proposals", "Callers", "Allowlist", "Sheet sync", "Ringba capability"])
+    nkey = f"{fp}|{int(full)}"
+    if st.session_state.get("sp_notes_key") != nkey:
+        try:
+            st.session_state["sp_notes"] = sp_call_notes(df, full)
+        except Exception:
+            st.session_state["sp_notes"] = {}
+        st.session_state["sp_notes_key"] = nkey
+    notes = st.session_state.get("sp_notes") or {}
+    t_inc, t_prop, t_cal, t_pub, t_allow, t_sync, t_cap, t_auto = st.tabs(["Incidents", "Block proposals", "Callers", "Publishers & export", "Allowlist", "Sheet sync", "Ringba capability", "Auto-block"])
     with t_inc:
-        it = sp_incident_table(store, meta.get("url", ""), full=full)
+        it = sp_incident_table(store, meta.get("url", ""), full=full, notes=notes)
+        st.caption("Short summary and Note come from the sheet rows that are loaded now (blank = that call is not in the loaded data). 'Why flagged' is the AI QC evidence. Use them to check what each call was about before approving a block.")
         st.dataframe(it, hide_index=True, width="stretch")
     with t_prop:
-        _sp_tab_proposals(store, df, ident, now, full)
+        _sp_tab_proposals(store, df, ident, now, full, notes)
     with t_cal:
         rc = pd.DataFrame(store._q("SELECT caller_norm, COUNT(*) AS spam_calls, SUM(classification='CONFIRMED_SPAM') AS confirmed, SUM(classification='SUSPICIOUS') AS suspicious, "
                                    "COUNT(DISTINCT publisher) AS publishers, MAX(call_ts) AS last_call FROM sp_incidents WHERE caller_norm<>'' GROUP BY caller_norm ORDER BY confirmed DESC, spam_calls DESC LIMIT 300"))
         if len(rc):
             rc["caller_norm"] = rc["caller_norm"].map(lambda x: sp_disp(x, full))
         st.dataframe(rc, hide_index=True, width="stretch")
-        st.caption("Single-incident numbers stay on this watch list. Only repeat offenders (SPAM_MIN_CONFIRMED, default 2 confirmed calls) get an automatic proposal; Publisher / buyer / campaign are shown for investigation only and are never blocking targets.")
+        st.caption(f"A Caller ID gets a block proposal after {sp_min_confirmed()} confirmed spam call(s) (SPAM_MIN_CONFIRMED). Numbers that also made a QUALIFIED call, and allow-listed numbers, never get one. Publisher / buyer / campaign are shown for investigation only and are never blocking targets.")
+    with t_pub:
+        _sp_tab_publishers(store, df, ident, now, full)
     with t_allow:
         al = pd.DataFrame(store._q("SELECT caller_norm, note, added_by, added_at, active FROM sp_allowlist ORDER BY added_at DESC"))
         if len(al):
@@ -16757,6 +16965,8 @@ def render_spam_page(df, available_columns, overrides, timeline):
             st.caption(f"Last run {s['last_run']['ts']}: {'OK' if s['last_run']['ok'] else 'FAILED'} - {s['last_run']['detail']}")
         st.caption("SQL is the source of truth. A failed or partial sheet update stays queued and is retried; nothing is ever duplicated. Rows are matched by the call's identity key (never by Caller ID alone or a row number).")
         st.dataframe(pd.DataFrame(store._q("SELECT incident_id, state, attempts, last_error, last_try FROM sp_sync_queue WHERE state <> 'done' ORDER BY queued_at LIMIT 200")), hide_index=True, width="stretch")
+    with t_auto:
+        _sp_tab_auto(store, ident, now, full)
     with t_cap:
         ad = sp_adapter()
         ok, why = ad.capability()
@@ -16778,14 +16988,54 @@ def render_spam_page(df, available_columns, overrides, timeline):
         st.caption(sp_manual_guidance("<number>"))
 
 
-def _sp_tab_proposals(store, df, ident, now, full=False):
+def _sp_bulk_panel(store, ident, now):
+    pend = sp_list(store, ["PENDING_APPROVAL"])
+    ready = sp_list(store, ["APPROVED"], exec_=["", "NOT_EXECUTED", "DRY_RUN", "FAILED", "MANUAL_ACTION_REQUIRED"])
+    with st.expander(f"Many at once: {len(pend)} pending approval · {len(ready)} approved and waiting to run"):
+        st.caption("One person's action, but every proposal is still checked and logged on its own (allowlist, unchanged evidence, expiry) and every block is verified on Ringba on its own. "
+                   "Highest risk first. Needs the operator level.")
+        if ident["level"] != "operator":
+            st.info("Approving and running blocks needs the operator level: set ALERT_ACTION_PASSWORD in Secrets, then enter it under 'Who is acting?'.")
+            return
+        n1 = int(st.number_input("How many pending proposals to approve now", min_value=1, max_value=500, value=max(1, min(50, len(pend))), key="sp_bulk_n"))
+        take = (list(pend["id"]) if "id" in pend.columns else [])[:n1]
+        word = f"APPROVE {len(take)}"
+        typed = st.text_input(f"Type {word} to approve the next {len(take)}", key="sp_bulk_txt")
+        if st.button("Approve these proposals", key="sp_bulk_ap"):
+            if not take:
+                st.info("Nothing is pending.")
+            elif typed.strip() != word:
+                st.warning(f"Not approved. Type exactly: {word}")
+            else:
+                r = sp_decide_many(store, take, True, ident, "bulk approval", now)
+                _s9_say(r["done"] > 0, r["message"] + (" Reasons: " + "; ".join(f"{k} x{v}" for k, v in r["reasons"].items()) if r["reasons"] else ""))
+        live = not sp_dry_run()
+        n2 = int(st.number_input("How many approved proposals to run now (max 25 per click)", min_value=1, max_value=25, value=max(1, min(25, len(ready))), key="sp_bulk_run_n"))
+        run_ids = (list(ready["id"]) if "id" in ready.columns else [])[:n2]
+        word2 = f"BLOCK {len(run_ids)}"
+        typed2 = st.text_input(f"Type {word2} to run {len(run_ids)} block(s) in Ringba now" if live else f"Type {word2} to run {len(run_ids)} DRY RUN(s) (nothing is sent to Ringba)", key="sp_bulk_txt2")
+        if st.button("Run these (LIVE)" if live else "Run these (dry run)", key="sp_bulk_ex"):
+            if not run_ids:
+                st.info("Nothing approved is waiting.")
+            elif typed2.strip() != word2:
+                st.warning(f"Not run. Type exactly: {word2}")
+            else:
+                r = sp_execute_many(store, run_ids, ident, now, limit=25)
+                _s9_say(not r["stopped"], r["message"], info=True)
+
+
+def _sp_tab_proposals(store, df, ident, now, full=False, notes=None):
     cn = st.radio("Show", ["Pending approval", "Approved", "Rejected", "All"], horizontal=True, key="sp_show")
     rv = {"Pending approval": ["PENDING_APPROVAL"], "Approved": ["APPROVED"], "Rejected": ["REJECTED"], "All": None}[cn]
+    _sp_bulk_panel(store, ident, now)
     lst = sp_list(store, rv)
     if not len(lst):
         st.info("No proposals here.")
         return
     show = lst[["id", "caller_norm", "review_status", "exec_status", "risk_score", "n_confirmed", "n_calls", "decided_by", "decided_at", "expires_at"]].copy()
+    ctx = sp_proposal_context(store, list(lst["caller_norm"]), notes, full)
+    show["Latest call summary"] = lst["caller_norm"].map(lambda n: ctx.get(n, ("", ""))[0][:160])
+    show["Why flagged (QC evidence)"] = lst["caller_norm"].map(lambda n: ctx.get(n, ("", ""))[1][:160])
     show["caller_norm"] = show["caller_norm"].map(lambda x: sp_disp(x, full))
     ids = list(lst["id"])
     sel = None
@@ -16805,7 +17055,7 @@ def _sp_tab_proposals(store, df, ident, now, full=False):
     st.write(f"**{sp_disp(p['caller_norm'], full)}** · review **{p['review_status']}** · execution **{p['exec_status'] or '-'}** · risk {p['risk_score']} · expires {p['expires_at']}")
     st.json(json.loads(p["evidence"] or "{}"))
     st.markdown("**Related calls (evidence)**")
-    st.dataframe(sp_calls_for(store, p["caller_norm"]), hide_index=True, width="stretch")
+    st.dataframe(sp_calls_for(store, p["caller_norm"], notes), hide_index=True, width="stretch")
     if p["result"]:
         st.caption("Result: " + p["result"])
     c = st.columns(6)
@@ -16838,6 +17088,584 @@ def _sp_tab_proposals(store, df, ident, now, full=False):
     ar = s16_audit_rows(store, 50, ref=pid)
     if len(ar):
         st.dataframe(ar, hide_index=True, width="stretch")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# bulk review (many proposals, each one still decided and audited on its own), export of numbers, per-publisher spam table
+# ---------------------------------------------------------------------------------------------------------------------
+@_sp_needs_store
+def sp_decide_many(store, pids, approve, ident, note="", now=None):
+    """Approve / reject many PENDING proposals in ONE person's action. Every proposal still goes through sp_decide() on its own (permission, expiry, allowlist, unchanged
+    evidence, its own audit row), so nothing a single approval would refuse can slip through. Returns {'done','refused','reasons'}."""
+    try:
+        s16_require("spam_bulk", ident)
+    except PermissionError as exc:
+        return {"done": 0, "refused": len(list(pids)), "reasons": {str(exc): len(list(pids))}, "message": str(exc)}
+    done, refused, reasons = 0, 0, {}
+    for pid in list(pids):
+        ok, msg = sp_decide(store, pid, approve, ident, note, now, _refresh=False)
+        if ok:
+            done += 1
+        else:
+            refused += 1
+            reasons[msg[:120]] = reasons.get(msg[:120], 0) + 1
+    sp_queue_refresh(store)
+    store._tx(lambda c: s16_audit(c, s16_ts(now), ident["label"], ident["verified"], "spam_bulk_approve" if approve else "spam_bulk_reject", "",
+                                  f"{done} decided, {refused} refused (each proposal has its own audit row)"))
+    return {"done": done, "refused": refused, "reasons": reasons, "message": f"{done} proposal(s) {'approved' if approve else 'rejected'}, {refused} refused."}
+
+
+@_sp_needs_store
+def sp_execute_many(store, pids, ident, now=None, adapter=None, dry_run=None, limit=25):
+    """Run APPROVED proposals one after the other through the normal gateway sp_execute() (so each one is checked, claimed, blocked and VERIFIED on its own).
+    Bounded by `limit` per click. Stops early when Ringba refuses the token or three runs in a row fail. Returns {'ran','by_status','stopped','message'}."""
+    by, ran, fails_in_row, stopped = {}, 0, 0, ""
+    for pid in list(pids)[:max(1, int(limit))]:
+        r = sp_execute(store, pid, ident, now, adapter=adapter, dry_run=dry_run)
+        ran += 1
+        st_ = r.get("exec_status") or "REFUSED"
+        by[st_] = by.get(st_, 0) + 1
+        if r.get("auth") or "refused the block token" in str(r.get("message", "")) or "Not permitted" in str(r.get("message", "")):
+            stopped = r.get("message", "")[:200]
+            break
+        fails_in_row = fails_in_row + 1 if st_ in ("FAILED", "REFUSED") else 0
+        if fails_in_row >= 3:
+            stopped = "Stopped after 3 failures in a row."
+            break
+    return {"ran": ran, "by_status": by, "stopped": stopped, "message": f"{ran} run: " + ", ".join(f"{k} {v}" for k, v in sorted(by.items())) + (f". {stopped}" if stopped else "")}
+
+
+@_sp_needs_store
+def sp_export_numbers(store, ident, now=None, include_blocked=False):
+    """-> (DataFrame, text). The Caller IDs a person could upload to Ringba's bulk block list: CONFIRMED_SPAM callers that are not allow-listed, have no QUALIFIED call, and are valid
+    +1XXXXXXXXXX numbers. `text` = one number per line (Ringba's TXT format). Needs the operator level; logs the export (count only, never the numbers)."""
+    s16_require("spam_export", ident)
+    props = {p["caller_norm"]: p for p in store._q("SELECT * FROM sp_proposals ORDER BY created_at, rowid")}
+    rows = []
+    for r in store._q("SELECT caller_norm, COUNT(*) AS confirmed_calls, MIN(call_ts) AS first_call, MAX(call_ts) AS last_call, MAX(confidence) AS max_confidence, "
+                      "GROUP_CONCAT(DISTINCT publisher) AS publishers, GROUP_CONCAT(DISTINCT buyer) AS buyers FROM sp_incidents "
+                      "WHERE classification='CONFIRMED_SPAM' AND caller_norm<>'' GROUP BY caller_norm ORDER BY confirmed_calls DESC, last_call DESC"):
+        norm = r["caller_norm"]
+        if not re.fullmatch(r"\+1\d{10}", norm or ""):
+            continue
+        ok, why, _stats = sp_eligibility(store, norm, None, manual=True)
+        if not ok:
+            continue
+        p = props.get(norm)
+        blocked = bool(p and p["exec_status"] == "BLOCKED")
+        if blocked and not include_blocked:
+            continue
+        rows.append({"phone_number": norm, "confirmed_spam_calls": r["confirmed_calls"], "first_call": r["first_call"], "last_call": r["last_call"], "max_confidence": r["max_confidence"],
+                     "publishers": r["publishers"] or "", "buyers": r["buyers"] or "", "proposal": (p["review_status"] if p else ""), "execution": (p["exec_status"] if p else "")})
+    df = pd.DataFrame(rows, columns=["phone_number", "confirmed_spam_calls", "first_call", "last_call", "max_confidence", "publishers", "buyers", "proposal", "execution"])
+    store._tx(lambda c: s16_audit(c, s16_ts(now), ident["label"], ident["verified"], "spam_numbers_exported", "", f"{len(df)} number(s) exported"))
+    return df, "\n".join(df["phone_number"].tolist()) + ("\n" if len(df) else "")
+
+
+@_sp_needs_store
+def sp_publisher_table(store, df, publisher_col=None, date_col=None):
+    """Spam per publisher for the calls currently loaded. Reporting only: publishers are never a blocking target. Spam rate = confirmed spam calls / all calls of that publisher
+    in the loaded data (the denominator is shown, and a publisher with fewer than 30 calls is flagged 'low sample')."""
+    inc = store._q("SELECT publisher, buyer, caller_norm, classification, call_ts FROM sp_incidents")
+    inc = pd.DataFrame(inc, columns=["publisher", "buyer", "caller_norm", "classification", "call_ts"])
+    totals = {}
+    if publisher_col and publisher_col in df.columns:
+        if date_col and date_col in df.columns and len(df):
+            ts = [sp_norm_ts(v) for v in df[date_col]]
+            ts = [t for t in ts if t]
+            if ts and len(inc):
+                inc = inc[(inc["call_ts"] >= min(ts)) & (inc["call_ts"] <= max(ts))]
+        totals = df[publisher_col].astype(str).str.strip().value_counts().to_dict()
+    out = []
+    for pub, g in inc.groupby(inc["publisher"].astype(str).str.strip()):
+        conf = g[g["classification"] == "CONFIRMED_SPAM"]
+        sus = g[g["classification"] == "SUSPICIOUS"]
+        tot = int(totals.get(pub, 0)) if totals else 0
+        buyers = conf["buyer"].astype(str).value_counts()
+        out.append({"Publisher": pub or "(blank)", "All calls loaded": tot if totals else None, "Confirmed spam calls": len(conf), "Suspicious": len(sus),
+                    "Different spam numbers": conf["caller_norm"].replace("", pd.NA).dropna().nunique(),
+                    "Spam rate %": (round(100.0 * len(conf) / tot, 1) if tot else None),
+                    "Sample": ("low sample (<30 calls)" if totals and tot < 30 else ("ok" if totals else "")),
+                    "Most affected buyer": (f"{buyers.index[0]} ({int(buyers.iloc[0])})" if len(buyers) else "")})
+    t = pd.DataFrame(out, columns=["Publisher", "All calls loaded", "Confirmed spam calls", "Suspicious", "Different spam numbers", "Spam rate %", "Sample", "Most affected buyer"])
+    return t.sort_values(["Confirmed spam calls", "Suspicious"], ascending=False).reset_index(drop=True) if len(t) else t
+
+
+def _sp_tab_publishers(store, df, ident, now, full):
+    pub = next((c for c in df.columns if str(c).strip().lower() == "publisher"), None)
+    dte = next((c for c in df.columns if str(c).strip().lower() == "call date"), None)
+    st.markdown("**Spam by publisher** (reporting only: this app never blocks a publisher or a campaign)")
+    pt = sp_publisher_table(store, df, pub, dte)
+    st.dataframe(pt, hide_index=True, width="stretch")
+    st.caption("Counts come from the stored incidents (SQL). Spam rate = confirmed spam calls / all calls of that publisher in the data currently loaded; the call count is shown so a small sample is visible.")
+    st.markdown("**Export spam numbers**")
+    st.caption("Confirmed spam Caller IDs in +1XXXXXXXXXX format. Allow-listed numbers, numbers that also made a QUALIFIED call and numbers already verified as blocked are left out. "
+               "Uploading this file to Ringba (Block Numbers > bulk) bypasses this page's approval and verification, so use it knowingly.")
+    if ident["level"] == "operator":
+        try:
+            xd, xt = sp_export_numbers(store, ident, now)
+        except PermissionError as exc:
+            st.warning(str(exc))
+        else:
+            st.write(f"**{len(xd):,}** number(s) ready.")
+            st.download_button("Download numbers (.txt, one per line, for Ringba bulk upload)", xt, file_name="spam_numbers_e164.txt", mime="text/plain", key="sp_dl_txt")
+            st.download_button("Download details (.csv)", xd.to_csv(index=False), file_name="spam_numbers_details.csv", mime="text/csv", key="sp_dl_csv")
+    else:
+        st.info("Exporting numbers needs the operator level: set ALERT_ACTION_PASSWORD in Secrets, then enter it under 'Who is acting?'.")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# AUTO BLOCK (added). A separate worker (worker/worker.py, e.g. a free Render web service) runs sp_auto_run(); this app only DISPLAYS its log and can UNBLOCK.
+# The rule set is the one the person chose: a CONFIRMED_SPAM call with confidence >= SPAM_AUTO_MIN_CONF (default 95) -> that ONE Caller ID is blocked, with
+#   * kill switch      SPAM_AUTO must be "true" (default OFF);
+#   * shadow mode      SPAM_AUTO_MODE="shadow" (default) only WRITES what it WOULD block; "live" also needs SPAM_DRY_RUN="false";
+#   * limits           SPAM_AUTO_PER_RUN (25) and SPAM_AUTO_PER_DAY (100) real attempts; the rest stay on hold for a person;
+#   * unchanged rules  one Caller ID only, allow-list, QUALIFIED history, rejected numbers, Medi-Cal / insurance rule (it is inside the classifier), Ringba read-back before BLOCKED;
+#   * one run at a time (lease lock) and every action in sw_log.
+# The worker and the app do NOT share the local database: the worker writes sw_* tables in Turso, the app reads them. The worker reads the app's allow-list / rejected / blocked
+# numbers from Turso (sp_* mirror tables) and skips them.
+# ---------------------------------------------------------------------------------------------------------------------
+SP_AUTO_MIN_CONF = 95
+SP_AUTO_PER_RUN = 25
+SP_AUTO_PER_DAY = 100
+SP_AUTO_MAX_FAILS = 3
+SW_DDL = [
+    "CREATE TABLE IF NOT EXISTS sw_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, run_id TEXT, mode TEXT, caller_norm TEXT, proposal_id TEXT, confidence INTEGER, outcome TEXT, detail TEXT)",
+    "CREATE INDEX IF NOT EXISTS sw_log_ts ON sw_log(ts)",
+    "CREATE TABLE IF NOT EXISTS sw_blocks (caller_norm TEXT PRIMARY KEY, block_id TEXT, proposal_id TEXT, confidence INTEGER, blocked_at TEXT, verified INTEGER DEFAULT 0, publisher TEXT, unblocked_at TEXT, unblocked_by TEXT)",
+    "CREATE TABLE IF NOT EXISTS sw_state (k TEXT PRIMARY KEY, v TEXT, updated_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS sw_lock (id INTEGER PRIMARY KEY, holder TEXT, until_ts TEXT)",
+]
+
+
+def _sp_truthy(name, default="false"):
+    return _cfg(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _sp_int(name, default, lo=0, hi=100000):
+    try:
+        return min(hi, max(lo, int(float(_cfg(name, str(default))))))
+    except Exception:
+        return default
+
+
+def sp_auto_on():
+    return _sp_truthy("SPAM_AUTO", "false")
+
+
+def sp_auto_min_conf():
+    return _sp_int("SPAM_AUTO_MIN_CONF", SP_AUTO_MIN_CONF, 50, 100)
+
+
+def sp_auto_limits():
+    return _sp_int("SPAM_AUTO_PER_RUN", SP_AUTO_PER_RUN, 1, 1000), _sp_int("SPAM_AUTO_PER_DAY", SP_AUTO_PER_DAY, 1, 10000)
+
+
+def sp_auto_mode():
+    """(mode, note). 'live' needs BOTH SPAM_AUTO_MODE=live and SPAM_DRY_RUN=false; anything else is shadow."""
+    want = _cfg("SPAM_AUTO_MODE", "shadow").lower()
+    if want != "live":
+        return "shadow", "SPAM_AUTO_MODE is not 'live': shadow mode (nothing is blocked, the log shows what WOULD be blocked)."
+    if sp_dry_run():
+        return "shadow", "SPAM_AUTO_MODE is 'live' but SPAM_DRY_RUN is still on: staying in shadow mode. Set SPAM_DRY_RUN=\"false\" to go live."
+    return "live", "Live: confirmed spam numbers are blocked for real."
+
+
+def sp_auto_ident():
+    return {"label": "auto-block (policy)", "verified": False, "level": "operator", "via": "auto-block worker", "gate": "policy: confidence + safety rules, no person"}
+
+
+class SwLedger:
+    """The auto-block log / block list / lease lock. Works on a local SQLite store (tests) or on Turso over HTTP (the worker and the app's Auto-block tab): both speak SQLite SQL."""
+
+    def __init__(self, store=None, client=None):
+        self.store, self.client = store, client
+
+    def _run(self, stmts):
+        if self.client is not None:
+            return self.client.run([(q, a) for q, a in stmts])
+        out = []
+
+        def fn(c):
+            for q, a in stmts:
+                cur = c.execute(q, tuple(a or ()))
+                out.append([dict(r) for r in cur.fetchall()] if cur.description else [])
+        self.store._tx(fn)
+        return out
+
+    def init(self):
+        self._run([(q, ()) for q in SW_DDL])
+
+    def acquire(self, holder, now_s, minutes=10):
+        until = (pd.Timestamp(now_s) + pd.Timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+        r = self._run([("INSERT OR IGNORE INTO sw_lock(id, holder, until_ts) VALUES (1, ?, ?)", (holder, until)),
+                       ("UPDATE sw_lock SET holder=?, until_ts=? WHERE id=1 AND (until_ts < ? OR holder=? OR holder='')", (holder, until, now_s, holder)),
+                       ("SELECT holder FROM sw_lock WHERE id=1", ())])
+        return bool(r[2]) and r[2][0]["holder"] == holder
+
+    def release(self, holder):
+        self._run([("UPDATE sw_lock SET holder='', until_ts='' WHERE id=1 AND holder=?", (holder,))])
+
+    def log(self, now_s, run_id, mode, caller, pid, conf, outcome, detail=""):
+        self._run([("INSERT INTO sw_log(ts, run_id, mode, caller_norm, proposal_id, confidence, outcome, detail) VALUES (?,?,?,?,?,?,?,?)",
+                    (now_s, run_id, mode, caller, pid, conf, outcome, s16_scrub(detail, 300)))])
+
+    def live_attempts_today(self, day):
+        r = self._run([("SELECT COUNT(*) AS n FROM sw_log WHERE mode='live' AND outcome IN ('BLOCKED','FAILED','VERIFICATION_PENDING','MANUAL_ACTION_REQUIRED') AND ts >= ? AND ts < ?", (day + " 00:00:00", day + " 99"))])
+        return int(r[0][0]["n"]) if r[0] else 0
+
+    def shadow_seen(self, caller):
+        r = self._run([("SELECT COUNT(*) AS n FROM sw_log WHERE mode='shadow' AND outcome='WOULD_BLOCK' AND caller_norm=?", (caller,))])
+        return bool(r[0] and int(r[0][0]["n"]) > 0)
+
+    def fail_count(self, caller):
+        r = self._run([("SELECT COUNT(*) AS n FROM sw_log WHERE mode='live' AND outcome='FAILED' AND caller_norm=?", (caller,))])
+        return int(r[0][0]["n"]) if r[0] else 0
+
+    def blocks(self, active_only=False):
+        r = self._run([("SELECT * FROM sw_blocks" + (" WHERE unblocked_at IS NULL OR unblocked_at=''" if active_only else "") + " ORDER BY blocked_at DESC", ())])
+        return r[0]
+
+    def blocked_set(self):
+        return {b["caller_norm"] for b in self.blocks(active_only=True)}
+
+    def record_block(self, caller, block_id, pid, conf, now_s, verified, publisher=""):
+        self._run([("INSERT INTO sw_blocks(caller_norm, block_id, proposal_id, confidence, blocked_at, verified, publisher) VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(caller_norm) DO UPDATE SET block_id=COALESCE(excluded.block_id, sw_blocks.block_id), proposal_id=excluded.proposal_id, confidence=excluded.confidence, "
+                    "blocked_at=excluded.blocked_at, verified=MAX(sw_blocks.verified, excluded.verified), unblocked_at=NULL, unblocked_by=NULL",
+                    (caller, block_id, pid, conf, now_s, int(bool(verified)), publisher))])
+
+    def set_verified(self, caller):
+        self._run([("UPDATE sw_blocks SET verified=1 WHERE caller_norm=?", (caller,))])
+
+    def mark_unblocked(self, caller, by, now_s):
+        self._run([("UPDATE sw_blocks SET unblocked_at=?, unblocked_by=? WHERE caller_norm=?", (now_s, s16_scrub(by, 60), caller))])
+
+    def set_state(self, k, v, now_s):
+        self._run([("INSERT INTO sw_state(k, v, updated_at) VALUES (?,?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at", (k, v if isinstance(v, str) else json.dumps(v), now_s))])
+
+    def state(self):
+        return {r["k"]: r for r in self._run([("SELECT k, v, updated_at FROM sw_state", ())])[0]}
+
+    def recent(self, limit=300):
+        return self._run([("SELECT ts, mode, caller_norm, proposal_id, confidence, outcome, detail FROM sw_log ORDER BY id DESC LIMIT ?", (int(limit),))])[0]
+
+    def would_block(self):
+        """Callers shadow mode flagged and that are not blocked / unblocked since."""
+        return self._run([("SELECT caller_norm, MAX(confidence) AS confidence, MIN(ts) AS first_flagged, COUNT(*) AS times FROM sw_log WHERE outcome='WOULD_BLOCK' AND caller_norm NOT IN "
+                           "(SELECT caller_norm FROM sw_blocks) GROUP BY caller_norm ORDER BY confidence DESC, first_flagged LIMIT 500", ())])[0]
+
+
+def sp_auto_import_app_state(store, client):
+    """Reads the APP's decisions from Turso (its mirrored sp_* tables) into the worker's own store and returns the callers to skip: allow-listed (copied in, so the normal
+    allow-list rule applies), rejected by a person, or already blocked / being blocked by the app. -> set of +1XXXXXXXXXX. Missing tables = nothing to skip (first run)."""
+    skip = set()
+    now_s = s16_ts(None)
+    try:
+        al = client.query("SELECT caller_norm, note, added_by, added_at FROM sp_allowlist WHERE active=1")
+        store._tx(lambda c: [c.execute("INSERT OR REPLACE INTO sp_allowlist(caller_norm, note, added_by, added_at, active) VALUES (?,?,?,?,1)",
+                                       (r["caller_norm"], r["note"], r["added_by"], r["added_at"])) for r in al])
+        skip |= {r["caller_norm"] for r in al}
+    except Exception:
+        pass
+    try:
+        for r in client.query("SELECT DISTINCT caller_norm FROM sp_proposals WHERE review_status='REJECTED' OR exec_status IN ('BLOCKED','VERIFICATION_PENDING','EXECUTING','MANUAL_REPORTED_UNVERIFIED','UNBLOCKED')"):
+            skip.add(r["caller_norm"])
+    except Exception:
+        pass
+    return skip
+
+
+def sp_auto_candidates(store, skip, conf_min):
+    rows = store._q("SELECT p.id, p.caller_norm, (SELECT MAX(i.confidence) FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM') AS conf, "
+                    "(SELECT i.publisher FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM' ORDER BY i.call_ts DESC LIMIT 1) AS publisher "
+                    "FROM sp_proposals p WHERE p.review_status='PENDING_APPROVAL' ORDER BY conf DESC, p.created_at, p.id")
+    out = []
+    for r in rows:
+        norm = r["caller_norm"]
+        if norm in skip or int(r["conf"] or 0) < conf_min:
+            continue
+        ok, _why, _st = sp_eligibility(store, norm)               # allow-list, QUALIFIED history, confirmed count: asked again, right before acting
+        if ok:
+            out.append({"pid": r["id"], "norm": norm, "conf": int(r["conf"]), "publisher": r["publisher"] or ""})
+    return out
+
+
+@_sp_needs_store
+def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None):
+    """One automatic pass over what sp_scan() already found. NEVER touches Ringba in shadow mode. Returns a summary dict (also stored in sw_state)."""
+    now_s = s16_ts(now)
+    run_id = run_id or ("RUN-" + hashlib.sha1((now_s + str(id(store))).encode()).hexdigest()[:8])
+    res = {"enabled": sp_auto_on(), "run_id": run_id, "ts": now_s, "mode": "", "candidates": 0, "would_block": 0, "blocked": 0, "pending": 0, "failed": 0, "held_by_limit": 0, "verified_later": 0, "note": ""}
+    if not res["enabled"]:
+        res["note"] = "SPAM_AUTO is off (kill switch). Nothing was done."
+        return res
+    mode, mnote = sp_auto_mode()
+    res["mode"], res["note"] = mode, mnote
+    ledger.init()
+    if not ledger.acquire(run_id, now_s):
+        res["note"] = "Another run is in progress; this one did nothing."
+        res["skipped"] = True
+        return res
+    ident = sp_auto_ident()
+    try:
+        conf_min = sp_auto_min_conf()
+        per_run, per_day = sp_auto_limits()
+        skip = set(skip or ()) | ledger.blocked_set()
+        ad = adapter or sp_adapter() if mode == "live" else adapter
+        if mode == "live" and ad is not None:                          # blocks sent earlier whose read-back did not work: try the read-back again, never POST again
+            try:
+                ok_v, _w = (ad.verify_capability() if hasattr(ad, "verify_capability") else ad.capability())
+                if ok_v:
+                    for b in ledger.blocks(active_only=True):
+                        if not b.get("verified"):
+                            try:
+                                if ad.verify(b["caller_norm"]) is True:
+                                    ledger.set_verified(b["caller_norm"])
+                                    ledger.log(now_s, run_id, mode, b["caller_norm"], b.get("proposal_id"), b.get("confidence"), "VERIFIED_LATER", "number found on the Ringba block list")
+                                    res["verified_later"] += 1
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+        cands = sp_auto_candidates(store, skip, conf_min)
+        res["candidates"] = len(cands)
+        used = ledger.live_attempts_today(now_s[:10]) if mode == "live" else 0
+        budget = max(0, min(per_run, per_day - used))
+        done, fails = 0, 0
+        for cnd in cands:
+            norm, pid, conf = cnd["norm"], cnd["pid"], cnd["conf"]
+            if mode == "shadow":
+                if not ledger.shadow_seen(norm):
+                    ledger.log(now_s, run_id, mode, norm, pid, conf, "WOULD_BLOCK", f"confidence {conf} >= {conf_min}; shadow mode, nothing sent to Ringba")
+                    res["would_block"] += 1
+                continue
+            if done >= budget:
+                res["held_by_limit"] += 1
+                continue
+            if ledger.fail_count(norm) >= SP_AUTO_MAX_FAILS:
+                continue                                                  # gave up on this number after repeated failures; a person looks at it
+            ok_c, why_c = ad.capability()
+            if not ok_c:
+                ledger.log(now_s, run_id, mode, norm, pid, conf, "NOT_CONFIGURED", why_c)
+                res["note"] = "Live mode, but Ringba blocking is not configured: " + why_c
+                break
+            okd, msgd = sp_decide(store, pid, True, ident, note=f"auto-block policy: confidence {conf} >= {conf_min}", now=now, _refresh=False)
+            if not okd:
+                ledger.log(now_s, run_id, mode, norm, pid, conf, "REFUSED", msgd)
+                continue
+            r = sp_execute(store, pid, ident, now, adapter=ad, dry_run=False)
+            done += 1
+            st_ = r.get("exec_status") or ""
+            ledger.log(now_s, run_id, mode, norm, pid, conf, st_ or "FAILED", r.get("message", ""))
+            if st_ in ("BLOCKED", "VERIFICATION_PENDING"):
+                ledger.record_block(norm, getattr(ad, "last_block_id", None), pid, conf, now_s, st_ == "BLOCKED", cnd["publisher"])
+            if st_ == "BLOCKED":
+                res["blocked"] += 1
+            elif st_ == "VERIFICATION_PENDING":
+                res["pending"] += 1
+            else:
+                res["failed"] += 1
+                fails += 1
+            if r.get("auth"):
+                res["note"] = "Ringba refused the token: the run stopped. Check RINGBA_BLOCK_TOKEN (an Admin user's token)."
+                break
+            if fails >= SP_AUTO_MAX_FAILS:
+                res["note"] = f"{fails} blocks failed in a row: the run stopped."
+                break
+        ledger.set_state("last_run", res, now_s)
+    finally:
+        ledger.release(run_id)
+    return res
+
+
+@_sp_needs_store
+def sp_unblock(store, norm_or_raw, ident, now=None, adapter=None, block_id=None, ledger=None, note=""):
+    """Removes ONE number from Ringba's block list (DELETE .../blockedNumbers/{id}), then allow-lists it (so no automatic rule blocks it again) and records it.
+    Operator level only. UNBLOCKED is recorded only when the number is no longer found on the list (or the list cannot be read, which is said plainly). -> {'ok','message'}"""
+    try:
+        s16_require("spam_unblock", ident)
+    except PermissionError as exc:
+        return {"ok": False, "message": str(exc)}
+    norm = sp_norm_caller(norm_or_raw)
+    if not norm:
+        return {"ok": False, "message": "That is not a usable Caller ID."}
+    now_s = s16_ts(now)
+    ad = adapter or sp_adapter()
+    if not hasattr(ad, "unblock"):
+        return {"ok": False, "message": "This Ringba adapter cannot remove a block. Remove it in Ringba > Block Numbers."}
+    ok, why = ad.capability()
+    if not ok:
+        return {"ok": False, "message": why}
+    bid = block_id
+    if not bid:
+        r = store._q("SELECT block_id FROM sp_blocks WHERE caller_norm=?", (norm,))
+        bid = r[0]["block_id"] if r else None
+    if not bid and ledger is not None:
+        try:
+            bid = next((b["block_id"] for b in ledger.blocks() if b["caller_norm"] == norm and b.get("block_id")), None)
+        except Exception:
+            bid = None
+    try:
+        how = ad.unblock(norm, bid)
+    except PermissionError as exc:
+        return {"ok": False, "message": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "message": getattr(exc, "msg", "") or f"Ringba did not remove the block ({type(exc).__name__}). Nothing was changed here."}
+    still = None
+    try:
+        still = ad.verify(norm)
+    except Exception:
+        still = None
+    if still is True:
+        return {"ok": False, "message": "Ringba accepted the removal but the number is still on the block list. Check it in Ringba > Block Numbers."}
+    label = ident["label"]
+
+    def fn(c):
+        c.execute("UPDATE sp_blocks SET unblocked_at=?, unblocked_by=? WHERE caller_norm=?", (now_s, s16_scrub(label, 60), norm))
+        c.execute("UPDATE sp_proposals SET exec_status='UNBLOCKED', result=?, updated_at=? WHERE caller_norm=? AND exec_status IN ('BLOCKED','VERIFICATION_PENDING','MANUAL_REPORTED_UNVERIFIED')",
+                  ("unblocked by " + s16_scrub(label, 60), now_s, norm))
+        s16_audit(c, now_s, label, ident["verified"], "spam_unblocked", norm, f"{sp_mask(norm)} {how} {note}")
+    store._tx(fn)
+    sp_allow_add(store, norm, "unblocked by " + label + (": " + note if note else ""), ident, now)
+    if ledger is not None:
+        try:
+            ledger.mark_unblocked(norm, label, now_s)
+        except Exception:
+            pass
+    sp_queue_refresh(store)
+    return {"ok": True, "message": ("Removed from the Ringba block list" if how == "deleted" else "It was already gone from the Ringba block list") +
+            ("; confirmed by reading the list back." if still is False else "; the list could not be read back to confirm.") + " The number was added to the allowlist so it is not blocked again."}
+
+
+@_sp_needs_store
+def sp_adopt_worker_blocks(store, rows, now=None, adapter=None):
+    """Brings numbers the worker blocked into THIS app's own records, so the proposals table and the Google Sheet columns show BLOCKED. A number becomes BLOCKED here only after
+    THIS app reads the Ringba block list and finds it (same rule as everywhere). -> {'adopted', 'skipped'}"""
+    ad = adapter or sp_adapter()
+    ok, _w = (ad.verify_capability() if hasattr(ad, "verify_capability") else ad.capability())
+    now_s = s16_ts(now)
+    res = {"adopted": 0, "skipped": 0}
+    if not ok:
+        res["skipped"] = len(rows or [])
+        return res
+    for b in rows or []:
+        norm = b.get("caller_norm")
+        if not norm or b.get("unblocked_at"):
+            continue
+        have = store._q("SELECT 1 FROM sp_proposals WHERE caller_norm=? AND exec_status='BLOCKED'", (norm,))
+        if have:
+            continue
+        try:
+            found = ad.verify(norm)
+        except Exception:
+            found = None
+        if found is not True:
+            res["skipped"] += 1
+            continue
+        st_ = sp_caller_stats(store, norm)
+        eh = sp_evidence_hash(store, norm)
+
+        def fn(c, norm=norm, b=b, st_=st_, eh=eh):
+            op = c.execute("SELECT id FROM sp_proposals WHERE caller_norm=? AND review_status IN ('PENDING_APPROVAL','APPROVED')", (norm,)).fetchone()
+            note = "blocked by the auto-block worker; verified on the Ringba block list by this app"
+            if op:
+                pid = op["id"]
+                c.execute("UPDATE sp_proposals SET review_status='APPROVED', exec_status='BLOCKED', decided_by=?, decided_verified=0, decided_at=?, decision_note=?, approved_hash=?, evidence_hash=?, "
+                          "blocked_at=?, verified_at=?, verification=?, result='verified blocked', updated_at=? WHERE id=?",
+                          ("auto-block (worker)", now_s, note, eh, eh, b.get("blocked_at") or now_s, now_s, "verified: number found on the Ringba block list", now_s, pid))
+            else:
+                pid = "BLK-" + hashlib.sha1((norm + "|auto|" + now_s).encode()).hexdigest()[:10].upper()
+                exp = (pd.Timestamp(now_s) + pd.Timedelta(hours=SP_EXPIRE_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+                c.execute("""INSERT INTO sp_proposals(id, caller_norm, review_status, exec_status, risk_score, risk, evidence, evidence_hash, approved_hash, incident_ids, n_confirmed, n_suspicious, n_calls,
+                            created_by, created_at, expires_at, decided_by, decided_verified, decided_at, decision_note, blocked_at, verified_at, verification, result, dry_run, updated_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                          (pid, norm, "APPROVED", "BLOCKED", sp_risk(st_), json.dumps({"rule": "blocked by the auto-block worker"}), s16_json({"caller": sp_mask(norm), "n_confirmed": st_["n_confirmed"]}), eh, eh,
+                           json.dumps(st_["incident_ids"]), st_["n_confirmed"], st_["n_suspicious"], st_["calls"] or 0, "auto-block (worker)", b.get("blocked_at") or now_s, exp,
+                           "auto-block (worker)", 0, now_s, note, b.get("blocked_at") or now_s, now_s, "verified: number found on the Ringba block list", "verified blocked", 0, now_s))
+            if b.get("block_id"):
+                c.execute("INSERT INTO sp_blocks(caller_norm, block_id, proposal_id, blocked_at) VALUES (?,?,?,?) ON CONFLICT(caller_norm) DO UPDATE SET block_id=excluded.block_id, proposal_id=excluded.proposal_id",
+                          (norm, b["block_id"], pid, b.get("blocked_at") or now_s))
+            s16_audit(c, now_s, "auto-block (worker)", 0, "spam_adopted_worker_block", pid, f"{sp_mask(norm)} verified on the Ringba list")
+        store._tx(fn)
+        res["adopted"] += 1
+    if res["adopted"]:
+        sp_queue_refresh(store)
+    return res
+
+
+def _sp_turso_ledger():
+    """A ledger on the Turso database, for the app's Auto-block tab. None when Turso is not configured."""
+    if not tm_configured():
+        return None
+    return SwLedger(client=TursoClient(_cfg("TURSO_DATABASE_URL"), _cfg("TURSO_AUTH_TOKEN"), timeout=_sp_int("TURSO_TIMEOUT", 10, 3, 60)))
+
+
+def _sp_tab_auto(store, ident, now, full=False):
+    mode, mnote = sp_auto_mode()
+    per_run, per_day = sp_auto_limits()
+    st.write(f"**Auto-block (this app's view; the worker does the blocking):** {'ON' if sp_auto_on() else 'OFF'} · **Mode:** {mode.upper()} · **Confidence at or above:** {sp_auto_min_conf()} · **Limits:** {per_run} per run, {per_day} per day")
+    st.caption(mnote + " These settings are read from the Secrets of the WORKER; the values shown here are this app's own Secrets, so keep both the same.")
+    led = _sp_turso_ledger()
+    if led is None:
+        st.info("Turso is not connected here, so the worker's log cannot be shown. Add TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to this app's Secrets (the same database the worker uses).")
+        return
+    try:
+        led.init()
+        state = led.state()
+        blocks = led.blocks()
+        recent = led.recent(300)
+        would = led.would_block()
+    except Exception as exc:
+        st.warning(f"Could not read the worker's log from Turso ({type(exc).__name__}).")
+        return
+    lr = state.get("last_run")
+    if lr:
+        try:
+            age = (pd.Timestamp(now) - pd.Timestamp(lr["updated_at"])).total_seconds() / 60
+        except Exception:
+            age = None
+        d = {}
+        try:
+            d = json.loads(lr["v"])
+        except Exception:
+            pass
+        st.write(f"**Worker last ran:** {lr['updated_at']}" + (f" ({age:.0f} min ago)" if age is not None else "") + f" · mode {d.get('mode', '?')} · candidates {d.get('candidates', 0)} · would block {d.get('would_block', 0)} · blocked {d.get('blocked', 0)} · held by limit {d.get('held_by_limit', 0)}")
+        if age is not None and age > 30:
+            st.warning("The worker has not reported for more than 30 minutes. Check that it is running (and that the Apps Script trigger is on).")
+    else:
+        st.warning("The worker has not reported yet.")
+    ad = sp_adapter()
+    if blocks and st.button("Bring the worker's blocks into this app (proposals table and Sheet)", key="sp_adopt_btn"):
+        r = sp_adopt_worker_blocks(store, blocks, now, ad)
+        st.success(f"{r['adopted']} number(s) adopted (each one re-checked on the Ringba block list), {r['skipped']} not confirmed.")
+    c1, c2 = st.columns(2)
+    c1.metric("Active blocks by the worker", sum(1 for b in blocks if not b.get("unblocked_at")))
+    c2.metric("Flagged in shadow mode, not blocked", len(would))
+    if would:
+        st.markdown("**Shadow mode: these Caller IDs WOULD be blocked** (nothing was sent to Ringba). Check them, then switch the worker to live.")
+        wdf = pd.DataFrame(would)
+        wdf["caller_norm"] = wdf["caller_norm"].map(lambda x: sp_disp(x, full))
+        st.dataframe(wdf, hide_index=True, width="stretch")
+    if blocks:
+        st.markdown("**Numbers the worker blocked**")
+        bdf = pd.DataFrame(blocks)
+        bdf["caller_norm"] = bdf["caller_norm"].map(lambda x: sp_disp(x, full))
+        st.dataframe(bdf.drop(columns=[c for c in ("block_id",) if c in bdf.columns]), hide_index=True, width="stretch")
+    st.markdown("**Unblock a number** (removes it from Ringba, then allow-lists it)")
+    num = st.text_input("Caller ID to unblock (+1XXXXXXXXXX)", key="sp_unb_num")
+    okc = st.checkbox("Yes, remove this one number from the Ringba block list", key="sp_unb_ok")
+    if st.button("Unblock", key="sp_unb_btn"):
+        if not okc:
+            st.warning("Tick the box first.")
+        else:
+            r = sp_unblock(store, num, ident, now, adapter=ad, ledger=led)
+            _s9_say(r["ok"], r["message"])
+    if recent:
+        st.markdown("**Recent worker log**")
+        rdf = pd.DataFrame(recent)
+        rdf["caller_norm"] = rdf["caller_norm"].map(lambda x: sp_disp(x, full))
+        st.dataframe(rdf, hide_index=True, width="stretch")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
