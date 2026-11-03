@@ -17227,7 +17227,7 @@ def _sp_tab_publishers(store, df, ident, now, full):
 # ---------------------------------------------------------------------------------------------------------------------
 SP_AUTO_MIN_CONF = 95
 SP_AUTO_PER_RUN = 25
-SP_AUTO_PER_DAY = 100
+SP_AUTO_PER_DAY = 600
 SP_AUTO_MAX_FAILS = 3
 SW_DDL = [
     "CREATE TABLE IF NOT EXISTS sw_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, run_id TEXT, mode TEXT, caller_norm TEXT, proposal_id TEXT, confidence INTEGER, outcome TEXT, detail TEXT)",
