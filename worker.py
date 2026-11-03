@@ -1,6 +1,6 @@
 """Auto-block WORKER. A small web service (free Render web service works) that runs the same spam logic as the dashboard, without Streamlit:
    read the Google Sheet -> find confirmed spam -> (shadow mode: only log what it WOULD block | live mode: block ONE Caller ID in Ringba, verify it, log it).
- * Needs analytics_app_updated.py in the same folder (it reuses the app's spam code; nothing is copied, so a new app version is picked up on the next deploy).
+ * Needs analytics_app.py in the same folder (it reuses the app's spam code; nothing is copied, so a new app version is picked up on the next deploy).
  * POST /run  (header X-Worker-Token: <WORKER_TOKEN>)  starts a run, returns at once. Many calls in a row are merged into one run + at most one follow-up run.
  * GET  /health  (no secret, no data)  says "ok": use it as a keep-alive ping.
  * Also runs by itself every WORKER_INTERVAL seconds (default 300) while the service is awake.
@@ -53,7 +53,7 @@ class _Stub:
 
 def load_core(app_path=None):
     """Executes ONLY the definitions of the app that come before its 'Main flow' (functions, classes, constants, the few registry updates); never the page itself."""
-    app_path = app_path or os.environ.get("WORKER_APP_FILE") or os.path.join(HERE, "analytics_app_updated.py")
+    app_path = app_path or os.environ.get("WORKER_APP_FILE") or os.path.join(HERE, "analytics_app.py")
     src = open(app_path, encoding="utf-8").read()
     pre = src[:src.index("# Main flow")]
     tree = ast.parse(pre)
