@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import streamlit as st
 import pandas as pd
 import gspread
+import plotly.graph_objects as go
 from datetime import date, timedelta
 
 # ---------------------------------------------------------------
@@ -84,6 +85,16 @@ html, body, [class*="css"], .stApp {
   background: var(--ui-bg);
   color-scheme: light;
 }
+
+/* Plotly Chart Container Border & Card Styling */
+[data-testid="stPlotlyChart"] {
+  background: var(--ui-card);
+  border: 1px solid var(--ui-border);
+  border-radius: 12px;
+  padding: 10px;
+  box-shadow: 0 1px 2px rgba(15,23,42,0.03);
+}
+"""
 
 /* Hide Streamlit Cloud branding, deploy button & top gap */
 #MainMenu, footer, [data-testid="stToolbar"], .stDeployButton, [data-testid="stDecoration"] {
@@ -393,7 +404,27 @@ def ui_dashboard_extras(work_df):
             daily = work_df["Parsed_Date"].dropna().dt.floor("D").value_counts().sort_index()
             if len(daily) > 1:
                 st.markdown('<div class="ui-sec">DAILY CALL VOLUME</div>', unsafe_allow_html=True)
-                st.area_chart(daily, height=220)
+                fig_daily = go.Figure(go.Scatter(
+                    x=daily.index,
+                    y=daily.values,
+                    mode="lines+markers",
+                    line=dict(color="#2563eb", width=2.5, shape="spline"),
+                    marker=dict(size=5, color="#1d4ed8"),
+                    fill="tozeroy",
+                    fillcolor="rgba(37, 99, 235, 0.10)",
+                    hovertemplate="<b>%{x|%b %d, %Y}</b><br>Calls: %{y:,}<extra></extra>",
+                ))
+                fig_daily.update_layout(
+                    height=240,
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    paper_bgcolor="#ffffff",
+                    plot_bgcolor="#ffffff",
+                    font=dict(family="Inter, sans-serif", size=12, color="#475569"),
+                    xaxis=dict(showgrid=False, linecolor="#e2e8f0"),
+                    yaxis=dict(showgrid=True, gridcolor="#f1f5f9", zeroline=False),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_daily, use_container_width=True, config={"displayModeBar": False})
     except Exception:
         pass
 
@@ -809,9 +840,52 @@ def render_period_comparison(base_df, available_columns, qc_col, voip_col):
     table = res[table_cols]
 
     st.markdown("**Calls per group: Earlier vs Later** (top 15)")
-    chart = res.copy()
+    chart = res.copy().head(15)
     chart["Group"] = chart[group_cols].astype(str).apply(" | ".join, axis=1)
-    st.bar_chart(chart.set_index("Group")[["Calls Earlier", "Calls Later"]].head(15))
+    fig_cmp = go.Figure(data=[
+        go.Bar(
+            name="Calls Earlier",
+            x=chart["Group"],
+            y=chart["Calls Earlier"],
+            marker_color="#cbd5e1",
+            hovertemplate="<b>%{x}</b><br>Earlier: %{y:,}<extra></extra>",
+        ),
+        go.Bar(
+            name="Calls Later",
+            x=chart["Group"],
+            y=chart["Calls Later"],
+            marker_color="#2563eb",
+            hovertemplate="<b>%{x}</b><br>Later: %{y:,}<extra></extra>",
+        ),
+    ])
+    fig_cmp.update_layout(
+        barmode="group",
+        height=320,
+        margin=dict(l=10, r=10, t=28, b=10),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(family="Inter, sans-serif", size=12, color="#475569"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title=None),
+        xaxis=dict(showgrid=False, linecolor="#e2e8f0"),
+        yaxis=dict(showgrid=True, gridcolor="#f1f5f9", zeroline=False),
+        bargap=0.25,
+        bargroupgap=0.08,
+    )
+    st.plotly_chart(fig_cmp, use_container_width=True, config={"displayModeBar": False})
+
+    st.dataframe(table, width="stretch", hide_index=True)
+    st.caption(
+        "Δ = Later minus Earlier (for % metrics it is in percentage points). "
+        "Percentages are a share of all calls in that period; a group with no calls in a period shows blank. "
+        "Avg Score ignores calls that have no AI QC result yet."
+    )
+    st.download_button(
+        label="📥 Download Comparison as CSV",
+        data=table.to_csv(index=False).encode("utf-8"),
+        file_name="period_comparison.csv",
+        mime="text/csv",
+        key="cmp_download",
+    )
 
     st.dataframe(table, width="stretch", hide_index=True)
     st.caption(
