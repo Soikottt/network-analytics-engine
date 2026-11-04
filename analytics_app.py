@@ -241,7 +241,7 @@ button[data-baseweb="tab"][aria-selected="true"] { background: var(--ui-card); c
 #MainMenu, footer, [data-testid="stToolbar"], .stDeployButton, [data-testid="stDecoration"] {
   display: none !important;
   visibility: hidden !important;
-}
+
 [data-testid="stHeader"] {
   height: 0px !important;
   background: transparent !important;
