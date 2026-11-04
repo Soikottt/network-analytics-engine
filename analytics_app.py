@@ -16562,6 +16562,26 @@ def sp_reconcile_stale(store, now, minutes=15):
 # ---------------------------------------------------------------------------------------------------------------------
 # SQL -> Google Sheet mirror (queue driven, idempotent)
 # ---------------------------------------------------------------------------------------------------------------------
+def sp_sheet_tz():
+    return _cfg("SPAM_SHEET_TZ", "Asia/Dhaka")
+
+
+def sp_local_ts(v):
+    """Times are STORED in UTC (the worker and this page both use UTC). The sheet shows them in the person's own time zone (SPAM_SHEET_TZ, default Asia/Dhaka), with the offset,
+    e.g. '2026-11-04 17:10:00 +06:00', so it is clear when something was blocked."""
+    v = str(v or "").strip()
+    if not v:
+        return ""
+    try:
+        t = pd.Timestamp(v)
+        t = t.tz_localize("UTC") if t.tzinfo is None else t
+        t = t.tz_convert(sp_sheet_tz())
+        z = t.strftime("%z")
+        return t.strftime("%Y-%m-%d %H:%M:%S") + " " + z[:3] + ":" + z[3:]
+    except Exception:
+        return v
+
+
 def sp_desired(inc, prop, allow=False):
     """The 10 sheet cells for one incident, derived ONLY from SQL. Detection (first 5) and blocking (last 5) are kept apart."""
     review = prop["review_status"] if prop else ("ALLOWLISTED" if allow else "")
@@ -16573,8 +16593,8 @@ def sp_desired(inc, prop, allow=False):
         ev = []
     return {"Spam Status": inc["classification"], "Spam Category": inc["category"] or "", "Spam Confidence": f"{int(inc['confidence'] or 0)}%",
             "Spam Evidence": s16_scrub("; ".join(ev[:4]), 300), "Spam Incident ID": inc["id"],
-            "Block Review Status": review, "Block Approved By": (prop["decided_by"] or "") if approved else "", "Block Approved At": (prop["decided_at"] or "") if approved else "",
-            "Block Execution Status": exec_, "Blocked At": (prop["blocked_at"] or "") if (prop and prop["exec_status"] == "BLOCKED") else ""}
+            "Block Review Status": review, "Block Approved By": (prop["decided_by"] or "") if approved else "", "Block Approved At": sp_local_ts(prop["decided_at"]) if approved else "",
+            "Block Execution Status": exec_, "Blocked At": sp_local_ts(prop["blocked_at"]) if (prop and prop["exec_status"] == "BLOCKED") else ""}
 
 
 def sp_desired_hash(d):
@@ -16938,11 +16958,7 @@ def render_spam_page(df, available_columns, overrides, timeline):
     store = s9_get_store()
     if store.warning:
         st.warning(store.warning)
-    tz = st.session_state.get("date_tz", DEFAULT_TIMEZONE)
-    try:
-        now = pd.Timestamp.now(tz=tz).tz_localize(None)
-    except Exception:
-        now = pd.Timestamp.now()
+    now = pd.Timestamp.now("UTC").tz_localize(None)         # spam times are stored in UTC (the worker does the same); the sheet shows them in SPAM_SHEET_TZ
     with st.expander("Who is acting? (identity and permissions)"):
         lab = st.text_input("Your name (a label, not proof of identity)", key="sp_actor")
         pw = st.text_input("Action password (needed to approve or execute)", key="sp_pw", type="password")
@@ -16975,6 +16991,12 @@ def render_spam_page(df, available_columns, overrides, timeline):
     if c2.button("Sync spam status to the Google Sheet", key="sp_sync_btn") or (sp_sheet_sync_on() and st.session_state.get("sp_autosync") != fp and meta.get("url")):
         st.session_state["sp_autosync"] = fp
         try:
+            try:                                           # blocks the worker made: take them into this store first, so this sync does not write PENDING_APPROVAL over them
+                _led = _sp_turso_ledger()
+                if _led is not None:
+                    sp_apply_ledger_blocks(store, _led.blocks(active_only=True), now)
+            except Exception:
+                pass
             ss = _s9_open_spreadsheet()
             r = sp_sheet_sync(store, ss, now, default_tab=tab_default) if ss is not None else {"ok": False, "error": "No sheet is loaded."}
             _s9_say(r["ok"], f"Sheet sync: {r.get('written', 0)} row(s) written, {r.get('unchanged', 0)} already up to date, {r.get('pending', 0)} still pending." if r["ok"] else f"Sheet sync failed (SQL is unaffected, it will retry): {r['error']}")
@@ -17358,6 +17380,7 @@ SW_DDL = [
     "CREATE INDEX IF NOT EXISTS sw_log_ts ON sw_log(ts)",
     "CREATE TABLE IF NOT EXISTS sw_blocks (caller_norm TEXT PRIMARY KEY, block_id TEXT, proposal_id TEXT, confidence INTEGER, blocked_at TEXT, verified INTEGER DEFAULT 0, publisher TEXT, unblocked_at TEXT, unblocked_by TEXT)",
     "CREATE TABLE IF NOT EXISTS sw_state (k TEXT PRIMARY KEY, v TEXT, updated_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS sw_hist (caller_norm TEXT PRIMARY KEY, calls INTEGER, qualified INTEGER, updated_at TEXT)",
     "CREATE TABLE IF NOT EXISTS sw_lock (id INTEGER PRIMARY KEY, holder TEXT, until_ts TEXT)",
 ]
 
@@ -17459,6 +17482,16 @@ class SwLedger:
                     "blocked_at=excluded.blocked_at, verified=MAX(sw_blocks.verified, excluded.verified), unblocked_at=NULL, unblocked_by=NULL",
                     (caller, block_id, pid, conf, now_s, int(bool(verified)), publisher))])
 
+    def hist_save(self, rows, now_s):
+        """Per-caller call / QUALIFIED-call counts from a FULL read of the sheet, kept so a quick run that reads only the new-calls tab still knows a caller's old history."""
+        rows = list(rows or [])
+        for i in range(0, len(rows), 150):
+            self._run([("INSERT INTO sw_hist(caller_norm, calls, qualified, updated_at) VALUES (?,?,?,?) ON CONFLICT(caller_norm) DO UPDATE SET calls=excluded.calls, qualified=excluded.qualified, updated_at=excluded.updated_at",
+                        (r["caller_norm"], int(r["calls"] or 0), int(r["qualified"] or 0), now_s)) for r in rows[i:i + 150]])
+
+    def hist_load(self):
+        return self._run([("SELECT caller_norm, calls, qualified FROM sw_hist", ())])[0]
+
     def set_verified(self, caller):
         self._run([("UPDATE sw_blocks SET verified=1 WHERE caller_norm=?", (caller,))])
 
@@ -17520,6 +17553,22 @@ def sp_auto_import_app_state(store, client):
     except Exception:
         pass
     return skip
+
+
+@_sp_needs_store
+def sp_hist_export(store):
+    return [dict(r) for r in store._q("SELECT caller_norm, calls, qualified FROM sp_caller_hist WHERE calls > 0 OR qualified > 0")]
+
+
+@_sp_needs_store
+def sp_hist_merge(store, rows, now=None):
+    """Adds per-caller history from elsewhere (the worker's last full read, the app's own copy). The LARGER count wins, so a quick read of one tab can never hide an old QUALIFIED call."""
+    now_s = s16_ts(now)
+    rows = [r for r in (rows or []) if r.get("caller_norm")]
+    store._tx(lambda c: [c.execute("INSERT INTO sp_caller_hist(caller_norm, calls, qualified, updated_at) VALUES (?,?,?,?) ON CONFLICT(caller_norm) DO UPDATE SET "
+                                   "calls=MAX(COALESCE(sp_caller_hist.calls,0), excluded.calls), qualified=MAX(COALESCE(sp_caller_hist.qualified,0), excluded.qualified), updated_at=excluded.updated_at",
+                                   (r["caller_norm"], int(r.get("calls") or 0), int(r.get("qualified") or 0), now_s)) for r in rows])
+    return len(rows)
 
 
 def sp_auto_candidates(store, skip, conf_min):
@@ -17751,6 +17800,41 @@ def sp_adopt_worker_blocks(store, rows, now=None, adapter=None):
     return res
 
 
+@_sp_needs_store
+def sp_apply_ledger_blocks(store, rows, now=None):
+    """Makes THIS store agree with the worker's block ledger (sw_blocks), so the proposals and the Google Sheet columns show BLOCKED instead of PENDING_APPROVAL.
+    Used by the worker (its store is rebuilt from the sheet every run, so it would otherwise write PENDING_APPROVAL over a block it made earlier) and by the app before a sheet sync.
+    The ledger row is the worker's own record: verified=1 means the worker read the number back from the Ringba block list; such a number is BLOCKED here, an unverified one stays VERIFICATION_PENDING.
+    Touches only an open (PENDING_APPROVAL / APPROVED not yet blocked) proposal of that Caller ID; nothing is sent to Ringba. -> number of proposals changed."""
+    now_s = s16_ts(now)
+    changed = 0
+    for b in rows or []:
+        norm = b.get("caller_norm")
+        if not norm or b.get("unblocked_at"):
+            continue
+        when = b.get("blocked_at") or now_s
+        ver = bool(b.get("verified"))
+
+        def fn(c, norm=norm, when=when, ver=ver):
+            r = c.execute("SELECT id FROM sp_proposals WHERE caller_norm=? AND review_status IN ('PENDING_APPROVAL','APPROVED') AND COALESCE(exec_status,'') <> ?",
+                          (norm, "BLOCKED" if ver else "VERIFICATION_PENDING")).fetchone()
+            if not r:
+                return 0
+            if ver:
+                c.execute("UPDATE sp_proposals SET review_status='APPROVED', exec_status='BLOCKED', decided_by=?, decided_verified=0, decided_at=?, decision_note=?, blocked_at=?, verified_at=?, "
+                          "verification=?, result='verified blocked', updated_at=? WHERE id=?",
+                          ("auto-block (policy)", when, "blocked by the auto-block worker (worker ledger)", when, when, "verified: the worker found the number on the Ringba block list", now_s, r["id"]))
+            else:
+                c.execute("UPDATE sp_proposals SET review_status='APPROVED', exec_status='VERIFICATION_PENDING', decided_by=?, decided_at=?, decision_note=?, executed_at=?, updated_at=? WHERE id=?",
+                          ("auto-block (policy)", when, "sent by the auto-block worker; read-back still pending", when, now_s, r["id"]))
+            s16_audit(c, now_s, "auto-block (policy)", 0, "spam_ledger_block_applied", r["id"], f"{sp_mask(norm)} {'verified' if ver else 'pending'}")
+            return 1
+        changed += store._tx(fn)
+    if changed:
+        sp_queue_refresh(store)
+    return changed
+
+
 def _sp_turso_ledger():
     """A ledger on the Turso database, for the app's Auto-block tab. None when Turso is not configured."""
     if not (_cfg("TURSO_DATABASE_URL") and _cfg("TURSO_AUTH_TOKEN")):
@@ -17799,6 +17883,66 @@ def _sp_tab_auto(store, ident, now, full=False):
     _sp_auto_view(store, ident, now, full, snap, utc)
 
 
+def sp_call_date_text(v):
+    """A call's date for DISPLAY. Some sheet rows carry no year ('Oct 29 6:01 PM'): they are stored with a placeholder year, so show them in the current year (the year before if that would be in the future),
+    the same rule the dashboard uses. The stored value (which is part of the call's identity key) is never changed."""
+    import re as _re
+    m = _re.match(r"^(\d{1,4})-(\d{2})-(\d{2}) (\d{2}:\d{2}:\d{2})$", str(v or "").strip())
+    if not m:
+        return str(v or "")
+    y, mo, d, hms = int(m.group(1)), m.group(2), m.group(3), m.group(4)
+    if y >= 2000:
+        return f"{y:04d}-{mo}-{d} {hms}"
+    now = pd.Timestamp.now("UTC").tz_localize(None)
+    try:
+        t = pd.Timestamp(f"{now.year}-{mo}-{d} {hms}")
+        if t > now + pd.Timedelta(days=1):
+            t = t - pd.DateOffset(years=1)
+        return t.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(v)
+
+
+def sp_auto_frames(store, blocks, would, recent, full=False):
+    """The three tables of the Auto-block tab with DATES: when each number was blocked / flagged / logged (shown in SPAM_SHEET_TZ, default Asia/Dhaka, with the offset) and the date of its
+    latest spam call and the number of spam calls (read from this app's own incident records). -> (blocks_df, would_df, recent_df)"""
+    info = {}
+    for r in store._q("SELECT caller_norm, MAX(call_ts) AS last_call, MIN(call_ts) AS first_call, COUNT(*) AS n, MAX(publisher) AS pub FROM sp_incidents WHERE classification='CONFIRMED_SPAM' AND caller_norm<>'' GROUP BY caller_norm"):
+        info[r["caller_norm"]] = r
+    L = lambda n: sp_disp(n, full)
+
+    def enrich(df, norm_col="caller_norm"):
+        df = df.copy()
+        df["Last spam call"] = df[norm_col].map(lambda n: sp_call_date_text((info.get(n) or {"last_call": ""})["last_call"] or ""))
+        df["Spam calls"] = df[norm_col].map(lambda n: int((info.get(n) or {"n": 0})["n"] or 0))
+        return df
+    bdf = pd.DataFrame(blocks or [])
+    if len(bdf):
+        bdf = enrich(bdf)
+        bdf["Blocked on"] = bdf["blocked_at"].map(sp_local_ts)
+        bdf["Unblocked on"] = bdf["unblocked_at"].map(lambda v: sp_local_ts(v) if v else "") if "unblocked_at" in bdf.columns else ""
+        bdf["Verified"] = bdf["verified"].map(lambda v: "yes" if int(v or 0) else "not yet") if "verified" in bdf.columns else ""
+        bdf["Caller ID"] = bdf["caller_norm"].map(L)
+        bdf = bdf.rename(columns={"confidence": "Confidence", "publisher": "Publisher"})
+        keep = [c for c in ("Caller ID", "Blocked on", "Last spam call", "Spam calls", "Confidence", "Publisher", "Verified", "Unblocked on", "unblocked_by") if c in bdf.columns]
+        bdf = bdf[keep]
+    wdf = pd.DataFrame(would or [])
+    if len(wdf):
+        wdf = enrich(wdf)
+        wdf["First flagged"] = wdf["first_flagged"].map(sp_local_ts)
+        wdf["Caller ID"] = wdf["caller_norm"].map(L)
+        wdf = wdf.rename(columns={"confidence": "Confidence", "times": "Times flagged"})
+        wdf = wdf[[c for c in ("Caller ID", "First flagged", "Last spam call", "Spam calls", "Confidence", "Times flagged") if c in wdf.columns]]
+    rdf = pd.DataFrame(recent or [])
+    if len(rdf):
+        rdf = enrich(rdf)
+        rdf["Time"] = rdf["ts"].map(sp_local_ts)
+        rdf["Caller ID"] = rdf["caller_norm"].map(L)
+        rdf = rdf.rename(columns={"mode": "Mode", "outcome": "Outcome", "detail": "Detail", "confidence": "Confidence"})
+        rdf = rdf[[c for c in ("Time", "Caller ID", "Last spam call", "Outcome", "Mode", "Confidence", "Detail") if c in rdf.columns]]
+    return bdf, wdf, rdf
+
+
 def _sp_auto_view(store, ident, now, full, snap, utc):
     if snap.get("off"):
         st.info("Turso is not connected here, so the worker's log cannot be shown. Add TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to this app's Secrets (the same database the worker uses).")
@@ -17840,16 +17984,14 @@ def _sp_auto_view(store, ident, now, full, snap, utc):
     c1.metric("Blocked by the worker (active)", sum(1 for b in blocks if not b.get("unblocked_at")))
     c2.metric("Flagged in shadow mode, still not blocked", len(would))
     c3.metric("Ever flagged in shadow mode", d.get("would_total", 0))
+    bdf, wdf, rdf = sp_auto_frames(store, blocks, would, recent, full)
+    st.caption(f"Dates and times are shown in {sp_sheet_tz()} (SPAM_SHEET_TZ). 'Last spam call' is the call's own time from the sheet.")
     if would:
         st.markdown("**Shadow mode: these Caller IDs WOULD be blocked** (nothing was sent to Ringba). Check them, then switch the worker to live.")
-        wdf = pd.DataFrame(would)
-        wdf["caller_norm"] = wdf["caller_norm"].map(lambda x: sp_disp(x, full))
         st.dataframe(wdf, hide_index=True, width="stretch")
     if blocks:
         st.markdown("**Numbers the worker blocked**")
-        bdf = pd.DataFrame(blocks)
-        bdf["caller_norm"] = bdf["caller_norm"].map(lambda x: sp_disp(x, full))
-        st.dataframe(bdf.drop(columns=[c for c in ("block_id",) if c in bdf.columns]), hide_index=True, width="stretch")
+        st.dataframe(bdf, hide_index=True, width="stretch")
     st.markdown("**Unblock a number** (removes it from Ringba, then allow-lists it)")
     num = st.text_input("Caller ID to unblock (+1XXXXXXXXXX)", key="sp_unb_num")
     okc = st.checkbox("Yes, remove this one number from the Ringba block list", key="sp_unb_ok")
@@ -17861,8 +18003,6 @@ def _sp_auto_view(store, ident, now, full, snap, utc):
             _s9_say(r["ok"], r["message"])
     if recent:
         st.markdown("**Recent worker log**")
-        rdf = pd.DataFrame(recent)
-        rdf["caller_norm"] = rdf["caller_norm"].map(lambda x: sp_disp(x, full))
         st.dataframe(rdf, hide_index=True, width="stretch")
 
 
