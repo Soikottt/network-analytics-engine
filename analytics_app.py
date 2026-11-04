@@ -243,7 +243,7 @@ button[data-baseweb="tab"][aria-selected="true"] { background: var(--ui-card); c
   visibility: hidden !important;
 
 [data-testid="stHeader"] {
-  height: 0px !important;
+  height: 0 !important;
   background: transparent !important;
 }
 .block-container {
