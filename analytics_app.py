@@ -210,6 +210,9 @@ box-shadow:0 4px 14px rgba(15,23,42,.10)}
 @@NAV@@ [role="radiogroup"]>label p{font-size:.9rem!important;font-weight:600!important;margin:0!important;color:#334155!important}
 @@NAV@@ [role="radiogroup"]>label:has(input:checked){background:var(--ui-accent)!important;box-shadow:0 3px 10px rgba(37,99,235,.30)}
 @@NAV@@ [role="radiogroup"]>label:has(input:checked) *{color:#ffffff!important}
+.st-key-ui_refresh{position:absolute;top:8px;right:12px;width:auto!important;z-index:3}
+.st-key-ui_refresh button{padding:4px 12px;min-height:0;border-radius:10px;font-weight:600}
+@@NAV@@ .st-key-ui_nav_group{padding-right:120px}
 .st-key-ui_nav_group [role="radiogroup"]>label{background:#e3eaf5;text-transform:uppercase;letter-spacing:.04em}
 .st-key-ui_nav_group [role="radiogroup"]>label p{font-size:.78rem!important;font-weight:750!important}
 .st-key-ui_nav_group [role="radiogroup"]>label:has(input:checked){background:var(--ui-navy)!important}
@@ -229,6 +232,15 @@ def ui_topnav_css():
     return css
 
 
+UI_REFRESH_KEYS = ("sheet_loaded", "sp_scanned", "sp_autosync", "sp_notes_key", "sp_auto_snap", "sp_adopt_t", "sp_pub_sig")
+
+
+def ui_refresh_clear():
+    """The Refresh button: forget the loaded sheet and the per-page caches. The loader further down the page sees 'sheet_loaded' missing and fetches fresh data in this same run."""
+    for k in UI_REFRESH_KEYS:
+        st.session_state.pop(k, None)
+
+
 def ui_nav_top():
     """The two-row top menu. Returns the chosen page LABEL (ui_nav() maps it to the page key)."""
     groups = ui_topnav_groups()
@@ -238,6 +250,8 @@ def ui_nav_top():
         g = st.radio("Section", names, index=0, horizontal=True, key="ui_nav_group", label_visibility="collapsed")
         gi = names.index(g) if g in names else 0
         choice = st.radio("Navigate", groups[gi][1], index=0, horizontal=True, key=f"ui_nav_page_{gi}", label_visibility="collapsed")
+        if st.button("🔄 Refresh", key="ui_refresh", help="Reload the latest calls from the Google Sheet and re-check everything on this page."):
+            ui_refresh_clear()
     return choice
 
 
@@ -15438,6 +15452,7 @@ def tm_status_panel():
 # =====================================================================================================================
 from urllib.parse import parse_qs as _sp_parse_qs
 
+import functools
 SP_COLUMNS = ["Spam Status", "Spam Category", "Spam Confidence", "Spam Evidence", "Spam Incident ID",
               "Block Review Status", "Block Approved By", "Block Approved At", "Block Execution Status", "Blocked At"]
 SP_CLASSES = ("CONFIRMED_SPAM", "SUSPICIOUS", "NOT_SPAM", "NEEDS_REVIEW")
@@ -15533,7 +15548,11 @@ def sp_disp(norm, full=False):
 
 
 def sp_norm_ts(v):
-    s = str(v if v is not None else "").strip()
+    return _sp_norm_ts_s(str(v if v is not None else "").strip())
+
+
+@functools.lru_cache(maxsize=60000)
+def _sp_norm_ts_s(s):
     if not s:
         return ""
     try:
@@ -15916,7 +15935,7 @@ def sp_calls_for(store, norm, notes=None):
 
 
 @_sp_needs_store
-def sp_create_proposal(store, norm, now, hist=None, manual=False, ident=None):
+def sp_create_proposal(store, norm, now, hist=None, manual=False, ident=None, refresh=True):
     """(proposal_id | None, message). Idempotent: one open proposal per Caller ID (unique index). A rejected number is not re-proposed unless there is NEW evidence."""
     ident = ident or sp_sysid()
     ok, why, stats = sp_eligibility(store, norm, hist, manual=manual)
@@ -15944,7 +15963,8 @@ def sp_create_proposal(store, norm, now, hist=None, manual=False, ident=None):
         s16_audit(c, now_s, ident["label"], ident["verified"], "spam_proposal_created", pid, f"caller {sp_mask(norm)} risk {risk} confirmed {stats['n_confirmed']}")
         return pid, "created"
     r = store._tx(fn)
-    sp_queue_refresh(store)
+    if refresh:                                   # sp_scan passes False and refreshes ONCE at the end (recomputing every incident per proposal made the scan slow)
+        sp_queue_refresh(store)
     return r
 
 
@@ -15967,7 +15987,7 @@ def sp_scan(store, df, now, actor=None, tab_default=""):
     sp_expire(store, now)
     created, existing, skipped = 0, 0, {}
     for r in store._q("SELECT DISTINCT caller_norm FROM sp_incidents WHERE classification='CONFIRMED_SPAM' AND caller_norm <> ''"):
-        pid, how = sp_create_proposal(store, r["caller_norm"], now, hist)
+        pid, how = sp_create_proposal(store, r["caller_norm"], now, hist, refresh=False)
         if how == "created":
             created += 1
         elif how == "existing":
@@ -16246,6 +16266,17 @@ class SpRingbaAdapter(SpAdapter):
         return False
 
     last_block_id = None
+    _pre_items = None
+
+    def prime(self):
+        """Reads the block list ONCE for a batch; block() then uses it for its already-listed check (the read-back after each POST is always a fresh read)."""
+        try:
+            self._pre_items = list(self._list())
+        except SpRingbaError:
+            self._pre_items = None
+
+    def unprime(self):
+        self._pre_items = None
 
     def block(self, norm):
         if not re.fullmatch(r"\+1\d{10}", str(norm or "")):
@@ -16253,7 +16284,7 @@ class SpRingbaAdapter(SpAdapter):
         s = self._s()
         self.last_block_id = None
         try:
-            items = self._list()
+            items = self._pre_items if self._pre_items is not None else self._list()
             if self._present(items, norm):
                 try:
                     self.last_block_id = self.find_id(norm)
@@ -16273,6 +16304,8 @@ class SpRingbaAdapter(SpAdapter):
         if status >= 300:
             raise SpRingbaError("uncertain", f"Ringba answered HTTP {status}; the result is uncertain.")
         self.last_block_id = self._id_from_post(text)
+        if self._pre_items is not None:
+            self._pre_items.append({"phoneNumber": norm, "campaignId": s["campaign"] or ""})
         return "posted"
 
     @staticmethod
@@ -16812,6 +16845,9 @@ def sp_call_notes(df, full=False):
     sc, nc = pick("ShortSummary", "Short Summary", "Summary"), pick("Note", "Notes")
     if not sc and not nc:
         return {}
+    if c.get("qc"):                                         # only the calls that could be an incident (same test as sp_ingest): far fewer rows to key
+        qcs = df[c["qc"]].astype(str)
+        df = df[(qcs.str.contains(SPAM_PAT, case=False, na=False, regex=True) | qcs.str.contains(r"Spam Confidence:\s*(?:[6-9]\d|100)\s*%", case=False, na=False, regex=True)).to_numpy()]
     keys = sp_row_keys(df, c)
     sv = df[sc].astype(str).tolist() if sc else [""] * len(df)
     nv = df[nc].astype(str).tolist() if nc else [""] * len(df)
@@ -16845,11 +16881,32 @@ def sp_proposal_context(store, norms, notes, full=False):
 
 
 @_sp_needs_store
-def sp_incident_table(store, meta_url="", limit=1000, full=False, notes=None):
+def sp_search_callers(store, q):
+    """None = no search. Otherwise the set of Caller IDs matching ANY word of the search: 4+ digits match inside the number (paste several numbers, separated by space, comma or new line);
+    other words match publisher, buyer or campaign."""
+    toks = [t for t in re.split(r"[\s,;]+", str(q or "").strip()) if t]
+    if not toks:
+        return None
+    nums = [re.sub(r"\D", "", t) for t in toks if len(re.sub(r"\D", "", t)) >= 4]
+    words = [t.lower() for t in toks if len(re.sub(r"\D", "", t)) < 4]
+    out = set()
+    for r in store._q("SELECT DISTINCT caller_norm, LOWER(COALESCE(publisher,'') || ' ' || COALESCE(buyer,'') || ' ' || COALESCE(campaign,'')) AS txt FROM sp_incidents WHERE caller_norm <> ''"):
+        d = re.sub(r"\D", "", r["caller_norm"])
+        if any(n in d for n in nums) or any(w in (r["txt"] or "") for w in words):
+            out.add(r["caller_norm"])
+    return out
+
+
+def sp_incident_table(store, meta_url="", limit=1000, full=False, notes=None, query=""):
+    only = sp_search_callers(store, query)
+    if only is not None:
+        limit = max(int(limit), 20000)
     rows = store._q("SELECT i.*, p.review_status AS p_review, p.exec_status AS p_exec, p.id AS p_id FROM sp_incidents i LEFT JOIN sp_proposals p ON p.id = "
                     "(SELECT id FROM sp_proposals WHERE caller_norm = i.caller_norm ORDER BY created_at DESC, rowid DESC LIMIT 1) ORDER BY i.call_ts DESC LIMIT ?", (int(limit),))
     out = []
     for r in rows:
+        if only is not None and r["caller_norm"] not in only:
+            continue
         d = {"Incident": r["id"], "Call time": r["call_ts"], "Caller": sp_disp(r["caller_norm"], full) or "(missing)", "Spam Status": r["classification"]}
         if notes is not None:                                 # what the call was about, from the loaded sheet (blank when the call is not in the loaded data)
             nt = notes.get(r["call_key"], {})
@@ -16910,6 +16967,11 @@ def render_spam_page(df, available_columns, overrides, timeline):
         st.session_state["sp_summary"] = sp_scan(store, df, now, tab_default=tab_default)
         st.session_state["sp_scanned"] = fp
     sp_reconcile_stale(store, now)
+    if st.session_state.get("sp_auto_snap"):
+        try:
+            _sp_auto_adopt(store, now)                         # from the status the person already loaded: no network request to Turso here
+        except Exception:
+            pass
     if c2.button("Sync spam status to the Google Sheet", key="sp_sync_btn") or (sp_sheet_sync_on() and st.session_state.get("sp_autosync") != fp and meta.get("url")):
         st.session_state["sp_autosync"] = fp
         try:
@@ -16932,13 +16994,15 @@ def render_spam_page(df, available_columns, overrides, timeline):
             st.session_state["sp_notes"] = {}
         st.session_state["sp_notes_key"] = nkey
     notes = st.session_state.get("sp_notes") or {}
+    query = st.text_input("🔎 Search number(s), publisher, buyer or campaign", key="sp_q", placeholder="paste one or many numbers (any part, 4+ digits) or a publisher name",
+                          help="Applies to the Incidents and Block proposals tables. Several numbers can be separated by space, comma or new line.")
     t_inc, t_prop, t_cal, t_pub, t_allow, t_sync, t_cap, t_auto = st.tabs(["Incidents", "Block proposals", "Callers", "Publishers & export", "Allowlist", "Sheet sync", "Ringba capability", "Auto-block"])
     with t_inc:
-        it = sp_incident_table(store, meta.get("url", ""), full=full, notes=notes)
+        it = sp_incident_table(store, meta.get("url", ""), full=full, notes=notes, query=query)
         st.caption("Short summary and Note come from the sheet rows that are loaded now (blank = that call is not in the loaded data). 'Why flagged' is the AI QC evidence. Use them to check what each call was about before approving a block.")
         st.dataframe(it, hide_index=True, width="stretch")
     with t_prop:
-        _sp_tab_proposals(store, df, ident, now, full, notes)
+        _sp_tab_proposals(store, df, ident, now, full, notes, query)
     with t_cal:
         rc = pd.DataFrame(store._q("SELECT caller_norm, COUNT(*) AS spam_calls, SUM(classification='CONFIRMED_SPAM') AS confirmed, SUM(classification='SUSPICIOUS') AS suspicious, "
                                    "COUNT(DISTINCT publisher) AS publishers, MAX(call_ts) AS last_call FROM sp_incidents WHERE caller_norm<>'' GROUP BY caller_norm ORDER BY confirmed DESC, spam_calls DESC LIMIT 300"))
@@ -17024,30 +17088,85 @@ def _sp_bulk_panel(store, ident, now):
                 _s9_say(not r["stopped"], r["message"], info=True)
 
 
-def _sp_tab_proposals(store, df, ident, now, full=False, notes=None):
+def _sp_selected_panel(store, ident, now, sel_ids, lst):
+    """Approve / reject / run the ticked proposals. Same gateway and same checks as one at a time: every proposal is decided, audited and verified on its own."""
+    sub = lst[lst["id"].isin(sel_ids)]
+    pend = list(sub[sub["review_status"] == "PENDING_APPROVAL"]["id"])
+    ready = list(sub[(sub["review_status"] == "APPROVED") & (sub["exec_status"].isin(["", "NOT_EXECUTED", "DRY_RUN", "FAILED", "MANUAL_ACTION_REQUIRED"]))]["id"])
+    st.markdown(f"**{len(sel_ids)} selected** · {len(pend)} pending approval · {len(ready)} approved and ready to run")
+    if ident["level"] != "operator":
+        st.info("Approving and running blocks needs the operator level: set ALERT_ACTION_PASSWORD in Secrets, then enter it under 'Who is acting?'.")
+        return
+    note = st.text_input("Decision note (optional)", key="sp_sel_note")
+    w1 = f"APPROVE {len(pend)}"
+    t1 = st.text_input(f"Type {w1} to approve the {len(pend)} pending one(s)", key="sp_sel_t1")
+    c1, c2 = st.columns(2)
+    if c1.button("Approve selected", key="sp_sel_ap"):
+        if not pend:
+            st.info("None of the selected proposals is pending.")
+        elif t1.strip() != w1:
+            st.warning(f"Not approved. Type exactly: {w1}")
+        else:
+            r = sp_decide_many(store, pend, True, ident, note or "bulk approval (selected)", now)
+            _s9_say(r["done"] > 0, r["message"] + (" Reasons: " + "; ".join(f"{k} x{v}" for k, v in r["reasons"].items()) if r["reasons"] else ""))
+    w2 = f"REJECT {len(pend)}"
+    t2 = st.text_input(f"Type {w2} to reject the {len(pend)} pending one(s)", key="sp_sel_t2")
+    if c2.button("Reject selected", key="sp_sel_rj"):
+        if not pend:
+            st.info("None of the selected proposals is pending.")
+        elif t2.strip() != w2:
+            st.warning(f"Not rejected. Type exactly: {w2}")
+        else:
+            r = sp_decide_many(store, pend, False, ident, note or "bulk rejection (selected)", now)
+            _s9_say(r["done"] > 0, r["message"])
+    live = not sp_dry_run()
+    run_ids = ready[:25]
+    w3 = f"BLOCK {len(run_ids)}"
+    t3 = st.text_input((f"Type {w3} to run {len(run_ids)} block(s) in Ringba now" if live else f"Type {w3} to run {len(run_ids)} DRY RUN(s) (nothing is sent to Ringba)") + " (max 25 per click)", key="sp_sel_t3")
+    if st.button("Run selected (LIVE)" if live else "Run selected (dry run)", key="sp_sel_ex"):
+        if not run_ids:
+            st.info("None of the selected proposals is approved and waiting.")
+        elif t3.strip() != w3:
+            st.warning(f"Not run. Type exactly: {w3}")
+        else:
+            r = sp_execute_many(store, run_ids, ident, now, limit=25)
+            _s9_say(not r["stopped"], r["message"], info=True)
+
+
+def _sp_tab_proposals(store, df, ident, now, full=False, notes=None, query=""):
     cn = st.radio("Show", ["Pending approval", "Approved", "Rejected", "All"], horizontal=True, key="sp_show")
     rv = {"Pending approval": ["PENDING_APPROVAL"], "Approved": ["APPROVED"], "Rejected": ["REJECTED"], "All": None}[cn]
     _sp_bulk_panel(store, ident, now)
-    lst = sp_list(store, rv)
+    lst = sp_list(store, rv, limit=5000)
+    only = sp_search_callers(store, query)
+    if only is not None and len(lst):
+        lst = lst[lst["caller_norm"].isin(only)].reset_index(drop=True)
     if not len(lst):
-        st.info("No proposals here.")
+        st.info("No proposals here." if only is None else "No proposals match the search.")
         return
+    if only is not None:
+        st.caption(f"{len(lst):,} proposal(s) match the search.")
     show = lst[["id", "caller_norm", "review_status", "exec_status", "risk_score", "n_confirmed", "n_calls", "decided_by", "decided_at", "expires_at"]].copy()
     ctx = sp_proposal_context(store, list(lst["caller_norm"]), notes, full)
     show["Latest call summary"] = lst["caller_norm"].map(lambda n: ctx.get(n, ("", ""))[0][:160])
     show["Why flagged (QC evidence)"] = lst["caller_norm"].map(lambda n: ctx.get(n, ("", ""))[1][:160])
     show["caller_norm"] = show["caller_norm"].map(lambda x: sp_disp(x, full))
     ids = list(lst["id"])
-    sel = None
-    try:                                                         # click a row to choose it (Streamlit 1.35+); older versions fall back to the drop-down
-        ev = st.dataframe(show, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="sp_tbl")
-        rows_ = list(getattr(getattr(ev, "selection", None), "rows", []) or [])
-        sel = rows_[0] if rows_ and 0 <= rows_[0] < len(ids) else None
+    sel_ids = []
+    try:                                                         # tick rows (Streamlit 1.35+); older versions fall back to the drop-down
+        ev = st.dataframe(show, hide_index=True, width="stretch", on_select="rerun", selection_mode="multi-row", key="sp_tbl")
+        rows_ = [r for r in list(getattr(getattr(ev, "selection", None), "rows", []) or []) if 0 <= r < len(ids)]
+        sel_ids = [ids[r] for r in rows_]
     except TypeError:
         st.dataframe(show, hide_index=True, width="stretch")
-    if sel is not None:
-        pid = ids[sel]
-        st.caption("Selected from the table. Click the same row again to clear it and use the drop-down instead.")
+    if st.checkbox(f"Select all {min(len(ids), 500):,} shown" + (" (the first 500)" if len(ids) > 500 else ""), key="sp_selall"):
+        sel_ids = ids[:500]
+    if len(sel_ids) >= 2:
+        _sp_selected_panel(store, ident, now, sel_ids, lst)
+        return
+    if len(sel_ids) == 1:
+        pid = sel_ids[0]
+        st.caption("Selected from the table. Tick more rows to act on several at once, or untick it to use the drop-down.")
     else:
         st.caption("Click a row in the table to choose a proposal, or pick one here:")
         pid = st.selectbox("Proposal", ids, key="sp_pick")
@@ -17171,8 +17290,10 @@ def sp_publisher_table(store, df, publisher_col=None, date_col=None):
     totals = {}
     if publisher_col and publisher_col in df.columns:
         if date_col and date_col in df.columns and len(df):
-            ts = [sp_norm_ts(v) for v in df[date_col]]
-            ts = [t for t in ts if t]
+            u = df[date_col].astype(str).str.strip().reset_index(drop=True)
+            u = u[u != ""]
+            parsed = pd.to_datetime(u, errors="coerce", format="mixed").dropna()      # vectorised: only the earliest and latest text go through sp_norm_ts
+            ts = [t for t in (sp_norm_ts(u[parsed.idxmin()]), sp_norm_ts(u[parsed.idxmax()])) if t] if len(parsed) else []
             if ts and len(inc):
                 inc = inc[(inc["call_ts"] >= min(ts)) & (inc["call_ts"] <= max(ts))]
         totals = df[publisher_col].astype(str).str.strip().value_counts().to_dict()
@@ -17195,7 +17316,10 @@ def _sp_tab_publishers(store, df, ident, now, full):
     pub = next((c for c in df.columns if str(c).strip().lower() == "publisher"), None)
     dte = next((c for c in df.columns if str(c).strip().lower() == "call date"), None)
     st.markdown("**Spam by publisher** (reporting only: this app never blocks a publisher or a campaign)")
-    pt = sp_publisher_table(store, df, pub, dte)
+    sig = f"{len(df)}|{hash(tuple(df.columns))}|{store._q('SELECT COUNT(*) n, MAX(last_seen) m FROM sp_incidents')[0]['n']}"
+    if st.session_state.get("sp_pub_sig") != sig:                    # the table is a full pass over every incident: not recomputed on every click
+        st.session_state["sp_pub_tbl"], st.session_state["sp_pub_sig"] = sp_publisher_table(store, df, pub, dte), sig
+    pt = st.session_state["sp_pub_tbl"]
     st.dataframe(pt, hide_index=True, width="stretch")
     st.caption("Counts come from the stored incidents (SQL). Spam rate = confirmed spam calls / all calls of that publisher in the data currently loaded; the call count is shown so a small sample is visible.")
     st.markdown("**Export spam numbers**")
@@ -17219,15 +17343,15 @@ def _sp_tab_publishers(store, df, ident, now, full):
 # The rule set is the one the person chose: a CONFIRMED_SPAM call with confidence >= SPAM_AUTO_MIN_CONF (default 95) -> that ONE Caller ID is blocked, with
 #   * kill switch      SPAM_AUTO must be "true" (default OFF);
 #   * shadow mode      SPAM_AUTO_MODE="shadow" (default) only WRITES what it WOULD block; "live" also needs SPAM_DRY_RUN="false";
-#   * limits           SPAM_AUTO_PER_RUN (25) and SPAM_AUTO_PER_DAY (100) real attempts; the rest stay on hold for a person;
+#   * limits           SPAM_AUTO_PER_RUN (100) and SPAM_AUTO_PER_DAY (2000) real attempts, NEWEST spam first, so the backlog drains from the latest to the oldest; the rest wait for the next run;
 #   * unchanged rules  one Caller ID only, allow-list, QUALIFIED history, rejected numbers, Medi-Cal / insurance rule (it is inside the classifier), Ringba read-back before BLOCKED;
 #   * one run at a time (lease lock) and every action in sw_log.
 # The worker and the app do NOT share the local database: the worker writes sw_* tables in Turso, the app reads them. The worker reads the app's allow-list / rejected / blocked
 # numbers from Turso (sp_* mirror tables) and skips them.
 # ---------------------------------------------------------------------------------------------------------------------
 SP_AUTO_MIN_CONF = 95
-SP_AUTO_PER_RUN = 25
-SP_AUTO_PER_DAY = 600
+SP_AUTO_PER_RUN = 100
+SP_AUTO_PER_DAY = 2000
 SP_AUTO_MAX_FAILS = 3
 SW_DDL = [
     "CREATE TABLE IF NOT EXISTS sw_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, run_id TEXT, mode TEXT, caller_norm TEXT, proposal_id TEXT, confidence INTEGER, outcome TEXT, detail TEXT)",
@@ -17347,6 +17471,18 @@ class SwLedger:
     def state(self):
         return {r["k"]: r for r in self._run([("SELECT k, v, updated_at FROM sw_state", ())])[0]}
 
+    def snapshot(self, limit=300):
+        """Everything the Auto-block tab shows, in ONE round trip to Turso (the tab used to ask five times). The tables are created in the same request if they do not exist yet."""
+        n = len(SW_DDL)
+        r = self._run([(q, ()) for q in SW_DDL] + [
+            ("SELECT k, v, updated_at FROM sw_state", ()),
+            ("SELECT * FROM sw_blocks ORDER BY blocked_at DESC", ()),
+            ("SELECT ts, mode, caller_norm, proposal_id, confidence, outcome, detail FROM sw_log ORDER BY id DESC LIMIT ?", (int(limit),)),
+            ("SELECT caller_norm, MAX(confidence) AS confidence, MIN(ts) AS first_flagged, COUNT(*) AS times FROM sw_log WHERE outcome='WOULD_BLOCK' AND caller_norm NOT IN "
+             "(SELECT caller_norm FROM sw_blocks) GROUP BY caller_norm ORDER BY confidence DESC, first_flagged LIMIT 500", ()),
+            ("SELECT COUNT(DISTINCT caller_norm) AS n FROM sw_log WHERE outcome='WOULD_BLOCK'", ())])
+        return {"state": {x["k"]: x for x in r[n]}, "blocks": r[n + 1], "recent": r[n + 2], "would": r[n + 3], "would_total": int(r[n + 4][0]["n"]) if r[n + 4] else 0}
+
     def recent(self, limit=300):
         return self._run([("SELECT ts, mode, caller_norm, proposal_id, confidence, outcome, detail FROM sw_log ORDER BY id DESC LIMIT ?", (int(limit),))])[0]
 
@@ -17373,13 +17509,24 @@ def sp_auto_import_app_state(store, client):
             skip.add(r["caller_norm"])
     except Exception:
         pass
+    try:                                                    # decisions a person (or the app) already made: copied in so the sheet rows the worker writes agree with the app
+        cols = [r["name"] for r in store._q("PRAGMA table_info(sp_proposals)")]
+        for pr in client.query("SELECT * FROM sp_proposals WHERE review_status <> 'PENDING_APPROVAL'"):
+            use = [k for k in pr if k in cols]
+            try:
+                store._tx(lambda c, pr=pr, use=use: c.execute("INSERT OR REPLACE INTO sp_proposals(" + ",".join(use) + ") VALUES (" + ",".join("?" * len(use)) + ")", tuple(pr[k] for k in use)))
+            except Exception:
+                pass
+    except Exception:
+        pass
     return skip
 
 
 def sp_auto_candidates(store, skip, conf_min):
     rows = store._q("SELECT p.id, p.caller_norm, (SELECT MAX(i.confidence) FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM') AS conf, "
-                    "(SELECT i.publisher FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM' ORDER BY i.call_ts DESC LIMIT 1) AS publisher "
-                    "FROM sp_proposals p WHERE p.review_status='PENDING_APPROVAL' ORDER BY conf DESC, p.created_at, p.id")
+                    "(SELECT i.publisher FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM' ORDER BY i.call_ts DESC LIMIT 1) AS publisher, "
+                    "(SELECT MAX(i.call_ts) FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM') AS last_call "
+                    "FROM sp_proposals p WHERE p.review_status='PENDING_APPROVAL' ORDER BY last_call DESC, conf DESC, p.id")   # NEWEST spam first: the latest calls are never stuck behind the old backlog
     out = []
     for r in rows:
         norm = r["caller_norm"]
@@ -17396,23 +17543,24 @@ def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None):
     """One automatic pass over what sp_scan() already found. NEVER touches Ringba in shadow mode. Returns a summary dict (also stored in sw_state)."""
     now_s = s16_ts(now)
     run_id = run_id or ("RUN-" + hashlib.sha1((now_s + str(id(store))).encode()).hexdigest()[:8])
-    res = {"enabled": sp_auto_on(), "run_id": run_id, "ts": now_s, "mode": "", "candidates": 0, "would_block": 0, "blocked": 0, "pending": 0, "failed": 0, "held_by_limit": 0, "verified_later": 0, "note": ""}
+    res = {"enabled": sp_auto_on(), "run_id": run_id, "ts": now_s, "mode": "", "candidates": 0, "would_block": 0, "blocked": 0, "pending": 0, "failed": 0, "held_by_limit": 0, "verified_later": 0, "already_flagged": 0, "note": ""}
     if not res["enabled"]:
         res["note"] = "SPAM_AUTO is off (kill switch). Nothing was done."
         return res
     mode, mnote = sp_auto_mode()
     res["mode"], res["note"] = mode, mnote
     ledger.init()
-    if not ledger.acquire(run_id, now_s):
+    if not ledger.acquire(run_id, now_s, 15):
         res["note"] = "Another run is in progress; this one did nothing."
         res["skipped"] = True
         return res
     ident = sp_auto_ident()
+    ad = None
     try:
         conf_min = sp_auto_min_conf()
         per_run, per_day = sp_auto_limits()
         skip = set(skip or ()) | ledger.blocked_set()
-        ad = adapter or sp_adapter() if mode == "live" else adapter
+        ad = (adapter or sp_adapter()) if mode == "live" else adapter
         if mode == "live" and ad is not None:                          # blocks sent earlier whose read-back did not work: try the read-back again, never POST again
             try:
                 ok_v, _w = (ad.verify_capability() if hasattr(ad, "verify_capability") else ad.capability())
@@ -17429,6 +17577,8 @@ def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None):
             except Exception:
                 pass
         cands = sp_auto_candidates(store, skip, conf_min)
+        if mode == "live" and hasattr(ad, "prime"):
+            ad.prime()
         res["candidates"] = len(cands)
         used = ledger.live_attempts_today(now_s[:10]) if mode == "live" else 0
         budget = max(0, min(per_run, per_day - used))
@@ -17439,6 +17589,8 @@ def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None):
                 if not ledger.shadow_seen(norm):
                     ledger.log(now_s, run_id, mode, norm, pid, conf, "WOULD_BLOCK", f"confidence {conf} >= {conf_min}; shadow mode, nothing sent to Ringba")
                     res["would_block"] += 1
+                else:
+                    res["already_flagged"] += 1                         # flagged by an earlier run: listed once, not again
                 continue
             if done >= budget:
                 res["held_by_limit"] += 1
@@ -17475,6 +17627,8 @@ def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None):
                 break
         ledger.set_state("last_run", res, now_s)
     finally:
+        if mode == "live" and ad is not None and hasattr(ad, "unprime"):
+            ad.unprime()
         ledger.release(run_id)
     return res
 
@@ -17549,15 +17703,18 @@ def sp_adopt_worker_blocks(store, rows, now=None, adapter=None):
     if not ok:
         res["skipped"] = len(rows or [])
         return res
-    for b in rows or []:
-        norm = b.get("caller_norm")
-        if not norm or b.get("unblocked_at"):
-            continue
-        have = store._q("SELECT 1 FROM sp_proposals WHERE caller_norm=? AND exec_status='BLOCKED'", (norm,))
-        if have:
-            continue
+    todo = [b for b in (rows or []) if b.get("caller_norm") and not b.get("unblocked_at")
+            and not store._q("SELECT 1 FROM sp_proposals WHERE caller_norm=? AND exec_status='BLOCKED'", (b["caller_norm"],))]
+    items = None
+    if todo and hasattr(ad, "_list") and hasattr(ad, "_present"):
         try:
-            found = ad.verify(norm)
+            items = ad._list()                                   # ONE read of the Ringba list for the whole batch (not one per number)
+        except Exception:
+            items = None
+    for b in todo:
+        norm = b.get("caller_norm")
+        try:
+            found = ad._present(items, norm) if items is not None else ad.verify(norm)
         except Exception:
             found = None
         if found is not True:
@@ -17596,52 +17753,93 @@ def sp_adopt_worker_blocks(store, rows, now=None, adapter=None):
 
 def _sp_turso_ledger():
     """A ledger on the Turso database, for the app's Auto-block tab. None when Turso is not configured."""
-    if not tm_configured():
+    if not (_cfg("TURSO_DATABASE_URL") and _cfg("TURSO_AUTH_TOKEN")):
         return None
     return SwLedger(client=TursoClient(_cfg("TURSO_DATABASE_URL"), _cfg("TURSO_AUTH_TOKEN"), timeout=_sp_int("TURSO_TIMEOUT", 10, 3, 60)))
+
+
+def _sp_auto_adopt(store, now):
+    """Brings worker blocks into this app's own records (each re-verified on the Ringba list) from the status the person already loaded. No Turso request here."""
+    snap = st.session_state.get("sp_auto_snap") or {}
+    d = snap.get("data") or {}
+    if not d.get("blocks") or st.session_state.get("sp_adopt_t") == snap.get("t"):
+        return None
+    st.session_state["sp_adopt_t"] = snap.get("t")
+    try:
+        return sp_adopt_worker_blocks(store, d["blocks"], now, sp_adapter())
+    except Exception:
+        return None
 
 
 def _sp_tab_auto(store, ident, now, full=False):
     mode, mnote = sp_auto_mode()
     per_run, per_day = sp_auto_limits()
     st.write(f"**Auto-block (this app's view; the worker does the blocking):** {'ON' if sp_auto_on() else 'OFF'} · **Mode:** {mode.upper()} · **Confidence at or above:** {sp_auto_min_conf()} · **Limits:** {per_run} per run, {per_day} per day")
-    st.caption(mnote + " These settings are read from the Secrets of the WORKER; the values shown here are this app's own Secrets, so keep both the same.")
-    led = _sp_turso_ledger()
-    if led is None:
+    st.caption(mnote + " These settings are read from the Secrets of the WORKER; the values shown here are this app's own Secrets, so keep both the same. "
+               "The worker's log is read from Turso only when you press the button (so the page stays fast).")
+    if st.button("Load / refresh worker status", key="sp_auto_load"):
+        led = _sp_turso_ledger()
+        if led is None:
+            snap = {"off": True}
+        else:
+            try:
+                snap = {"data": led.snapshot()}
+            except Exception as exc:
+                snap = {"error": type(exc).__name__}
+        snap["t"] = time.time()
+        st.session_state["sp_auto_snap"] = snap
+        r_ad = _sp_auto_adopt(store, now)
+        if r_ad and r_ad.get("adopted"):
+            st.success(f"{r_ad['adopted']} number(s) blocked by the worker were brought into this app (each one re-checked on the Ringba block list).")
+    snap = st.session_state.get("sp_auto_snap")
+    if not snap:
+        st.info("Press 'Load / refresh worker status' to see what the worker did.")
+        return
+    utc = pd.Timestamp.now("UTC").tz_localize(None)       # the worker stores UTC times: compare with the real UTC clock, not the report time zone
+    _sp_auto_view(store, ident, now, full, snap, utc)
+
+
+def _sp_auto_view(store, ident, now, full, snap, utc):
+    if snap.get("off"):
         st.info("Turso is not connected here, so the worker's log cannot be shown. Add TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to this app's Secrets (the same database the worker uses).")
         return
-    try:
-        led.init()
-        state = led.state()
-        blocks = led.blocks()
-        recent = led.recent(300)
-        would = led.would_block()
-    except Exception as exc:
-        st.warning(f"Could not read the worker's log from Turso ({type(exc).__name__}).")
+    if snap.get("error") or not snap.get("data"):
+        st.warning(f"Could not read the worker's log from Turso ({snap.get('error', 'no data')}).")
         return
-    lr = state.get("last_run")
-    if lr:
+    d = snap["data"]
+    state, blocks, recent, would = d["state"], d["blocks"], d["recent"], d["would"]
+
+    def age(row):
         try:
-            age = (pd.Timestamp(now) - pd.Timestamp(lr["updated_at"])).total_seconds() / 60
+            return (utc - pd.Timestamp(row["updated_at"])).total_seconds() / 60
         except Exception:
-            age = None
-        d = {}
-        try:
-            d = json.loads(lr["v"])
-        except Exception:
-            pass
-        st.write(f"**Worker last ran:** {lr['updated_at']}" + (f" ({age:.0f} min ago)" if age is not None else "") + f" · mode {d.get('mode', '?')} · candidates {d.get('candidates', 0)} · would block {d.get('would_block', 0)} · blocked {d.get('blocked', 0)} · held by limit {d.get('held_by_limit', 0)}")
-        if age is not None and age > 30:
-            st.warning("The worker has not reported for more than 30 minutes. Check that it is running (and that the Apps Script trigger is on).")
+            return None
+    seen, lr = state.get("worker_seen"), state.get("last_run")
+    if seen:
+        a = age(seen)
+        st.write(f"**Worker alive:** last contact {seen['updated_at']} UTC" + (f" ({max(0, a):.0f} min ago)" if a is not None else ""))
+        if a is not None and a > 30:
+            st.warning("The worker has not reported for more than 30 minutes. Check that it is running (Render logs) and that the Apps Script trigger is on.")
     else:
         st.warning("The worker has not reported yet.")
+    if lr:
+        try:
+            x = json.loads(lr["v"])
+        except Exception:
+            x = {}
+        a = age(lr)
+        st.write(f"**Last full run:** {lr['updated_at']} UTC" + (f" ({max(0, a):.0f} min ago)" if a is not None else "") + f" · mode {x.get('mode', '?')} · candidates {x.get('candidates', 0)} · newly flagged this run {x.get('would_block', 0)} · blocked this run {x.get('blocked', 0)} · waiting for the next run {x.get('held_by_limit', 0)}")
+    err = state.get("last_error")
+    if err and str(err.get("v") or "").strip():
+        st.error("The worker's last error: " + str(err["v"])[:300])
     ad = sp_adapter()
-    if blocks and st.button("Bring the worker's blocks into this app (proposals table and Sheet)", key="sp_adopt_btn"):
+    if blocks and st.button("Bring the worker's blocks into this app now", key="sp_adopt_btn"):
         r = sp_adopt_worker_blocks(store, blocks, now, ad)
         st.success(f"{r['adopted']} number(s) adopted (each one re-checked on the Ringba block list), {r['skipped']} not confirmed.")
-    c1, c2 = st.columns(2)
-    c1.metric("Active blocks by the worker", sum(1 for b in blocks if not b.get("unblocked_at")))
-    c2.metric("Flagged in shadow mode, not blocked", len(would))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Blocked by the worker (active)", sum(1 for b in blocks if not b.get("unblocked_at")))
+    c2.metric("Flagged in shadow mode, still not blocked", len(would))
+    c3.metric("Ever flagged in shadow mode", d.get("would_total", 0))
     if would:
         st.markdown("**Shadow mode: these Caller IDs WOULD be blocked** (nothing was sent to Ringba). Check them, then switch the worker to live.")
         wdf = pd.DataFrame(would)
@@ -17659,7 +17857,7 @@ def _sp_tab_auto(store, ident, now, full=False):
         if not okc:
             st.warning("Tick the box first.")
         else:
-            r = sp_unblock(store, num, ident, now, adapter=ad, ledger=led)
+            r = sp_unblock(store, num, ident, now, adapter=ad, ledger=_sp_turso_ledger())
             _s9_say(r["ok"], r["message"])
     if recent:
         st.markdown("**Recent worker log**")
