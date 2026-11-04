@@ -434,11 +434,11 @@ def ui_nav_css():
         if sec:
             out.append(f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx}){{margin-top:26px}}'
                        f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx})::before{{content:"{sec}";position:absolute;top:-19px;left:4px;'
-                       f'font-size:.68rem;font-weight:750;letter-spacing:.12em;color:#7c8fb0}}')
+                       f'font-size:.68rem;font-weight:750;letter-spacing:.12em;color:#7c8fb0;}}')
         elif idx > 1:
-            out.append(f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx}){{margin-top:14px;border-top:1px solid rgba(255,255,255,.1);border-radius:0 0 10px 10px}}')
+            out.append(f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx}){{margin-top:14px;border-top:1px solid rgba(255,255,255,.1);border-radius:0 0 10px 10px;}}')
         idx += len(items)
-    out.append('[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child(1){margin-top:22px}')
+    out.append('[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child(1){margin-top:22px;}')
     return "".join(out)
     
 UI_REFRESH_KEYS = ("sheet_loaded", "sp_scanned", "sp_autosync", "sp_notes_key", "sp_auto_snap", "sp_adopt_t", "sp_pub_sig")
