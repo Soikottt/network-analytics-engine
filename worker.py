@@ -88,7 +88,12 @@ def open_client(core):
     raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "")
     if not raw:
         raise RuntimeError("GCP_SERVICE_ACCOUNT_JSON is not set.")
-    return gspread.service_account_from_dict(json.loads(raw))
+    gc = gspread.service_account_from_dict(json.loads(raw))
+    try:
+        gc.set_timeout(int(float(os.environ.get("SHEETS_TIMEOUT", "60"))))     # a Google call that hangs must not block every later run
+    except Exception:
+        pass
+    return gc
 
 
 def load_frame(core):
@@ -115,7 +120,7 @@ def load_frame(core):
             titles.append(ws.title)
     if not frames:
         raise RuntimeError("The sheet has no data rows.")
-    return core["unify_header_aliases"](pd.concat(frames, ignore_index=True).fillna("")), " + ".join(titles)
+    return core["unify_header_aliases"](pd.concat(frames, ignore_index=True).fillna("")), " + ".join(titles), ss
 
 
 def turso_client(core):
@@ -128,7 +133,7 @@ def turso_client(core):
 def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None):
     """-> summary dict. Never raises: an error is logged and stored in sw_state (scrubbed)."""
     pd = core["pd"]
-    now = now if now is not None else pd.Timestamp.now()
+    now = now if now is not None else pd.Timestamp.now("UTC").tz_localize(None)       # always UTC: the app compares against the real UTC clock
     out = {"why": why, "ok": False}
     try:
         client = client or turso_client(core)
@@ -142,12 +147,21 @@ def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None)
         store = core["S9Store"](":memory:")
         core["sp_init"](store)
         skip = core["sp_auto_import_app_state"](store, client)               # the app's allow-list / rejected / blocked numbers
-        df, tabs = frame if frame is not None else load_frame(core)
+        df, tabs, ss = (tuple(frame) + (None,))[:3] if frame is not None else load_frame(core)
         scan = core["sp_scan"](store, df, now, tab_default=tabs)
         res = core["sp_auto_run"](store, ledger, now, adapter=adapter, skip=skip)
         out.update(ok=True, scan={k: scan.get(k) for k in ("calls", "incidents", "proposals_created") if k in scan}, result=res)
+        if ss is not None and core["sp_sheet_sync_on"]():                     # the sheet columns are filled by the worker itself, so they do not wait for someone to open the app
+            try:
+                sy = core["sp_sheet_sync"](store, ss, now, default_tab=tabs.split(" + ")[0], max_incidents=20000)
+                out["sheet"] = {k: sy.get(k) for k in ("ok", "written", "unchanged", "pending", "error")}
+                ledger.set_state("last_sheet_sync", out["sheet"], now_s)
+                log(f"sheet sync: {sy.get('written', 0)} row(s) written, {sy.get('unchanged', 0)} unchanged, {sy.get('pending', 0)} pending" + ("" if sy.get("ok") else f" - FAILED: {sy.get('error')}"))
+            except Exception as exc:
+                out["sheet"] = {"ok": False, "error": f"{type(exc).__name__}"}
+                log("sheet sync failed: " + type(exc).__name__)
         ledger.set_state("last_error", "", now_s)
-        log(f"run ({why}): mode {res.get('mode')}, candidates {res.get('candidates')}, would-block {res.get('would_block')}, blocked {res.get('blocked')}, held {res.get('held_by_limit')}. {res.get('note', '')}")
+        log(f"run ({why}): mode {res.get('mode')}, candidates {res.get('candidates')} (newly flagged {res.get('would_block')}, already flagged earlier {res.get('already_flagged')}), blocked {res.get('blocked')}, held by limit {res.get('held_by_limit')}. {res.get('note', '')}")
     except Exception as exc:
         msg = _scrub(f"{type(exc).__name__}: {exc}")[:300]
         out["error"] = msg
@@ -163,30 +177,39 @@ def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None)
 # service
 # ---------------------------------------------------------------------------------------------------------------------
 class Runner:
-    """Coalesces triggers: at most one run at a time plus ONE queued follow-up, however many requests arrive."""
+    """Coalesces triggers: at most one run at a time plus ONE queued follow-up, however many requests arrive.
+    Watchdog: a run that has lasted longer than max_run seconds (default 600) is treated as stuck, and the next trigger starts a fresh run instead of queueing behind it forever."""
 
-    def __init__(self, core, run=run_once):
+    def __init__(self, core, run=run_once, max_run=None):
         self.core, self.run, self.lock = core, run, threading.Lock()
-        self.running, self.again, self.last = False, False, {}
+        self.max_run = float(os.environ.get("WORKER_MAX_RUN", "600")) if max_run is None else max_run
+        self.running, self.again, self.last, self.started, self.gen = False, False, {}, 0.0, 0
 
     def trigger(self, why="request"):
         with self.lock:
             if self.running:
-                self.again = True
-                return "queued"
-            self.running = True
-        threading.Thread(target=self._loop, args=(why,), daemon=True).start()
+                if time.time() - self.started <= self.max_run:
+                    self.again = True
+                    return "queued"
+                log(f"the previous run has lasted more than {int(self.max_run)} s: treated as stuck, starting a new run")
+            self.running, self.started, self.again = True, time.time(), False
+            self.gen += 1
+            gen = self.gen
+        threading.Thread(target=self._loop, args=(why, gen), daemon=True).start()
         return "started"
 
-    def _loop(self, why):
+    def _loop(self, why, gen):
         while True:
-            self.last = self.run(self.core, why)
-            self.last["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            res = self.run(self.core, why)
             with self.lock:
+                if gen != self.gen:                      # a newer run replaced this (stuck) one: stop quietly
+                    return
+                self.last = res
+                self.last["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 if not self.again:
                     self.running = False
                     return
-                self.again, why = False, "follow-up"
+                self.again, why, self.started = False, "follow-up", time.time()
 
 
 def make_handler(runner, token):
@@ -222,8 +245,11 @@ def make_handler(runner, token):
             if not token:
                 return self._send(503, {"error": "WORKER_TOKEN is not set"})
             if not self._authed():
+                log("POST /run refused: the token does not match WORKER_TOKEN")
                 return self._send(401, {"error": "unauthorized"})
-            self._send(202, {"result": runner.trigger("request")})
+            res = runner.trigger("request")
+            log(f"POST /run accepted ({res})")
+            self._send(202, {"result": res})
     return H
 
 
