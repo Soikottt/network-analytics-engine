@@ -96,16 +96,19 @@ def open_client(core):
     return gc
 
 
-def load_frame(core):
-    """The same tabs the dashboard loads (main tab + extra tabs), combined the same way."""
+def load_frame(core, tabs_only=None):
+    """The same tabs the dashboard loads (main tab + extra tabs), combined the same way. tabs_only=["Sheet1"] reads just those tabs (the quick run)."""
     pd = core["pd"]
     gc = open_client(core)
     ss, _m = core["open_spreadsheet"](gc, os.environ.get("SHEET_NAME", "Ringba to Sheet QC"), os.environ.get("SHEET_URL", ""))
-    tabs = [os.environ.get("SHEET_TAB", "ALL QC from 30 Sept 2026").strip()]
-    for t in os.environ.get("EXTRA_TABS", "Sheet1").split(","):
-        t = t.strip()
-        if t and t.lower() not in [x.lower() for x in tabs]:
-            tabs.append(t)
+    if tabs_only:
+        tabs = [t.strip() for t in tabs_only if t.strip()]
+    else:
+        tabs = [os.environ.get("SHEET_TAB", "ALL QC from 30 Sept 2026").strip()]
+        for t in os.environ.get("EXTRA_TABS", "Sheet1").split(","):
+            t = t.strip()
+            if t and t.lower() not in [x.lower() for x in tabs]:
+                tabs.append(t)
     frames, titles = [], []
     for i, tab in enumerate(tabs):
         try:
@@ -130,6 +133,20 @@ def turso_client(core):
     return core["TursoClient"](url, tok, timeout=int(float(os.environ.get("TURSO_TIMEOUT", "15"))))
 
 
+def _full_due(ledger, now, pd):
+    """A FULL read (all tabs) is due when no quick-tab setting exists, it never ran, or the last one is older than WORKER_FULL_HOURS (default 6)."""
+    if not os.environ.get("SHEET_FAST_TAB", "").strip():
+        return True
+    row = ledger.state().get("last_full")
+    if not row:
+        return True
+    try:
+        age_h = (pd.Timestamp(now) - pd.Timestamp(row["updated_at"])).total_seconds() / 3600
+    except Exception:
+        return True
+    return age_h >= float(os.environ.get("WORKER_FULL_HOURS", "6")) or age_h < 0
+
+
 def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None):
     """-> summary dict. Never raises: an error is logged and stored in sw_state (scrubbed)."""
     pd = core["pd"]
@@ -147,8 +164,30 @@ def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None)
         store = core["S9Store"](":memory:")
         core["sp_init"](store)
         skip = core["sp_auto_import_app_state"](store, client)               # the app's allow-list / rejected / blocked numbers
-        df, tabs, ss = (tuple(frame) + (None,))[:3] if frame is not None else load_frame(core)
+        full = _full_due(ledger, now, pd)
+        if frame is not None:
+            df, tabs, ss = (tuple(frame) + (None,))[:3]
+        elif full:
+            df, tabs, ss = load_frame(core)
+        else:
+            df, tabs, ss = load_frame(core, [os.environ.get("SHEET_FAST_TAB", "")])     # quick run: only the tab where NEW calls arrive
         scan = core["sp_scan"](store, df, now, tab_default=tabs)
+        try:                                                  # a caller's OLD history (QUALIFIED calls in the big tab) must survive a quick read of one tab
+            extra = list(ledger.hist_load())
+            try:
+                extra += list(client.query("SELECT caller_norm, calls, qualified FROM sp_caller_hist"))      # the app's own copy
+            except Exception:
+                pass
+            core["sp_hist_merge"](store, extra, now)
+            if full:
+                ledger.hist_save(core["sp_hist_export"](store), now_s)
+                ledger.set_state("last_full", {"why": why, "rows": int(len(df))}, now_s)
+        except Exception as exc:
+            log("could not merge caller history: " + type(exc).__name__)
+        try:
+            core["sp_apply_ledger_blocks"](store, ledger.blocks(active_only=True), now)     # blocks made in earlier runs: this store is rebuilt every run, so it must agree before the sheet is written
+        except Exception as exc:
+            log("could not apply earlier blocks to this run: " + type(exc).__name__)
         res = core["sp_auto_run"](store, ledger, now, adapter=adapter, skip=skip)
         out.update(ok=True, scan={k: scan.get(k) for k in ("calls", "incidents", "proposals_created") if k in scan}, result=res)
         if ss is not None and core["sp_sheet_sync_on"]():                     # the sheet columns are filled by the worker itself, so they do not wait for someone to open the app
@@ -161,7 +200,8 @@ def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None)
                 out["sheet"] = {"ok": False, "error": f"{type(exc).__name__}"}
                 log("sheet sync failed: " + type(exc).__name__)
         ledger.set_state("last_error", "", now_s)
-        log(f"run ({why}): mode {res.get('mode')}, candidates {res.get('candidates')} (newly flagged {res.get('would_block')}, already flagged earlier {res.get('already_flagged')}), blocked {res.get('blocked')}, held by limit {res.get('held_by_limit')}. {res.get('note', '')}")
+        out["full"] = full
+        log(f"run ({why}, {'full read' if full else 'quick read: ' + str(len(df)) + ' row(s)'}): mode {res.get('mode')}, candidates {res.get('candidates')} (newly flagged {res.get('would_block')}, already flagged earlier {res.get('already_flagged')}), blocked {res.get('blocked')}, held by limit {res.get('held_by_limit')}. {res.get('note', '')}")
     except Exception as exc:
         msg = _scrub(f"{type(exc).__name__}: {exc}")[:300]
         out["error"] = msg
