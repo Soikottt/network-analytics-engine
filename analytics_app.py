@@ -16736,6 +16736,52 @@ def sp_desired_hash(d):
     return hashlib.sha1(json.dumps([d[k] for k in SP_COLUMNS]).encode()).hexdigest()[:20]
 
 
+def sp_row_coloring():
+    """Rows blocked by the AUTOMATION are filled with SPAM_ROW_FILL (default #FC0000) with white bold text. SPAM_ROW_COLORING=false turns it off."""
+    return _cfg("SPAM_ROW_COLORING", "true").lower() not in ("0", "false", "no", "off")
+
+
+def sp_row_fill():
+    h = str(_cfg("SPAM_ROW_FILL", "#FC0000") or "").strip().lstrip("#")
+    return "#" + (h.upper() if re.fullmatch(r"[0-9A-Fa-f]{6}", h) else "FC0000")
+
+
+def _sp_is_auto_blocked(prop):
+    return bool(prop and prop["exec_status"] == "BLOCKED" and str(prop["decided_by"] or "").startswith("auto-block"))
+
+
+def _sp_h(d, prop):
+    """Hash of what the sheet should show; the colour is part of it, so rows that were blocked BEFORE the colouring existed are written again once."""
+    return sp_desired_hash(d) + ("|" + sp_row_fill() if (sp_row_coloring() and _sp_is_auto_blocked(prop)) else "")
+
+
+def sp_color_rows(ws, rows, ncols):
+    """Fills whole sheet rows (1-based numbers) red with white bold text, in ONE Sheets request per 200 row blocks. Best effort: never raises. Returns the number of rows coloured."""
+    try:
+        sheet = getattr(ws, "spreadsheet", None)
+        gid = getattr(ws, "id", None)
+        if sheet is None or gid is None or not rows:
+            return 0
+        fill = sp_row_fill().lstrip("#")
+        rgb = {k: int(fill[i:i + 2], 16) / 255.0 for k, i in (("red", 0), ("green", 2), ("blue", 4))}
+        rs = sorted(set(int(r) for r in rows))
+        blocks, start, prev = [], rs[0], rs[0]
+        for r in rs[1:]:
+            if r != prev + 1:
+                blocks.append((start, prev))
+                start = r
+            prev = r
+        blocks.append((start, prev))
+        fmt = {"userEnteredFormat": {"backgroundColor": rgb, "textFormat": {"foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "bold": True}}}
+        reqs = [{"repeatCell": {"range": {"sheetId": gid, "startRowIndex": a - 1, "endRowIndex": b, "startColumnIndex": 0, "endColumnIndex": int(ncols)}, "cell": fmt,
+                                "fields": "userEnteredFormat(backgroundColor,textFormat)"}} for a, b in blocks]
+        for k in range(0, len(reqs), 200):
+            sheet.batch_update({"requests": reqs[k:k + 200]})
+        return len(rs)
+    except Exception:
+        return 0
+
+
 def sp_latest_prop(props, norm):
     return props.get(norm)
 
@@ -16784,7 +16830,7 @@ def sp_queue_refresh(store, now=None):
             rp = _sp_prop_for(i, props, rprops)
             if str(i["classification"] or "").startswith("RULE_") and rp is None:
                 continue                                                  # a rule-matched call is written to the sheet only once its number is actually blocked
-            h = sp_desired_hash(sp_desired(i, rp, i["caller_norm"] in allow))
+            h = _sp_h(sp_desired(i, rp, i["caller_norm"] in allow), rp)
             cur = q.get(i["id"])
             if i["sheet_hash"] == h and i["sheet_state"] == "synced":
                 if cur and cur["state"] != "done":
@@ -16922,7 +16968,7 @@ def sp_sheet_sync(store, spreadsheet, now=None, default_tab="", max_incidents=20
                     t2, p2 = sp_sheet_plan(items, v2, plan, sp_dup_policy())
                     if t2 != targets:
                         raise RuntimeError("The sheet changed while it was being read (rows moved); nothing was written. It will be retried.")
-                ranges, done = [], {}
+                ranges, done, paint = [], {}, []
                 spam = plan["spam"]
                 if plan["new"]:
                     cols_needed = max(spam.values()) + 1
@@ -16933,8 +16979,9 @@ def sp_sheet_sync(store, spreadsheet, now=None, default_tab="", max_incidents=20
                 for inc in items:
                     if inc["id"] in problems:
                         continue
-                    d = sp_desired(inc, _sp_prop_for(inc, props, rprops), inc["caller_norm"] in allow)
-                    h = sp_desired_hash(d)
+                    pr_ = _sp_prop_for(inc, props, rprops)
+                    d = sp_desired(inc, pr_, inc["caller_norm"] in allow)
+                    h = _sp_h(d, pr_)
                     rows_ = targets.get(inc["id"], [])
                     changed = False
                     for r in rows_:
@@ -16950,8 +16997,12 @@ def sp_sheet_sync(store, spreadsheet, now=None, default_tab="", max_incidents=20
                         else:
                             ranges += [{"range": f"{sp_a1(spam[n])}{r}", "values": [[d[n]]]} for n in SP_COLUMNS]
                     done[inc["id"]] = (h, rows_[0] if rows_ else None, changed)
+                    if sp_row_coloring() and _sp_is_auto_blocked(pr_):
+                        paint.extend(rows_)
                 for k in range(0, len(ranges), 200):
                     ws.batch_update(ranges[k:k + 200], value_input_option="RAW")
+                if paint:                                                  # rows blocked by the automation: whole row red, white bold text
+                    res["colored"] = res.get("colored", 0) + sp_color_rows(ws, paint, max(len(v1[0]) if v1 else 0, max(spam.values()) + 1))
                 gid = str(getattr(ws, "id", "") or "")
 
                 def mark(c):
