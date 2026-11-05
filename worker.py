@@ -232,6 +232,11 @@ def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None)
             except Exception as exc:
                 out["sheet"] = {"ok": False, "error": f"{type(exc).__name__}"}
                 log("sheet sync failed: " + type(exc).__name__)
+        try:
+            rr = res.get("rules") or {}
+            log(f"rules (VoIP+silent, wrong number): mode {rr.get('mode', '-')}, matched calls since {core['s16_ts'](since) if since is not None else '-'} UTC: {rr.get('candidates', 0)} number(s) (newly flagged {rr.get('would_block', 0)}, blocked {rr.get('blocked', 0)}, no campaign id {rr.get('no_campaign_id', 0)}, held by limit {rr.get('held_by_limit', 0)}). {rr.get('note', '')}")
+        except Exception:
+            pass
         ledger.set_state("last_error", "", now_s)
         out["full"] = full
         log(f"run ({why}, {'full read' if full else 'quick read: ' + str(len(df)) + ' row(s)'}): mode {res.get('mode')}, candidates {res.get('candidates')} (newly flagged {res.get('would_block')}, already flagged earlier {res.get('already_flagged')}), blocked {res.get('blocked')}, held by limit {res.get('held_by_limit')}. {res.get('note', '')}")
