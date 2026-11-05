@@ -147,6 +147,22 @@ def _full_due(ledger, now, pd):
     return age_h >= float(os.environ.get("WORKER_FULL_HOURS", "6")) or age_h < 0
 
 
+def _rules_since(core, ledger, now, now_s, pd):
+    """The rules act only on calls made from this moment on ('from now on'). Fixed on the first run (saved in sw_state), or set with SPAM_RULES_SINCE=YYYY-MM-DD (US Eastern midnight)."""
+    st = ledger.state().get("rules_since")
+    if st and str(st.get("v") or "").strip():
+        return pd.Timestamp(str(st["v"]).strip('"'))
+    env = os.environ.get("SPAM_RULES_SINCE", "").strip()
+    since = now
+    if env:
+        try:
+            since = pd.Timestamp(env).tz_localize(os.environ.get("RINGBA_TIMEZONE", "America/New_York")).tz_convert("UTC").tz_localize(None)
+        except Exception:
+            since = now
+    ledger.set_state("rules_since", core["s16_ts"](since), now_s)
+    return since
+
+
 def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None):
     """-> summary dict. Never raises: an error is logged and stored in sw_state (scrubbed)."""
     pd = core["pd"]
@@ -172,6 +188,12 @@ def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None)
         else:
             df, tabs, ss = load_frame(core, [os.environ.get("SHEET_FAST_TAB", "")])     # quick run: only the tab where NEW calls arrive
         scan = core["sp_scan"](store, df, now, tab_default=tabs)
+        since = None
+        try:                                                  # rules (VoIP + silent, wrong number): find the matching calls now, so their callers' history is saved with the rest
+            since = _rules_since(core, ledger, now, now_s, pd)
+            core["sp_rules_scan"](store, df, now, since_utc=since, tab_default=tabs)
+        except Exception as exc:
+            log("rules scan failed: " + type(exc).__name__)
         try:                                                  # a caller's OLD history (QUALIFIED calls in the big tab) must survive a quick read of one tab
             extra = list(ledger.hist_load())
             try:
@@ -188,7 +210,18 @@ def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None)
             core["sp_apply_ledger_blocks"](store, ledger.blocks(active_only=True), now)     # blocks made in earlier runs: this store is rebuilt every run, so it must agree before the sheet is written
         except Exception as exc:
             log("could not apply earlier blocks to this run: " + type(exc).__name__)
-        res = core["sp_auto_run"](store, ledger, now, adapter=adapter, skip=skip)
+        try:
+            notes = core["sp_call_notes"](df, full=True)                      # call summaries, shown next to each number in the Auto-block tables
+        except Exception:
+            notes = {}
+        res = core["sp_auto_run"](store, ledger, now, adapter=adapter, skip=skip, notes=notes)
+        rres = {}
+        try:                                                                  # rules: VoIP + silent, wrong number (this campaign only). Shadow until SPAM_AUTO_RULES_MODE=live.
+            rres = core["sp_rules_run"](store, ledger, now, adapter=adapter, skip=skip | set(ledger.blocked_set()), notes=notes, since_utc=since) 
+            core["sp_apply_rule_ledger"](store, ledger.rule_blocks(), now)
+            res["rules"] = rres
+        except Exception as exc:
+            log("rules failed: " + type(exc).__name__)
         out.update(ok=True, scan={k: scan.get(k) for k in ("calls", "incidents", "proposals_created") if k in scan}, result=res)
         if ss is not None and core["sp_sheet_sync_on"]():                     # the sheet columns are filled by the worker itself, so they do not wait for someone to open the app
             try:
