@@ -68,7 +68,7 @@ UI_SECTIONS = [
     ("", [("__all__", "🧾", "Classic view", "Everything on one long page (the previous layout).")]),
 ]
 UI_PAGE_INFO = {k: (ic, t, d) for _s, items in UI_SECTIONS for (k, ic, t, d) in items}
-UI_LABELS = {k: t for k, (ic, t, d) in UI_PAGE_INFO.items()}
+UI_LABELS = {k: f"{ic}  {t}" for k, (ic, t, d) in UI_PAGE_INFO.items()}
 UI_S1016_PAGES = {"Health": "health", "Quality": "quality", "Advisor": "review", "Tasks": "tasks", "Recs": "recs", "DailyBrief": "briefing", "Governance": "gov"}
 
 UI_CSS = """
@@ -248,7 +248,28 @@ button[data-baseweb="tab"][aria-selected="true"] { background: var(--ui-card); c
 }
 """
 
-UI_TOPNAV_NAV = '[data-testid="stVerticalBlock"]:not(:has([data-testid="stVerticalBlock"])):has(.ui-topnav-anchor)'
+
+def ui_nav_css():
+    """Section captions (OVERVIEW / INTELLIGENCE / ...) above the first item of each group, generated from UI_SECTIONS."""
+    out, idx = [], 1
+    for sec, items in UI_SECTIONS:
+        if sec:
+            out.append(f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx}){{margin-top:26px}}'
+                       f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx})::before{{content:"{sec}";position:absolute;top:-19px;left:4px;'
+                       f'font-size:.68rem;font-weight:750;letter-spacing:.12em;color:#7c8fb0}}')
+        elif idx > 1:
+            out.append(f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx}){{margin-top:14px;border-top:1px solid rgba(255,255,255,.1);border-radius:0 0 10px 10px}}')
+        idx += len(items)
+    out.append('[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child(1){margin-top:22px}')
+    return "".join(out)
+
+
+# ---------------------------------------------------------------
+# TOP MENU. The page menu moved from the sidebar to a bar at the top of the page that stays in view while you scroll (sticky).
+# Row 1 = the section (Overview, Network Money, ...), row 2 = the pages of that section. Nothing else changes: the same page keys, labels and pages as before;
+# the sidebar keeps the brand and the data source / filters. Pure look-and-navigation code.
+# ---------------------------------------------------------------
+UI_TOPNAV_NAV = '[data-testid="stVerticalBlock"]:not(:has([data-testid="stVerticalBlock"])):has(.ui-topnav-anchor)'      # the innermost block that holds the menu (never the page itself)
 UI_TOPNAV_CSS = """
 @@NAV@@ {
   position: sticky; top: 0.5rem; z-index: 999;
@@ -282,7 +303,12 @@ UI_TOPNAV_CSS = """
 .st-key-ui_nav_group [role="radiogroup"]>label p { font-size: 0.72rem !important; font-weight: 700 !important; color: #64748b !important; }
 .st-key-ui_nav_group [role="radiogroup"]>label:has(input:checked) { background: var(--ui-navy2) !important; border-color: var(--ui-navy2); }
 .st-key-ui_nav_group [role="radiogroup"]>label:has(input:checked) p { color: #ffffff !important; }
+
+.st-key-ui_refresh{position:absolute;top:8px;right:12px;width:auto!important;z-index:3}
+.st-key-ui_refresh button{padding:4px 12px;min-height:0;border-radius:8px;font-weight:600}
+@@NAV@@ .st-key-ui_nav_group{padding-right:120px}
 """
+
 
 def ui_topnav_groups():
     """[(section name, [page labels])] in menu order; the last section is the one-page 'Classic view'."""
@@ -296,20 +322,7 @@ def ui_topnav_css():
             css += f".st-key-ui_nav_page_{gi}{{display:none!important}}"
     return css
 
-def ui_nav_css():
-    """Section captions (OVERVIEW / INTELLIGENCE / ...) above the first item of each group, generated from UI_SECTIONS."""
-    out, idx = [], 1
-    for sec, items in UI_SECTIONS:
-        if sec:
-            out.append(f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx}){{margin-top:26px}}'
-                       f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx})::before{{content:"{sec}";position:absolute;top:-19px;left:4px;'
-                       f'font-size:.68rem;font-weight:750;letter-spacing:.12em;color:#7c8fb0;}}')
-        elif idx > 1:
-            out.append(f'[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child({idx}){{margin-top:14px;border-top:1px solid rgba(255,255,255,.1);border-radius:0 0 10px 10px;}}')
-        idx += len(items)
-    out.append('[data-testid="stSidebar"] [role="radiogroup"]>label:nth-child(1){margin-top:22px;}')
-    return "".join(out)
-    
+
 UI_REFRESH_KEYS = ("sheet_loaded", "sp_scanned", "sp_autosync", "sp_notes_key", "sp_auto_snap", "sp_adopt_t", "sp_pub_sig")
 
 
@@ -414,27 +427,7 @@ def ui_dashboard_extras(work_df):
             daily = work_df["Parsed_Date"].dropna().dt.floor("D").value_counts().sort_index()
             if len(daily) > 1:
                 st.markdown('<div class="ui-sec">DAILY CALL VOLUME</div>', unsafe_allow_html=True)
-                fig_daily = go.Figure(go.Scatter(
-                    x=daily.index,
-                    y=daily.values,
-                    mode="lines+markers",
-                    line=dict(color="#2563eb", width=2.5, shape="spline"),
-                    marker=dict(size=5, color="#1d4ed8"),
-                    fill="tozeroy",
-                    fillcolor="rgba(37, 99, 235, 0.10)",
-                    hovertemplate="<b>%{x|%b %d, %Y}</b><br>Calls: %{y:,}<extra></extra>",
-                ))
-                fig_daily.update_layout(
-                    height=240,
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    paper_bgcolor="#ffffff",
-                    plot_bgcolor="#ffffff",
-                    font=dict(family="Inter, sans-serif", size=12, color="#475569"),
-                    xaxis=dict(showgrid=False, linecolor="#e2e8f0"),
-                    yaxis=dict(showgrid=True, gridcolor="#f1f5f9", zeroline=False),
-                    hovermode="x unified",
-                )
-                st.plotly_chart(fig_daily, use_container_width=True, config={"displayModeBar": False})
+                st.area_chart(daily, height=220)
     except Exception:
         pass
 
@@ -850,52 +843,9 @@ def render_period_comparison(base_df, available_columns, qc_col, voip_col):
     table = res[table_cols]
 
     st.markdown("**Calls per group: Earlier vs Later** (top 15)")
-    chart = res.copy().head(15)
+    chart = res.copy()
     chart["Group"] = chart[group_cols].astype(str).apply(" | ".join, axis=1)
-    fig_cmp = go.Figure(data=[
-        go.Bar(
-            name="Calls Earlier",
-            x=chart["Group"],
-            y=chart["Calls Earlier"],
-            marker_color="#cbd5e1",
-            hovertemplate="<b>%{x}</b><br>Earlier: %{y:,}<extra></extra>",
-        ),
-        go.Bar(
-            name="Calls Later",
-            x=chart["Group"],
-            y=chart["Calls Later"],
-            marker_color="#2563eb",
-            hovertemplate="<b>%{x}</b><br>Later: %{y:,}<extra></extra>",
-        ),
-    ])
-    fig_cmp.update_layout(
-        barmode="group",
-        height=320,
-        margin=dict(l=10, r=10, t=28, b=10),
-        paper_bgcolor="#ffffff",
-        plot_bgcolor="#ffffff",
-        font=dict(family="Inter, sans-serif", size=12, color="#475569"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title=None),
-        xaxis=dict(showgrid=False, linecolor="#e2e8f0"),
-        yaxis=dict(showgrid=True, gridcolor="#f1f5f9", zeroline=False),
-        bargap=0.25,
-        bargroupgap=0.08,
-    )
-    st.plotly_chart(fig_cmp, use_container_width=True, config={"displayModeBar": False})
-
-    st.dataframe(table, width="stretch", hide_index=True)
-    st.caption(
-        "Δ = Later minus Earlier (for % metrics it is in percentage points). "
-        "Percentages are a share of all calls in that period; a group with no calls in a period shows blank. "
-        "Avg Score ignores calls that have no AI QC result yet."
-    )
-    st.download_button(
-        label="📥 Download Comparison as CSV",
-        data=table.to_csv(index=False).encode("utf-8"),
-        file_name="period_comparison.csv",
-        mime="text/csv",
-        key="cmp_download",
-    )
+    st.bar_chart(chart.set_index("Group")[["Calls Earlier", "Calls Later"]].head(15))
 
     st.dataframe(table, width="stretch", hide_index=True)
     st.caption(
@@ -15631,6 +15581,8 @@ SP_DDL = [
     """CREATE TABLE IF NOT EXISTS sp_caller_hist (caller_norm TEXT PRIMARY KEY, calls INTEGER, qualified INTEGER, updated_at TEXT)""",
     """CREATE TABLE IF NOT EXISTS sp_blocks (caller_norm TEXT PRIMARY KEY, block_id TEXT, proposal_id TEXT, blocked_at TEXT, unblocked_at TEXT, unblocked_by TEXT)""",
     """CREATE TABLE IF NOT EXISTS sp_sync_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ok INTEGER, written INTEGER, unchanged INTEGER, pending INTEGER, detail TEXT)""",
+    """CREATE TABLE IF NOT EXISTS sp_rule_blocks (caller_norm TEXT, rule TEXT, scope_key TEXT, campaign TEXT, campaign_id TEXT, block_id TEXT, blocked_at TEXT, verified INTEGER DEFAULT 0,
+        reason TEXT, summary TEXT, PRIMARY KEY (caller_norm, rule, scope_key))""",
 ]
 S16_PERMS.update({"spam_view": "viewer", "spam_scan": "open", "spam_allowlist": "strict", "spam_approve": "strict", "spam_execute": "strict", "spam_sync": "open", "spam_export": "strict", "spam_bulk": "strict", "spam_unblock": "strict"})
 
@@ -16245,10 +16197,10 @@ class SpAdapter:
                        "(account-wide or one campaign) and an API 'number block' endpoint, but its path and payload are not documented in what this build can read, "
                        "and the Ringba token used here is read-only.")
 
-    def block(self, norm):
+    def block(self, norm, campaign=None):
         raise NotImplementedError
 
-    def verify(self, norm):
+    def verify(self, norm, campaign=None):
         raise NotImplementedError
 
 
@@ -16385,9 +16337,9 @@ class SpRingbaAdapter(SpAdapter):
     def _digits(v):
         return re.sub(r"\D", "", str(v or ""))
 
-    def _present(self, items, norm):
+    def _present(self, items, norm, campaign=None):
         want = self._digits(norm)[-10:]
-        camp = self._s()["campaign"] or ""
+        camp = (self._s()["campaign"] if campaign is None else campaign) or ""
         for it in items:
             vals, itcamp = [], None
             if isinstance(it, dict):
@@ -16419,14 +16371,16 @@ class SpRingbaAdapter(SpAdapter):
     def unprime(self):
         self._pre_items = None
 
-    def block(self, norm):
+    def block(self, norm, campaign=None):
+        """campaign=None: scope from the settings (empty = all campaigns). A Ringba campaign id blocks the number for THAT campaign only."""
         if not re.fullmatch(r"\+1\d{10}", str(norm or "")):
             raise ValueError("Only a normalised +1XXXXXXXXXX Caller ID can be blocked.")
         s = self._s()
+        camp = (s["campaign"] if campaign is None else campaign) or ""
         self.last_block_id = None
         try:
             items = self._pre_items if self._pre_items is not None else self._list()
-            if self._present(items, norm):
+            if self._present(items, norm, campaign):
                 try:
                     self.last_block_id = self.find_id(norm)
                 except Exception:
@@ -16435,7 +16389,7 @@ class SpRingbaAdapter(SpAdapter):
         except SpRingbaError:
             pass                                      # best-effort pre-check; the read-back after the POST is the one that counts
         self.last_block_id = None
-        status, text = self._call("POST", self._base() + "/", {"phoneNumber": norm, "campaignId": s["campaign"] or ""}, s["block_token"])
+        status, text = self._call("POST", self._base() + "/", {"phoneNumber": norm, "campaignId": camp}, s["block_token"])
         if status in (401, 403):
             raise PermissionError(f"Ringba refused the block token (HTTP {status}). Only a Ringba Admin user's token can block numbers.")
         if status in (400, 404, 405, 415, 422):
@@ -16446,7 +16400,7 @@ class SpRingbaAdapter(SpAdapter):
             raise SpRingbaError("uncertain", f"Ringba answered HTTP {status}; the result is uncertain.")
         self.last_block_id = self._id_from_post(text)
         if self._pre_items is not None:
-            self._pre_items.append({"phoneNumber": norm, "campaignId": s["campaign"] or ""})
+            self._pre_items.append({"phoneNumber": norm, "campaignId": camp})
         return "posted"
 
     @staticmethod
@@ -16498,8 +16452,48 @@ class SpRingbaAdapter(SpAdapter):
             raise SpRingbaError("rejected", "Ringba did not confirm the removal (isSuccessful was not true).")
         return "deleted"
 
-    def verify(self, norm):
-        return self._present(self._list(), norm)
+    def verify(self, norm, campaign=None):
+        return self._present(self._list(), norm, campaign)
+
+    _camp_cache = None
+
+    @staticmethod
+    def _cn(v):
+        return re.sub(r"\s+", " ", str(v or "").strip().lower())
+
+    def resolve_campaign(self, name):
+        """Ringba campaign id for a campaign NAME from the sheet (column D), or None. 1) setting SPAM_CAMPAIGN_IDS, JSON {"name": "id"} (wins);
+        2) Ringba's campaign list (GET /v2/{account}/campaigns, confirmed by Ringba support: {\"campaigns\": [ {id, name, ...} ]}; only each campaign's OWN top-level id / name are read, never the nested defaultPayout id). None = unknown: callers must NOT fall back to an account-wide block."""
+        key = self._cn(name)
+        if not key:
+            return None
+        try:
+            m = json.loads(_cfg("SPAM_CAMPAIGN_IDS", "{}") or "{}")
+            for k, v in (m.items() if isinstance(m, dict) else []):
+                if self._cn(k) == key and re.fullmatch(r"[A-Za-z0-9_-]{6,80}", str(v or "")):
+                    return str(v)
+        except Exception:
+            pass
+        if self._camp_cache is None:
+            self._camp_cache = {}
+            try:
+                s = self._s()
+                status, text = self._call("GET", f"{RB_HOST}/{s['account'].strip()}/campaigns", None, s["block_token"] or s["read_token"])
+                data = json.loads(text) if status < 300 else []
+                items = data if isinstance(data, list) else next((v for v in (data.values() if isinstance(data, dict) else []) if isinstance(v, list)), [])
+                for it in items:
+                    if isinstance(it, dict):
+                        cid = next((it[k] for k in ("id", "campaignId", "campaign_id") if it.get(k)), None)
+                        nm = next((it[k] for k in ("name", "campaignName", "campaign_name") if it.get(k)), None)
+                        if cid and nm and re.fullmatch(r"[A-Za-z0-9_-]{6,80}", str(cid)):
+                            k_ = self._cn(nm)
+                            if k_ in self._camp_cache and self._camp_cache[k_] != str(cid):
+                                self._camp_cache[k_] = ""             # two campaigns with the same name: ambiguous, so never guess
+                            else:
+                                self._camp_cache[k_] = str(cid)
+            except Exception:
+                self._camp_cache = {}
+        return self._camp_cache.get(key) or None
 
     def test(self):
         """Read-only connection test. -> (ok, message)"""
@@ -16704,12 +16698,12 @@ def sp_reconcile_stale(store, now, minutes=15):
 # SQL -> Google Sheet mirror (queue driven, idempotent)
 # ---------------------------------------------------------------------------------------------------------------------
 def sp_sheet_tz():
-    return _cfg("SPAM_SHEET_TZ", "Asia/Dhaka")
+    return _cfg("SPAM_SHEET_TZ", "America/New_York")
 
 
 def sp_local_ts(v):
-    """Times are STORED in UTC (the worker and this page both use UTC). The sheet shows them in the person's own time zone (SPAM_SHEET_TZ, default Asia/Dhaka), with the offset,
-    e.g. '2026-11-04 17:10:00 +06:00', so it is clear when something was blocked."""
+    """Times are STORED in UTC (the worker and this page both use UTC). The sheet and the Auto-block tables show them in US Eastern time (SPAM_SHEET_TZ, default America/New_York) in 12-hour
+    format with the zone name, e.g. '2026-11-04 08:10:05 PM EST', so it is clear when something was blocked."""
     v = str(v or "").strip()
     if not v:
         return ""
@@ -16717,8 +16711,7 @@ def sp_local_ts(v):
         t = pd.Timestamp(v)
         t = t.tz_localize("UTC") if t.tzinfo is None else t
         t = t.tz_convert(sp_sheet_tz())
-        z = t.strftime("%z")
-        return t.strftime("%Y-%m-%d %H:%M:%S") + " " + z[:3] + ":" + z[3:]
+        return t.strftime("%Y-%m-%d %I:%M:%S %p") + " " + (t.strftime("%Z") or t.strftime("%z"))
     except Exception:
         return v
 
@@ -16732,7 +16725,8 @@ def sp_desired(inc, prop, allow=False):
         ev = json.loads(inc["evidence"] or "{}").get("evidence", [])
     except Exception:
         ev = []
-    return {"Spam Status": inc["classification"], "Spam Category": inc["category"] or "", "Spam Confidence": f"{int(inc['confidence'] or 0)}%",
+    is_rule = str(inc["classification"] or "").startswith("RULE_")
+    return {"Spam Status": inc["classification"], "Spam Category": inc["category"] or "", "Spam Confidence": "RULE" if is_rule else f"{int(inc['confidence'] or 0)}%",
             "Spam Evidence": s16_scrub("; ".join(ev[:4]), 300), "Spam Incident ID": inc["id"],
             "Block Review Status": review, "Block Approved By": (prop["decided_by"] or "") if approved else "", "Block Approved At": sp_local_ts(prop["decided_at"]) if approved else "",
             "Block Execution Status": exec_, "Blocked At": sp_local_ts(prop["blocked_at"]) if (prop and prop["exec_status"] == "BLOCKED") else ""}
@@ -16746,6 +16740,32 @@ def sp_latest_prop(props, norm):
     return props.get(norm)
 
 
+def _sp_scope_key(inc):
+    return re.sub(r"\s+", " ", str(inc["campaign"] or "").strip().lower()) if inc["classification"] == "RULE_WRONG_NUMBER" else ""
+
+
+def _sp_rule_props(store):
+    """Rule-based blocks as synthetic 'proposals' for the sheet text: {(caller, class, scope): prop-like dict}."""
+    out = {}
+    try:
+        rows = store._q("SELECT * FROM sp_rule_blocks")
+    except Exception:
+        return out
+    for r in rows:
+        if int(r["verified"] or 0) < 0:
+            continue
+        out[(r["caller_norm"], SP_RULE_CLASSES.get(r["rule"], r["rule"]), r["scope_key"] or "")] = {
+            "review_status": "APPROVED", "exec_status": "BLOCKED" if int(r["verified"] or 0) else "VERIFICATION_PENDING", "decided_by": "auto-block (rule)",
+            "decided_at": r["blocked_at"], "blocked_at": r["blocked_at"]}
+    return out
+
+
+def _sp_prop_for(inc, props, rprops):
+    if str(inc["classification"] or "").startswith("RULE_"):
+        return rprops.get((inc["caller_norm"], inc["classification"], _sp_scope_key(inc)))
+    return props.get(inc["caller_norm"])
+
+
 @_sp_needs_store
 def sp_queue_refresh(store, now=None):
     """SQL only (no network): recompute every incident's desired sheet cells and queue the ones that differ from what was last written. Safe to call any time."""
@@ -16754,13 +16774,17 @@ def sp_queue_refresh(store, now=None):
     props = {}
     for p in store._q("SELECT * FROM sp_proposals ORDER BY created_at, rowid"):
         props[p["caller_norm"]] = p
+    rprops = _sp_rule_props(store)
     q = {r["incident_id"]: r for r in store._q("SELECT * FROM sp_sync_queue")}
     allow = {r["caller_norm"] for r in store._q("SELECT caller_norm FROM sp_allowlist WHERE active = 1")}
 
     def fn(c):
         n = 0
         for i in incs:
-            h = sp_desired_hash(sp_desired(i, props.get(i["caller_norm"]), i["caller_norm"] in allow))
+            rp = _sp_prop_for(i, props, rprops)
+            if str(i["classification"] or "").startswith("RULE_") and rp is None:
+                continue                                                  # a rule-matched call is written to the sheet only once its number is actually blocked
+            h = sp_desired_hash(sp_desired(i, rp, i["caller_norm"] in allow))
             cur = q.get(i["id"])
             if i["sheet_hash"] == h and i["sheet_state"] == "synced":
                 if cur and cur["state"] != "done":
@@ -16881,6 +16905,7 @@ def sp_sheet_sync(store, spreadsheet, now=None, default_tab="", max_incidents=20
         for p in store._q("SELECT * FROM sp_proposals ORDER BY created_at, rowid"):
             props[p["caller_norm"]] = p
         allow = {r["caller_norm"] for r in store._q("SELECT caller_norm FROM sp_allowlist WHERE active = 1")}
+        rprops = _sp_rule_props(store)
         tabs = {}
         for i in pend:
             tabs.setdefault(i["source_tab"] or default_tab, []).append(i)
@@ -16908,7 +16933,7 @@ def sp_sheet_sync(store, spreadsheet, now=None, default_tab="", max_incidents=20
                 for inc in items:
                     if inc["id"] in problems:
                         continue
-                    d = sp_desired(inc, props.get(inc["caller_norm"]), inc["caller_norm"] in allow)
+                    d = sp_desired(inc, _sp_prop_for(inc, props, rprops), inc["caller_norm"] in allow)
                     h = sp_desired_hash(d)
                     rows_ = targets.get(inc["id"], [])
                     changed = False
@@ -17523,6 +17548,9 @@ SW_DDL = [
     "CREATE TABLE IF NOT EXISTS sw_state (k TEXT PRIMARY KEY, v TEXT, updated_at TEXT)",
     "CREATE TABLE IF NOT EXISTS sw_hist (caller_norm TEXT PRIMARY KEY, calls INTEGER, qualified INTEGER, updated_at TEXT)",
     "CREATE TABLE IF NOT EXISTS sw_lock (id INTEGER PRIMARY KEY, holder TEXT, until_ts TEXT)",
+    "CREATE TABLE IF NOT EXISTS sw_notes (k TEXT PRIMARY KEY, summary TEXT, reason TEXT, updated_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS sw_rule_blocks (rkey TEXT PRIMARY KEY, caller_norm TEXT, rule TEXT, scope_key TEXT, campaign TEXT, campaign_id TEXT, block_id TEXT, blocked_at TEXT, verified INTEGER DEFAULT 0, "
+    "reason TEXT, summary TEXT, unblocked_at TEXT)",
 ]
 
 
@@ -17645,6 +17673,30 @@ class SwLedger:
     def state(self):
         return {r["k"]: r for r in self._run([("SELECT k, v, updated_at FROM sw_state", ())])[0]}
 
+    def notes_save(self, rows, now_s):
+        """(key, summary, reason) per number: the call summary shown next to it in the Auto-block tables. Key = Caller ID (spam) or the rule key."""
+        rows = [r for r in (rows or []) if r and r[0]]
+        for i in range(0, len(rows), 100):
+            self._run([("INSERT INTO sw_notes(k, summary, reason, updated_at) VALUES (?,?,?,?) ON CONFLICT(k) DO UPDATE SET summary=excluded.summary, reason=excluded.reason, updated_at=excluded.updated_at",
+                        (k, s16_scrub(sm, 300), s16_scrub(rs, 300), now_s)) for k, sm, rs in rows[i:i + 100]])
+
+    def rule_blocks(self):
+        return self._run([("SELECT * FROM sw_rule_blocks ORDER BY blocked_at DESC", ())])[0]
+
+    def record_rule_block(self, rkey, norm, rule, scope_key, campaign, campaign_id, block_id, now_s, verified, reason, summary):
+        self._run([("INSERT INTO sw_rule_blocks(rkey, caller_norm, rule, scope_key, campaign, campaign_id, block_id, blocked_at, verified, reason, summary) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(rkey) DO UPDATE SET block_id=COALESCE(excluded.block_id, sw_rule_blocks.block_id), blocked_at=excluded.blocked_at, verified=MAX(sw_rule_blocks.verified, excluded.verified), "
+                    "reason=excluded.reason, summary=excluded.summary, unblocked_at=NULL",
+                    (rkey, norm, rule, scope_key, campaign, campaign_id, block_id, now_s, int(bool(verified)), s16_scrub(reason, 300), s16_scrub(summary, 300)))])
+
+    def rule_seen(self, rkey, outcome):
+        r = self._run([("SELECT COUNT(*) AS n FROM sw_log WHERE outcome=? AND proposal_id=?", (outcome, rkey))])
+        return bool(r[0] and int(r[0][0]["n"]) > 0)
+
+    def rule_attempts_today(self, day):
+        r = self._run([("SELECT COUNT(*) AS n FROM sw_log WHERE mode='live' AND proposal_id LIKE 'RULE:%' AND outcome IN ('BLOCKED','FAILED','VERIFICATION_PENDING') AND ts >= ? AND ts < ?", (day + " 00:00:00", day + " 99"))])
+        return int(r[0][0]["n"]) if r[0] else 0
+
     def snapshot(self, limit=300):
         """Everything the Auto-block tab shows, in ONE round trip to Turso (the tab used to ask five times). The tables are created in the same request if they do not exist yet."""
         n = len(SW_DDL)
@@ -17654,8 +17706,13 @@ class SwLedger:
             ("SELECT ts, mode, caller_norm, proposal_id, confidence, outcome, detail FROM sw_log ORDER BY id DESC LIMIT ?", (int(limit),)),
             ("SELECT caller_norm, MAX(confidence) AS confidence, MIN(ts) AS first_flagged, COUNT(*) AS times FROM sw_log WHERE outcome='WOULD_BLOCK' AND caller_norm NOT IN "
              "(SELECT caller_norm FROM sw_blocks) GROUP BY caller_norm ORDER BY confidence DESC, first_flagged LIMIT 500", ()),
-            ("SELECT COUNT(DISTINCT caller_norm) AS n FROM sw_log WHERE outcome='WOULD_BLOCK'", ())])
-        return {"state": {x["k"]: x for x in r[n]}, "blocks": r[n + 1], "recent": r[n + 2], "would": r[n + 3], "would_total": int(r[n + 4][0]["n"]) if r[n + 4] else 0}
+            ("SELECT COUNT(DISTINCT caller_norm) AS n FROM sw_log WHERE outcome='WOULD_BLOCK'", ()),
+            ("SELECT k, summary, reason FROM sw_notes", ()),
+            ("SELECT * FROM sw_rule_blocks ORDER BY blocked_at DESC", ()),
+            ("SELECT proposal_id, caller_norm, MIN(ts) AS first_flagged, MAX(detail) AS detail FROM sw_log WHERE outcome='RULE_WOULD_BLOCK' AND proposal_id NOT IN (SELECT rkey FROM sw_rule_blocks) "
+             "GROUP BY proposal_id, caller_norm ORDER BY first_flagged DESC LIMIT 300", ())])
+        return {"state": {x["k"]: x for x in r[n]}, "blocks": r[n + 1], "recent": r[n + 2], "would": r[n + 3], "would_total": int(r[n + 4][0]["n"]) if r[n + 4] else 0,
+                "notes": {x["k"]: x for x in r[n + 5]}, "rule_blocks": r[n + 6], "rule_would": r[n + 7]}
 
     def recent(self, limit=300):
         return self._run([("SELECT ts, mode, caller_norm, proposal_id, confidence, outcome, detail FROM sw_log ORDER BY id DESC LIMIT ?", (int(limit),))])[0]
@@ -17715,7 +17772,8 @@ def sp_hist_merge(store, rows, now=None):
 def sp_auto_candidates(store, skip, conf_min):
     rows = store._q("SELECT p.id, p.caller_norm, (SELECT MAX(i.confidence) FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM') AS conf, "
                     "(SELECT i.publisher FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM' ORDER BY i.call_ts DESC LIMIT 1) AS publisher, "
-                    "(SELECT MAX(i.call_ts) FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM') AS last_call "
+                    "(SELECT MAX(i.call_ts) FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM') AS last_call, "
+                    "(SELECT i.call_key FROM sp_incidents i WHERE i.caller_norm=p.caller_norm AND i.classification='CONFIRMED_SPAM' ORDER BY i.call_ts DESC LIMIT 1) AS ckey "
                     "FROM sp_proposals p WHERE p.review_status='PENDING_APPROVAL' ORDER BY last_call DESC, conf DESC, p.id")   # NEWEST spam first: the latest calls are never stuck behind the old backlog
     out = []
     for r in rows:
@@ -17724,12 +17782,27 @@ def sp_auto_candidates(store, skip, conf_min):
             continue
         ok, _why, _st = sp_eligibility(store, norm)               # allow-list, QUALIFIED history, confirmed count: asked again, right before acting
         if ok:
-            out.append({"pid": r["id"], "norm": norm, "conf": int(r["conf"]), "publisher": r["publisher"] or ""})
+            out.append({"pid": r["id"], "norm": norm, "conf": int(r["conf"]), "publisher": r["publisher"] or "", "ckey": r["ckey"] or ""})
     return out
 
 
+def _sp_summary_for(store, ckey, notes):
+    """(summary, reason) of the latest call behind a number: the sheet's ShortSummary when it is loaded, else the QC finding stored with the incident."""
+    reason, summ = "", ""
+    try:
+        r = store._q("SELECT category, evidence FROM sp_incidents WHERE call_key=?", (ckey,))
+        if r:
+            ev = json.loads(r[0]["evidence"] or "{}").get("evidence", [])
+            reason = s16_scrub("; ".join(ev[:2]) or (r[0]["category"] or ""), 300)
+    except Exception:
+        pass
+    n = (notes or {}).get(ckey) or {}
+    summ = str(n.get("summary") or n.get("note") or "").strip() or reason
+    return summ, reason
+
+
 @_sp_needs_store
-def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None):
+def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, notes=None):
     """One automatic pass over what sp_scan() already found. NEVER touches Ringba in shadow mode. Returns a summary dict (also stored in sw_state)."""
     now_s = s16_ts(now)
     run_id = run_id or ("RUN-" + hashlib.sha1((now_s + str(id(store))).encode()).hexdigest()[:8])
@@ -17767,6 +17840,10 @@ def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None):
             except Exception:
                 pass
         cands = sp_auto_candidates(store, skip, conf_min)
+        try:
+            ledger.notes_save([(c_["norm"],) + _sp_summary_for(store, c_["ckey"], notes) for c_ in cands[:400]], now_s)     # the call summary shown next to each number in the Auto-block tables
+        except Exception:
+            pass
         if mode == "live" and hasattr(ad, "prime"):
             ad.prime()
         res["candidates"] = len(cands)
@@ -17821,6 +17898,276 @@ def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None):
             ad.unprime()
         ledger.release(run_id)
     return res
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Rule-based auto-blocks (from the QC report / summary): VoIP + silent calls, and wrong-number calls (blocked for THAT campaign only)
+# ---------------------------------------------------------------------------------------------------------------------
+SP_RULE_CLASSES = {"VOIP_SILENT": "RULE_VOIP_SILENT", "WRONG_NUMBER": "RULE_WRONG_NUMBER"}
+SP_RULE_LABELS = {"VOIP_SILENT": "VoIP + silent call (no voice)", "WRONG_NUMBER": "Wrong number (this campaign only)"}
+
+
+def sp_rules_enabled(rule):
+    return _sp_truthy("SPAM_AUTO_" + rule, "true")
+
+
+def sp_rules_mode():
+    """(mode, note). The rules go live only when the main auto-block is live AND SPAM_AUTO_RULES_MODE=live. Until then they only LOG what they would block (shadow)."""
+    main, _n = sp_auto_mode()
+    want = _cfg("SPAM_AUTO_RULES_MODE", "shadow").lower()
+    if want != "live":
+        return "shadow", "SPAM_AUTO_RULES_MODE is not 'live': the VoIP-silent and wrong-number rules only log what they WOULD block."
+    if main != "live":
+        return "shadow", "SPAM_AUTO_RULES_MODE is 'live' but the main auto-block is not live (SPAM_AUTO_MODE / SPAM_DRY_RUN): rules stay in shadow."
+    return "live", "Live: rule matches are blocked for real."
+
+
+def sp_call_utc(ts):
+    """A stored call time (Ringba's time zone, RINGBA_TIMEZONE) -> naive UTC. A time without a year (placeholder year) is placed in the current year (the year before if that is in the future)."""
+    try:
+        now = pd.Timestamp.now("UTC").tz_localize(None)
+        m = re.match(r"^(\d{1,4})-(\d{2})-(\d{2}) (\d{2}:\d{2}:\d{2})$", str(ts).strip())
+        yr = int(m.group(1)) if m else None
+        t = pd.Timestamp(f"{now.year}-{m.group(2)}-{m.group(3)} {m.group(4)}" if (m and yr < 2000) else str(ts))
+        tz = _cfg("RINGBA_TIMEZONE", "America/New_York")
+        u = t.tz_localize(tz, ambiguous=True, nonexistent="shift_forward").tz_convert("UTC").tz_localize(None)
+        if (yr is not None and yr < 2000) and u > now + pd.Timedelta(days=1):
+            u = u - pd.DateOffset(years=1)
+        return u
+    except Exception:
+        return None
+
+
+def sp_rule_hits(df):
+    """Calls that match a rule, read from the loaded rows. VOIP_SILENT: column M 'Line Type' says VoIP AND the QC 'Call Type' is SILENT / NO RESPONSE.
+    WRONG_NUMBER: the QC 'Call Type' is WRONG NUMBER (or the QC reason / summary says 'wrong number') AND the call has a campaign name (column D): the block is for that campaign only.
+    -> list of dicts."""
+    if df is None or not len(df):
+        return []
+    c = sp_columns(df)
+    if not c.get("qc") or not c.get("caller"):
+        return []
+    low = {str(x).strip().lower(): x for x in df.columns}
+    sc = next((low[n] for n in ("shortsummary", "short summary", "summary") if n in low), None)
+    qcs = df[c["qc"]].astype(str)
+    pre = qcs.str.contains(r"SILENT|NO RESPONSE|WRONG\s*NUMBER", case=False, na=False, regex=True)
+    if sc:
+        pre = pre | df[sc].astype(str).str.contains(r"wrong\s*number", case=False, na=False, regex=True)
+    out, seen = [], set()
+    for i in np.flatnonzero(pre.to_numpy()):
+        row = df.iloc[i]
+        g_ = lambda k: str(row[c[k]]).strip() if c.get(k) else ""
+        q = sp_parse_qc(row[c["qc"]])
+        ct = q["call_type"].upper()
+        summ = str(row[sc]).strip() if sc else ""
+        summ = "" if summ.lower() in ("nan", "none") else summ
+        rule = None
+        if re.search(r"SILENT|NO RESPONSE", ct) and "voip" in g_("line").lower():
+            rule = "VOIP_SILENT"
+        elif re.match(r"WRONG\s*NUMBER", ct) or (ct in ("", "OTHER") and re.search(r"wrong\s*number", q["reason"] + " " + summ, re.I)):
+            rule = "WRONG_NUMBER"
+        if not rule:
+            continue
+        norm = sp_norm_caller(g_("caller"))
+        camp = g_("campaign")
+        if not norm or (rule == "WRONG_NUMBER" and not camp):
+            continue
+        key, kind = sp_call_key(g_("call_id"), g_("recording"), g_("date"), g_("caller"), g_("buyer"), g_("publisher"), g_("campaign"), g_("duration"))
+        if key in seen:
+            continue
+        seen.add(key)
+        if rule == "VOIP_SILENT":
+            reason = "VoIP line + silent call (" + (q["reason"] or q["issue"] or "no voice") + ")"
+        else:
+            reason = f"Wrong number on campaign '{camp}'" + (": " + q["reason"] if q["reason"] and q["reason"].lower() != "none" else "")
+        out.append({"key": key, "kind": kind, "rule": rule, "norm": norm, "raw": g_("caller"), "campaign": camp, "reason": s16_scrub(reason, 300), "summary": s16_scrub(summ or q["reason"], 300),
+                    "ts": sp_norm_ts(row[c["date"]]) if c.get("date") else "", "call_id": g_("call_id"), "buyer": g_("buyer"), "publisher": g_("publisher"),
+                    "tab": g_("tab")})
+    return out
+
+
+@_sp_needs_store
+def sp_rules_scan(store, df, now, since_utc=None, tab_default=""):
+    """Stores the rule matches as incidents (class RULE_VOIP_SILENT / RULE_WRONG_NUMBER) - only calls made at or after `since_utc` ('from now on'), and never a call that already is a spam incident."""
+    now_s = s16_ts(now)
+    hits = sp_rule_hits(df)
+    out = {"hits": len(hits), "new": 0, "old": 0}
+    keep = []
+    for h in hits:
+        if since_utc is not None:
+            u = sp_call_utc(h["ts"])
+            if u is None or u < since_utc:
+                out["old"] += 1
+                continue
+        keep.append(h)
+
+    def fn(cx):
+        for h in keep:
+            if cx.execute("SELECT 1 FROM sp_incidents WHERE call_key=?", (h["key"],)).fetchone():
+                continue
+            iid = sp_incident_id(h["key"])
+            scope = h["campaign"] if h["rule"] == "WRONG_NUMBER" else "all campaigns"
+            ev = s16_json({"evidence": [h["reason"], "block scope: " + scope], "rule": h["rule"], "campaign": h["campaign"], "summary": h["summary"],
+                           "decision_basis": "rule: " + SP_RULE_LABELS[h["rule"]]})
+            cx.execute("""INSERT INTO sp_incidents(id, call_key, key_kind, call_id, call_ts, caller_raw, caller_norm, buyer, publisher, campaign, source_tab, classification, category,
+                       confidence, evidence, rules, qc_fp, first_seen, last_seen, times_seen, sheet_state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'pending')""",
+                       (iid, h["key"], h["kind"], h["call_id"], h["ts"], h["raw"], h["norm"], h["buyer"], h["publisher"], h["campaign"], h["tab"] or tab_default,
+                        SP_RULE_CLASSES[h["rule"]], SP_RULE_LABELS[h["rule"]], 100, ev, json.dumps([h["rule"]]), "rule", now_s, now_s))
+            out["new"] += 1
+    store._tx(fn)
+    try:                                                    # call / QUALIFIED-call counts of the rule callers and of EVERY caller that ever made a QUALIFIED call (a rule never blocks those)
+        hist = sp_history(df, sp_columns(df))
+        want = {h["norm"] for h in hits} | set(hist.index[hist["qualified"] > 0])
+        rows_h = [(n, int(hist.loc[n, "calls"]), int(hist.loc[n, "qualified"])) for n in want if n in hist.index]
+        store._tx(lambda cx: [cx.execute("INSERT INTO sp_caller_hist(caller_norm, calls, qualified, updated_at) VALUES (?,?,?,?) ON CONFLICT(caller_norm) DO UPDATE SET "
+                                         "calls=MAX(COALESCE(sp_caller_hist.calls,0), excluded.calls), qualified=MAX(COALESCE(sp_caller_hist.qualified,0), excluded.qualified), updated_at=excluded.updated_at",
+                                         (n, a_, b_, now_s)) for n, a_, b_ in rows_h])
+    except Exception:
+        pass
+    return out
+
+
+@_sp_needs_store
+def sp_rule_candidates(store, skip):
+    """One entry per (number, rule, scope): the number is blocked for all campaigns (VOIP_SILENT) or for the one campaign of the call (WRONG_NUMBER)."""
+    rows = store._q("SELECT caller_norm, classification, campaign, MAX(call_ts) AS last_call, COUNT(*) AS n FROM sp_incidents WHERE classification IN ('RULE_VOIP_SILENT','RULE_WRONG_NUMBER') AND caller_norm<>'' "
+                    "GROUP BY caller_norm, classification, CASE WHEN classification='RULE_WRONG_NUMBER' THEN lower(trim(campaign)) ELSE '' END ORDER BY last_call DESC")
+    out = []
+    for r in rows:
+        norm = r["caller_norm"]
+        rule = "VOIP_SILENT" if r["classification"] == "RULE_VOIP_SILENT" else "WRONG_NUMBER"
+        if norm in skip or not sp_rules_enabled(rule):
+            continue
+        if sp_allowlisted(store, norm):
+            continue
+        if (sp_caller_stats(store, norm).get("qualified") or 0) > 0:
+            continue                                                  # a QUALIFIED call exists for this number: a person decides
+        camp = str(r["campaign"] or "").strip() if rule == "WRONG_NUMBER" else ""
+        scope = re.sub(r"\s+", " ", camp.lower())
+        last = store._q("SELECT call_key, evidence FROM sp_incidents WHERE caller_norm=? AND classification=? AND (?='' OR lower(trim(campaign))=?) ORDER BY call_ts DESC LIMIT 1", (norm, r["classification"], scope, scope))
+        ck = last[0]["call_key"] if last else ""
+        reason, summ = "", ""
+        try:
+            ev_ = json.loads(last[0]["evidence"] or "{}") if last else {}
+            reason, summ = (ev_.get("evidence") or [""])[0], str(ev_.get("summary") or "")
+        except Exception:
+            pass
+        out.append({"norm": norm, "rule": rule, "campaign": camp, "scope": scope, "rkey": f"RULE:{norm}|{rule}|{scope}", "ckey": ck, "reason": reason, "summary": summ or reason, "n": int(r["n"])})
+    return out
+
+
+@_sp_needs_store
+def sp_rules_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, notes=None, since_utc=None):
+    """One pass over the rule matches. Shadow (default) only LOGS what it would block. Live: VOIP_SILENT is blocked with the normal scope; WRONG_NUMBER only with the call's own campaign ID.
+    If that ID is unknown the number is NOT blocked (never widened to all campaigns)."""
+    now_s = s16_ts(now)
+    run_id = (run_id or "RUN") + "-rules"
+    res = {"enabled": sp_auto_on(), "mode": "", "candidates": 0, "would_block": 0, "blocked": 0, "pending": 0, "failed": 0, "no_campaign_id": 0, "held_by_limit": 0, "note": ""}
+    if not res["enabled"]:
+        res["note"] = "SPAM_AUTO is off (kill switch)."
+        return res
+    mode, mnote = sp_rules_mode()
+    res["mode"], res["note"] = mode, mnote
+    ledger.init()
+    if not ledger.acquire(run_id, now_s, 15):
+        res["note"] = "Another run is in progress; the rules did nothing."
+        return res
+    ad = None
+    try:
+        skip = set(skip or ())
+        cands = sp_rule_candidates(store, skip)
+        res["candidates"] = len(cands)
+        try:
+            ledger.notes_save([(c_["rkey"], c_["summary"], c_["reason"]) for c_ in cands[:400]], now_s)
+        except Exception:
+            pass
+        done_keys = {b["rkey"] for b in ledger.rule_blocks() if not b.get("unblocked_at")}
+        cands = [c_ for c_ in cands if c_["rkey"] not in done_keys]
+        per_run = _sp_int("SPAM_AUTO_RULES_PER_RUN", 100, 1, 1000)
+        per_day = _sp_int("SPAM_AUTO_RULES_PER_DAY", 2000, 1, 10000)
+        ad = (adapter or sp_adapter()) if mode == "live" else adapter
+        used = ledger.rule_attempts_today(now_s[:10]) if mode == "live" else 0
+        budget = max(0, min(per_run, per_day - used))
+        done = fails = 0
+        if mode == "live":
+            ok_c, why_c = ad.capability()
+            if not ok_c:
+                res["note"] = "Live mode, but Ringba blocking is not configured: " + why_c
+                return res
+            if hasattr(ad, "prime"):
+                ad.prime()
+        for c_ in cands:
+            norm, rule, rkey = c_["norm"], c_["rule"], c_["rkey"]
+            summ = c_["summary"]
+            label = SP_RULE_LABELS[rule] + (f" [{c_['campaign']}]" if rule == "WRONG_NUMBER" else "")
+            if mode == "shadow":
+                if not ledger.rule_seen(rkey, "RULE_WOULD_BLOCK"):
+                    ledger.log(now_s, run_id, mode, norm, rkey, 100, "RULE_WOULD_BLOCK", f"{label}; shadow mode, nothing sent to Ringba")
+                    res["would_block"] += 1
+                continue
+            if done >= budget:
+                res["held_by_limit"] += 1
+                continue
+            cid = None
+            if rule == "WRONG_NUMBER":
+                cid = ad.resolve_campaign(c_["campaign"]) if hasattr(ad, "resolve_campaign") else None
+                if not cid:
+                    res["no_campaign_id"] += 1
+                    if not ledger.rule_seen(rkey, "NO_CAMPAIGN_ID"):
+                        ledger.log(now_s, run_id, mode, norm, rkey, 100, "NO_CAMPAIGN_ID",
+                                   f"Ringba campaign ID for '{c_['campaign']}' is unknown, so this number was NOT blocked (it is never widened to all campaigns). Add it to SPAM_CAMPAIGN_IDS, e.g. {{\"{c_['campaign']}\": \"<campaign id>\"}}.")
+                    continue
+            try:
+                r_ = ad.block(norm, campaign=cid) if rule == "WRONG_NUMBER" else ad.block(norm)
+                done += 1
+                if r_ in ("posted", "already_listed", "conflict_possibly_listed"):
+                    ok_v = bool(ad.verify(norm, cid)) if rule == "WRONG_NUMBER" else bool(ad.verify(norm))
+                    st_ = "BLOCKED" if ok_v else "VERIFICATION_PENDING"
+                else:
+                    st_ = "FAILED"
+                ledger.log(now_s, run_id, mode, norm, rkey, 100, st_, f"{label}: {r_}")
+                if st_ in ("BLOCKED", "VERIFICATION_PENDING"):
+                    ledger.record_rule_block(rkey, norm, rule, c_["scope"], c_["campaign"], cid or "", getattr(ad, "last_block_id", None), now_s, st_ == "BLOCKED", c_["reason"] or label, summ)
+                    res["blocked" if st_ == "BLOCKED" else "pending"] += 1
+                else:
+                    res["failed"] += 1
+                    fails += 1
+            except PermissionError:
+                res["note"] = "Ringba refused the token: the rules run stopped. Check RINGBA_BLOCK_TOKEN (an Admin user's token)."
+                break
+            except Exception as exc:
+                done += 1
+                fails += 1
+                res["failed"] += 1
+                ledger.log(now_s, run_id, mode, norm, rkey, 100, "FAILED", f"{label}: {type(exc).__name__}")
+            if fails >= SP_AUTO_MAX_FAILS:
+                res["note"] = f"{fails} rule blocks failed in a row: the rules run stopped."
+                break
+        ledger.set_state("rules_last_run", res, now_s)
+    finally:
+        if mode == "live" and ad is not None and hasattr(ad, "unprime"):
+            ad.unprime()
+        ledger.release(run_id)
+    return res
+
+
+@_sp_needs_store
+def sp_apply_rule_ledger(store, rows, now=None):
+    """Copies the worker's rule blocks (Turso ledger) into this store so the sheet shows them as blocked. Idempotent."""
+    n = 0
+
+    def fn(c):
+        nonlocal n
+        for r in rows or []:
+            if r.get("unblocked_at"):
+                c.execute("UPDATE sp_rule_blocks SET verified=-1 WHERE caller_norm=? AND rule=? AND scope_key=?", (r["caller_norm"], r["rule"], r["scope_key"] or ""))   # -1 = removed again
+                continue
+            c.execute("INSERT INTO sp_rule_blocks(caller_norm, rule, scope_key, campaign, campaign_id, block_id, blocked_at, verified, reason, summary) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                      "ON CONFLICT(caller_norm, rule, scope_key) DO UPDATE SET block_id=excluded.block_id, blocked_at=excluded.blocked_at, verified=excluded.verified, reason=excluded.reason, summary=excluded.summary",
+                      (r["caller_norm"], r["rule"], r["scope_key"] or "", r.get("campaign") or "", r.get("campaign_id") or "", r.get("block_id"), r["blocked_at"], int(r.get("verified") or 0), r.get("reason") or "", r.get("summary") or ""))
+            n += 1
+    store._tx(fn)
+    return n
 
 
 @_sp_needs_store
@@ -18033,24 +18380,27 @@ def sp_call_date_text(v):
         return str(v or "")
     y, mo, d, hms = int(m.group(1)), m.group(2), m.group(3), m.group(4)
     if y >= 2000:
-        return f"{y:04d}-{mo}-{d} {hms}"
+        return pd.Timestamp(f"{y:04d}-{mo}-{d} {hms}").strftime("%Y-%m-%d %I:%M:%S %p")
     now = pd.Timestamp.now("UTC").tz_localize(None)
     try:
         t = pd.Timestamp(f"{now.year}-{mo}-{d} {hms}")
         if t > now + pd.Timedelta(days=1):
             t = t - pd.DateOffset(years=1)
-        return t.strftime("%Y-%m-%d %H:%M:%S")
+        return t.strftime("%Y-%m-%d %I:%M:%S %p")
     except Exception:
         return str(v)
 
 
-def sp_auto_frames(store, blocks, would, recent, full=False):
-    """The three tables of the Auto-block tab with DATES: when each number was blocked / flagged / logged (shown in SPAM_SHEET_TZ, default Asia/Dhaka, with the offset) and the date of its
+def sp_auto_frames(store, blocks, would, recent, full=False, notes=None, rule_blocks=None, rule_would=None):
+    """The three tables of the Auto-block tab with DATES: when each number was blocked / flagged / logged (shown in SPAM_SHEET_TZ, default America/New_York, 12-hour) and the date of its
     latest spam call and the number of spam calls (read from this app's own incident records). -> (blocks_df, would_df, recent_df)"""
     info = {}
     for r in store._q("SELECT caller_norm, MAX(call_ts) AS last_call, MIN(call_ts) AS first_call, COUNT(*) AS n, MAX(publisher) AS pub FROM sp_incidents WHERE classification='CONFIRMED_SPAM' AND caller_norm<>'' GROUP BY caller_norm"):
         info[r["caller_norm"]] = r
     L = lambda n: sp_disp(n, full)
+    notes = notes or {}
+    summ_of = lambda k: str((notes.get(k) or {}).get("summary") or "")[:300]
+    why_of = lambda k: str((notes.get(k) or {}).get("reason") or "")[:300]
 
     def enrich(df, norm_col="caller_norm"):
         df = df.copy()
@@ -18059,28 +18409,56 @@ def sp_auto_frames(store, blocks, would, recent, full=False):
         return df
     bdf = pd.DataFrame(blocks or [])
     if len(bdf):
+        bdf["Summary"] = bdf["caller_norm"].map(summ_of)
+        bdf["Reason"] = bdf["caller_norm"].map(why_of)
+        bdf["Rule"] = "Spam (QC report)"
+        bdf["Scope"] = "all campaigns"
         bdf = enrich(bdf)
         bdf["Blocked on"] = bdf["blocked_at"].map(sp_local_ts)
         bdf["Unblocked on"] = bdf["unblocked_at"].map(lambda v: sp_local_ts(v) if v else "") if "unblocked_at" in bdf.columns else ""
         bdf["Verified"] = bdf["verified"].map(lambda v: "yes" if int(v or 0) else "not yet") if "verified" in bdf.columns else ""
         bdf["Caller ID"] = bdf["caller_norm"].map(L)
         bdf = bdf.rename(columns={"confidence": "Confidence", "publisher": "Publisher"})
-        keep = [c for c in ("Caller ID", "Blocked on", "Last spam call", "Spam calls", "Confidence", "Publisher", "Verified", "Unblocked on", "unblocked_by") if c in bdf.columns]
+        keep = [c for c in ("Caller ID", "Blocked on", "Rule", "Scope", "Summary", "Reason", "Last spam call", "Spam calls", "Confidence", "Publisher", "Verified", "Unblocked on", "unblocked_by") if c in bdf.columns]
         bdf = bdf[keep]
+    if rule_blocks:
+        rb = pd.DataFrame(rule_blocks)
+        rb["Caller ID"] = rb["caller_norm"].map(L)
+        rb["Blocked on"] = rb["blocked_at"].map(sp_local_ts)
+        rb["Rule"] = rb["rule"].map(lambda r: SP_RULE_LABELS.get(r, r))
+        rb["Scope"] = rb["campaign"].map(lambda v: v or "all campaigns")
+        rb["Summary"] = [str(sm or "")[:300] or summ_of(k) for sm, k in zip(rb["summary"], rb["rkey"])]
+        rb["Reason"] = rb["reason"].fillna("")
+        rb["Verified"] = rb["verified"].map(lambda v: "yes" if int(v or 0) else "not yet")
+        rb["Unblocked on"] = rb["unblocked_at"].map(lambda v: sp_local_ts(v) if v else "") if "unblocked_at" in rb.columns else ""
+        rb = rb[["Caller ID", "Blocked on", "Rule", "Scope", "Summary", "Reason", "Verified", "Unblocked on"]]
+        bdf = pd.concat([rb, bdf], ignore_index=True) if len(bdf) else rb
+        bdf = bdf.fillna("")
     wdf = pd.DataFrame(would or [])
     if len(wdf):
         wdf = enrich(wdf)
+        wdf["Summary"] = wdf["caller_norm"].map(summ_of)
+        wdf["Rule"] = "Spam (QC report)"
         wdf["First flagged"] = wdf["first_flagged"].map(sp_local_ts)
         wdf["Caller ID"] = wdf["caller_norm"].map(L)
         wdf = wdf.rename(columns={"confidence": "Confidence", "times": "Times flagged"})
-        wdf = wdf[[c for c in ("Caller ID", "First flagged", "Last spam call", "Spam calls", "Confidence", "Times flagged") if c in wdf.columns]]
+        wdf = wdf[[c for c in ("Caller ID", "First flagged", "Rule", "Summary", "Last spam call", "Spam calls", "Confidence", "Times flagged") if c in wdf.columns]]
+    if rule_would:
+        rw = pd.DataFrame(rule_would)
+        rw["Caller ID"] = rw["caller_norm"].map(L)
+        rw["First flagged"] = rw["first_flagged"].map(sp_local_ts)
+        rw["Rule"] = rw["detail"].map(lambda d: str(d).split(";")[0])
+        rw["Summary"] = rw["proposal_id"].map(summ_of)
+        rw = rw[["Caller ID", "First flagged", "Rule", "Summary"]]
+        wdf = pd.concat([rw, wdf], ignore_index=True).fillna("") if len(wdf) else rw
     rdf = pd.DataFrame(recent or [])
     if len(rdf):
         rdf = enrich(rdf)
+        rdf["Summary"] = [summ_of(k if str(k).startswith("RULE:") else n) for k, n in zip(rdf["proposal_id"], rdf["caller_norm"])] if "proposal_id" in rdf.columns else ""
         rdf["Time"] = rdf["ts"].map(sp_local_ts)
         rdf["Caller ID"] = rdf["caller_norm"].map(L)
         rdf = rdf.rename(columns={"mode": "Mode", "outcome": "Outcome", "detail": "Detail", "confidence": "Confidence"})
-        rdf = rdf[[c for c in ("Time", "Caller ID", "Last spam call", "Outcome", "Mode", "Confidence", "Detail") if c in rdf.columns]]
+        rdf = rdf[[c for c in ("Time", "Caller ID", "Summary", "Last spam call", "Outcome", "Mode", "Confidence", "Detail") if c in rdf.columns]]
     return bdf, wdf, rdf
 
 
@@ -18093,6 +18471,7 @@ def _sp_auto_view(store, ident, now, full, snap, utc):
         return
     d = snap["data"]
     state, blocks, recent, would = d["state"], d["blocks"], d["recent"], d["would"]
+    rule_blocks, rule_would = d.get("rule_blocks") or [], d.get("rule_would") or []
 
     def age(row):
         try:
@@ -18114,6 +18493,14 @@ def _sp_auto_view(store, ident, now, full, snap, utc):
             x = {}
         a = age(lr)
         st.write(f"**Last full run:** {lr['updated_at']} UTC" + (f" ({max(0, a):.0f} min ago)" if a is not None else "") + f" · mode {x.get('mode', '?')} · candidates {x.get('candidates', 0)} · newly flagged this run {x.get('would_block', 0)} · blocked this run {x.get('blocked', 0)} · waiting for the next run {x.get('held_by_limit', 0)}")
+    rl = state.get("rules_last_run")
+    if rl:
+        try:
+            y = json.loads(rl["v"])
+        except Exception:
+            y = {}
+        st.write(f"**Rules (VoIP + silent, wrong number):** mode {y.get('mode', '?')} · candidates {y.get('candidates', 0)} · newly flagged {y.get('would_block', 0)} · blocked {y.get('blocked', 0)} · no campaign ID {y.get('no_campaign_id', 0)}"
+                 + (f" · {y.get('note')}" if y.get("note") else ""))
     err = state.get("last_error")
     if err and str(err.get("v") or "").strip():
         st.error("The worker's last error: " + str(err["v"])[:300])
@@ -18122,15 +18509,15 @@ def _sp_auto_view(store, ident, now, full, snap, utc):
         r = sp_adopt_worker_blocks(store, blocks, now, ad)
         st.success(f"{r['adopted']} number(s) adopted (each one re-checked on the Ringba block list), {r['skipped']} not confirmed.")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Blocked by the worker (active)", sum(1 for b in blocks if not b.get("unblocked_at")))
-    c2.metric("Flagged in shadow mode, still not blocked", len(would))
+    c1.metric("Blocked by the worker (active)", sum(1 for b in blocks if not b.get("unblocked_at")) + sum(1 for b in rule_blocks if not b.get("unblocked_at")))
+    c2.metric("Flagged in shadow mode, still not blocked", len(would) + len(rule_would))
     c3.metric("Ever flagged in shadow mode", d.get("would_total", 0))
-    bdf, wdf, rdf = sp_auto_frames(store, blocks, would, recent, full)
-    st.caption(f"Dates and times are shown in {sp_sheet_tz()} (SPAM_SHEET_TZ). 'Last spam call' is the call's own time from the sheet.")
-    if would:
+    bdf, wdf, rdf = sp_auto_frames(store, blocks, would, recent, full, notes=d.get("notes"), rule_blocks=rule_blocks, rule_would=rule_would)
+    st.caption(f"Block / flag times are shown in {sp_sheet_tz()} (SPAM_SHEET_TZ), 12-hour. 'Last spam call' is the call's own time as in the sheet (12-hour).")
+    if would or rule_would:
         st.markdown("**Shadow mode: these Caller IDs WOULD be blocked** (nothing was sent to Ringba). Check them, then switch the worker to live.")
         st.dataframe(wdf, hide_index=True, width="stretch")
-    if blocks:
+    if blocks or rule_blocks:
         st.markdown("**Numbers the worker blocked**")
         st.dataframe(bdf, hide_index=True, width="stretch")
     st.markdown("**Unblock a number** (removes it from Ringba, then allow-lists it)")
