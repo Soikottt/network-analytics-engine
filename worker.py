@@ -148,19 +148,23 @@ def _full_due(ledger, now, pd):
 
 
 def _rules_since(core, ledger, now, now_s, pd):
-    """The rules act only on calls made from this moment on ('from now on'). Fixed on the first run (saved in sw_state), or set with SPAM_RULES_SINCE=YYYY-MM-DD (US Eastern midnight)."""
+    """The rules act only on calls made from this moment on ('from now on'): fixed on the first run and saved in sw_state. SPAM_RULES_SINCE=YYYY-MM-DD (US Eastern midnight), when set,
+    OVERRIDES the saved moment (so an earlier start can be chosen at any time). Remove the variable to keep the last value."""
     st = ledger.state().get("rules_since")
-    if st and str(st.get("v") or "").strip():
-        return pd.Timestamp(str(st["v"]).strip('"'))
+    saved = pd.Timestamp(str(st["v"]).strip('"')) if st and str(st.get("v") or "").strip() else None
     env = os.environ.get("SPAM_RULES_SINCE", "").strip()
-    since = now
     if env:
         try:
             since = pd.Timestamp(env).tz_localize(os.environ.get("RINGBA_TIMEZONE", "America/New_York")).tz_convert("UTC").tz_localize(None)
+            if saved is None or since != saved:
+                ledger.set_state("rules_since", core["s16_ts"](since), now_s)
+            return since
         except Exception:
-            since = now
-    ledger.set_state("rules_since", core["s16_ts"](since), now_s)
-    return since
+            pass
+    if saved is not None:
+        return saved
+    ledger.set_state("rules_since", core["s16_ts"](now), now_s)
+    return now
 
 
 def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None):
