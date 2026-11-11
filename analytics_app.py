@@ -17995,7 +17995,7 @@ def sp_call_utc(ts):
 
 def sp_rule_hits(df):
     """Calls that match a rule, read from the loaded rows. VOIP_SILENT: column M 'Line Type' says VoIP AND the QC 'Call Type' is SILENT / NO RESPONSE.
-    VOIP_UNCLEAR: Line Type is VoIP AND the Note / summary says 'Call details were not clear enough to summarize' -> blocked for the call's own campaign only.
+    VOIP_UNCLEAR: column M 'Line Type' says VoIP AND (column H 'ShortSummary' says 'No clear caller topic identified') AND the call has a campaign name (column D) -> blocked for the call's own campaign only.
     WRONG_NUMBER: the QC 'Call Type' is WRONG NUMBER (or the QC reason / summary says 'wrong number') AND the call has a campaign name (column D): the block is for that campaign only.
     -> list of dicts."""
     if df is None or not len(df):
