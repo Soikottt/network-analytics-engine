@@ -193,9 +193,15 @@ def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None)
             df, tabs, ss = load_frame(core, [os.environ.get("SHEET_FAST_TAB", "")])     # quick run: only the tab where NEW calls arrive
         scan = core["sp_scan"](store, df, now, tab_default=tabs)
         since = None
+        rcfg = None
         try:                                                  # rules (VoIP + silent, wrong number): find the matching calls now, so their callers' history is saved with the rest
             since = _rules_since(core, ledger, now, now_s, pd)
-            core["sp_rules_scan"](store, df, now, since_utc=since, tab_default=tabs)
+            try:
+                ledger.init()
+                rcfg = ledger.cfg_get()                                  # rules switched off / added in the app (Auto-block tab)
+            except Exception:
+                rcfg = None
+            core["sp_rules_scan"](store, df, now, since_utc=since, tab_default=tabs, cfg=rcfg)
         except Exception as exc:
             log("rules scan failed: " + type(exc).__name__)
         try:                                                  # a caller's OLD history (QUALIFIED calls in the big tab) must survive a quick read of one tab
@@ -221,7 +227,7 @@ def run_once(core, why="timer", frame=None, client=None, adapter=None, now=None)
         res = core["sp_auto_run"](store, ledger, now, adapter=adapter, skip=skip, notes=notes)
         rres = {}
         try:                                                                  # rules: VoIP + silent, wrong number (this campaign only). Shadow until SPAM_AUTO_RULES_MODE=live.
-            rres = core["sp_rules_run"](store, ledger, now, adapter=adapter, skip=skip | set(ledger.blocked_set()), notes=notes, since_utc=since) 
+            rres = core["sp_rules_run"](store, ledger, now, adapter=adapter, skip=skip | set(ledger.blocked_set()), notes=notes, since_utc=since, cfg=rcfg) 
             core["sp_apply_rule_ledger"](store, ledger.rule_blocks(), now)
             res["rules"] = rres
         except Exception as exc:
