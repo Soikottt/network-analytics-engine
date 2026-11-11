@@ -16787,7 +16787,7 @@ def sp_latest_prop(props, norm):
 
 
 def _sp_scope_key(inc):
-    return re.sub(r"\s+", " ", str(inc["campaign"] or "").strip().lower()) if inc["classification"] == "RULE_WRONG_NUMBER" else ""
+    return re.sub(r"\s+", " ", str(inc["campaign"] or "").strip().lower()) if inc["classification"] in ("RULE_WRONG_NUMBER", "RULE_VOIP_UNCLEAR") else ""
 
 
 def _sp_rule_props(store):
@@ -17954,8 +17954,12 @@ def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, n
 # ---------------------------------------------------------------------------------------------------------------------
 # Rule-based auto-blocks (from the QC report / summary): VoIP + silent calls, and wrong-number calls (blocked for THAT campaign only)
 # ---------------------------------------------------------------------------------------------------------------------
-SP_RULE_CLASSES = {"VOIP_SILENT": "RULE_VOIP_SILENT", "WRONG_NUMBER": "RULE_WRONG_NUMBER"}
-SP_RULE_LABELS = {"VOIP_SILENT": "VoIP + silent call (no voice)", "WRONG_NUMBER": "Wrong number (this campaign only)"}
+SP_RULE_CLASSES = {"VOIP_SILENT": "RULE_VOIP_SILENT", "WRONG_NUMBER": "RULE_WRONG_NUMBER", "VOIP_UNCLEAR": "RULE_VOIP_UNCLEAR"}
+SP_RULE_LABELS = {"VOIP_SILENT": "VoIP + silent call (no voice)", "WRONG_NUMBER": "Wrong number (this campaign only)",
+                  "VOIP_UNCLEAR": "VoIP + unclear call ended by the caller (this campaign only)"}
+SP_RULE_CAMPAIGN = ("WRONG_NUMBER", "VOIP_UNCLEAR")                  # rules whose block is for the call's own campaign only
+SP_UNCLEAR_PAT = re.compile(r"not clear enough to summari[sz]e", re.I)
+SP_CALLER_ENDED_PAT = re.compile(r"caller ended the call", re.I)
 
 
 def sp_rules_enabled(rule):
@@ -17991,6 +17995,7 @@ def sp_call_utc(ts):
 
 def sp_rule_hits(df):
     """Calls that match a rule, read from the loaded rows. VOIP_SILENT: column M 'Line Type' says VoIP AND the QC 'Call Type' is SILENT / NO RESPONSE.
+    VOIP_UNCLEAR: Line Type is VoIP AND the Note / summary says 'Call details were not clear enough to summarize' -> blocked for the call's own campaign only.
     WRONG_NUMBER: the QC 'Call Type' is WRONG NUMBER (or the QC reason / summary says 'wrong number') AND the call has a campaign name (column D): the block is for that campaign only.
     -> list of dicts."""
     if df is None or not len(df):
@@ -18000,10 +18005,12 @@ def sp_rule_hits(df):
         return []
     low = {str(x).strip().lower(): x for x in df.columns}
     sc = next((low[n] for n in ("shortsummary", "short summary", "summary") if n in low), None)
+    nc = low.get("note")                                              # column G 'Note' carries the same kind of call summary
     qcs = df[c["qc"]].astype(str)
     pre = qcs.str.contains(r"SILENT|NO RESPONSE|WRONG\s*NUMBER", case=False, na=False, regex=True)
-    if sc:
-        pre = pre | df[sc].astype(str).str.contains(r"wrong\s*number", case=False, na=False, regex=True)
+    for col_ in (sc, nc):
+        if col_:
+            pre = pre | df[col_].astype(str).str.contains(r"wrong\s*number|not clear enough to summari", case=False, na=False, regex=True)
     out, seen = [], set()
     for i in np.flatnonzero(pre.to_numpy()):
         row = df.iloc[i]
@@ -18012,16 +18019,21 @@ def sp_rule_hits(df):
         ct = q["call_type"].upper()
         summ = str(row[sc]).strip() if sc else ""
         summ = "" if summ.lower() in ("nan", "none") else summ
+        note = str(row[nc]).strip() if nc else ""
+        note = "" if note.lower() in ("nan", "none") else note
+        both = (summ + " " + note).strip()
         rule = None
         if re.search(r"SILENT|NO RESPONSE", ct) and "voip" in g_("line").lower():
             rule = "VOIP_SILENT"
-        elif re.match(r"WRONG\s*NUMBER", ct) or (ct in ("", "OTHER") and re.search(r"wrong\s*number", q["reason"] + " " + summ, re.I)):
+        elif re.match(r"WRONG\s*NUMBER", ct) or (ct in ("", "OTHER") and re.search(r"wrong\s*number", q["reason"] + " " + both, re.I)):
             rule = "WRONG_NUMBER"
+        elif "voip" in g_("line").lower() and SP_UNCLEAR_PAT.search(both) and SP_CALLER_ENDED_PAT.search(both):
+            rule = "VOIP_UNCLEAR"
         if not rule:
             continue
         norm = sp_norm_caller(g_("caller"))
         camp = g_("campaign")
-        if not norm or (rule == "WRONG_NUMBER" and not camp):
+        if not norm or (rule in SP_RULE_CAMPAIGN and not camp):
             continue
         key, kind = sp_call_key(g_("call_id"), g_("recording"), g_("date"), g_("caller"), g_("buyer"), g_("publisher"), g_("campaign"), g_("duration"))
         if key in seen:
@@ -18029,9 +18041,11 @@ def sp_rule_hits(df):
         seen.add(key)
         if rule == "VOIP_SILENT":
             reason = "VoIP line + silent call (" + (q["reason"] or q["issue"] or "no voice") + ")"
+        elif rule == "VOIP_UNCLEAR":
+            reason = f"VoIP line + unclear call ended by the caller on campaign '{camp}' (summary: {both[:120]})"
         else:
             reason = f"Wrong number on campaign '{camp}'" + (": " + q["reason"] if q["reason"] and q["reason"].lower() != "none" else "")
-        out.append({"key": key, "kind": kind, "rule": rule, "norm": norm, "raw": g_("caller"), "campaign": camp, "reason": s16_scrub(reason, 300), "summary": s16_scrub(summ or q["reason"], 300),
+        out.append({"key": key, "kind": kind, "rule": rule, "norm": norm, "raw": g_("caller"), "campaign": camp, "reason": s16_scrub(reason, 300), "summary": s16_scrub(summ or note or q["reason"], 300),
                     "ts": sp_norm_ts(row[c["date"]]) if c.get("date") else "", "call_id": g_("call_id"), "buyer": g_("buyer"), "publisher": g_("publisher"),
                     "tab": g_("tab")})
     return out
@@ -18057,7 +18071,7 @@ def sp_rules_scan(store, df, now, since_utc=None, tab_default=""):
             if cx.execute("SELECT 1 FROM sp_incidents WHERE call_key=?", (h["key"],)).fetchone():
                 continue
             iid = sp_incident_id(h["key"])
-            scope = h["campaign"] if h["rule"] == "WRONG_NUMBER" else "all campaigns"
+            scope = h["campaign"] if h["rule"] in SP_RULE_CAMPAIGN else "all campaigns"
             ev = s16_json({"evidence": [h["reason"], "block scope: " + scope], "rule": h["rule"], "campaign": h["campaign"], "summary": h["summary"],
                            "decision_basis": "rule: " + SP_RULE_LABELS[h["rule"]]})
             cx.execute("""INSERT INTO sp_incidents(id, call_key, key_kind, call_id, call_ts, caller_raw, caller_norm, buyer, publisher, campaign, source_tab, classification, category,
@@ -18081,19 +18095,19 @@ def sp_rules_scan(store, df, now, since_utc=None, tab_default=""):
 @_sp_needs_store
 def sp_rule_candidates(store, skip):
     """One entry per (number, rule, scope): the number is blocked for all campaigns (VOIP_SILENT) or for the one campaign of the call (WRONG_NUMBER)."""
-    rows = store._q("SELECT caller_norm, classification, campaign, MAX(call_ts) AS last_call, COUNT(*) AS n FROM sp_incidents WHERE classification IN ('RULE_VOIP_SILENT','RULE_WRONG_NUMBER') AND caller_norm<>'' "
-                    "GROUP BY caller_norm, classification, CASE WHEN classification='RULE_WRONG_NUMBER' THEN lower(trim(campaign)) ELSE '' END ORDER BY last_call DESC")
+    rows = store._q("SELECT caller_norm, classification, campaign, MAX(call_ts) AS last_call, COUNT(*) AS n FROM sp_incidents WHERE classification IN ('RULE_VOIP_SILENT','RULE_WRONG_NUMBER','RULE_VOIP_UNCLEAR') AND caller_norm<>'' "
+                    "GROUP BY caller_norm, classification, CASE WHEN classification IN ('RULE_WRONG_NUMBER','RULE_VOIP_UNCLEAR') THEN lower(trim(campaign)) ELSE '' END ORDER BY last_call DESC")
     out = []
     for r in rows:
         norm = r["caller_norm"]
-        rule = "VOIP_SILENT" if r["classification"] == "RULE_VOIP_SILENT" else "WRONG_NUMBER"
+        rule = next(k_ for k_, v_ in SP_RULE_CLASSES.items() if v_ == r["classification"])
         if norm in skip or not sp_rules_enabled(rule):
             continue
         if sp_allowlisted(store, norm):
             continue
         if (sp_caller_stats(store, norm).get("qualified") or 0) > 0:
             continue                                                  # a QUALIFIED call exists for this number: a person decides
-        camp = str(r["campaign"] or "").strip() if rule == "WRONG_NUMBER" else ""
+        camp = str(r["campaign"] or "").strip() if rule in SP_RULE_CAMPAIGN else ""
         scope = re.sub(r"\s+", " ", camp.lower())
         last = store._q("SELECT call_key, evidence FROM sp_incidents WHERE caller_norm=? AND classification=? AND (?='' OR lower(trim(campaign))=?) ORDER BY call_ts DESC LIMIT 1", (norm, r["classification"], scope, scope))
         ck = last[0]["call_key"] if last else ""
@@ -18150,7 +18164,7 @@ def sp_rules_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, 
         for c_ in cands:
             norm, rule, rkey = c_["norm"], c_["rule"], c_["rkey"]
             summ = c_["summary"]
-            label = SP_RULE_LABELS[rule] + (f" [{c_['campaign']}]" if rule == "WRONG_NUMBER" else "")
+            label = SP_RULE_LABELS[rule] + (f" [{c_['campaign']}]" if rule in SP_RULE_CAMPAIGN else "")
             if mode == "shadow":
                 if not ledger.rule_seen(rkey, "RULE_WOULD_BLOCK"):
                     ledger.log(now_s, run_id, mode, norm, rkey, 100, "RULE_WOULD_BLOCK", f"{label}; shadow mode, nothing sent to Ringba")
@@ -18160,7 +18174,7 @@ def sp_rules_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, 
                 res["held_by_limit"] += 1
                 continue
             cid = None
-            if rule == "WRONG_NUMBER":
+            if rule in SP_RULE_CAMPAIGN:
                 cid = ad.resolve_campaign(c_["campaign"]) if hasattr(ad, "resolve_campaign") else None
                 if not cid:
                     res["no_campaign_id"] += 1
@@ -18169,10 +18183,10 @@ def sp_rules_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, 
                                    f"Ringba campaign ID for '{c_['campaign']}' is unknown, so this number was NOT blocked (it is never widened to all campaigns). Add it to SPAM_CAMPAIGN_IDS, e.g. {{\"{c_['campaign']}\": \"<campaign id>\"}}.")
                     continue
             try:
-                r_ = ad.block(norm, campaign=cid) if rule == "WRONG_NUMBER" else ad.block(norm)
+                r_ = ad.block(norm, campaign=cid) if rule in SP_RULE_CAMPAIGN else ad.block(norm)
                 done += 1
                 if r_ in ("posted", "already_listed", "conflict_possibly_listed"):
-                    ok_v = bool(ad.verify(norm, cid)) if rule == "WRONG_NUMBER" else bool(ad.verify(norm))
+                    ok_v = bool(ad.verify(norm, cid)) if rule in SP_RULE_CAMPAIGN else bool(ad.verify(norm))
                     st_ = "BLOCKED" if ok_v else "VERIFICATION_PENDING"
                 else:
                     st_ = "FAILED"
