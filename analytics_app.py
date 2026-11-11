@@ -16736,6 +16736,12 @@ def sp_desired_hash(d):
     return hashlib.sha1(json.dumps([d[k] for k in SP_COLUMNS]).encode()).hexdigest()[:20]
 
 
+def sp_app_autosync():
+    """Opening the page used to sync the spam status to the Google Sheet on its own (reads every tab of the sheet + asks Turso): that is what made the page slow. The worker syncs the sheet every few
+    minutes now, so the page only does it on the 'Sync spam status to the Google Sheet' button. SPAM_APP_AUTOSYNC=true brings the old behaviour back."""
+    return _cfg("SPAM_APP_AUTOSYNC", "false").lower() in ("1", "true", "yes", "on")
+
+
 def sp_row_coloring():
     """Rows blocked by the AUTOMATION are filled with SPAM_ROW_FILL (default #FC0000) with white bold text. SPAM_ROW_COLORING=false turns it off."""
     return _cfg("SPAM_ROW_COLORING", "true").lower() not in ("0", "false", "no", "off")
@@ -17205,7 +17211,7 @@ def render_spam_page(df, available_columns, overrides, timeline):
             _sp_auto_adopt(store, now)                         # from the status the person already loaded: no network request to Turso here
         except Exception:
             pass
-    if c2.button("Sync spam status to the Google Sheet", key="sp_sync_btn") or (sp_sheet_sync_on() and st.session_state.get("sp_autosync") != fp and meta.get("url")):
+    if c2.button("Sync spam status to the Google Sheet", key="sp_sync_btn") or (sp_sheet_sync_on() and sp_app_autosync() and st.session_state.get("sp_autosync") != fp and meta.get("url")):
         st.session_state["sp_autosync"] = fp
         try:
             try:                                           # blocks the worker made: take them into this store first, so this sync does not write PENDING_APPROVAL over them
