@@ -16787,7 +16787,7 @@ def sp_latest_prop(props, norm):
 
 
 def _sp_scope_key(inc):
-    return re.sub(r"\s+", " ", str(inc["campaign"] or "").strip().lower()) if inc["classification"] in ("RULE_WRONG_NUMBER", "RULE_VOIP_UNCLEAR") else ""
+    return re.sub(r"\s+", " ", str(inc["campaign"] or "").strip().lower()) if sp_rule_is_campaign(str(inc["classification"])[5:]) and str(inc["classification"]).startswith("RULE_") else ""
 
 
 def _sp_rule_props(store):
@@ -16800,7 +16800,7 @@ def _sp_rule_props(store):
     for r in rows:
         if int(r["verified"] or 0) < 0:
             continue
-        out[(r["caller_norm"], SP_RULE_CLASSES.get(r["rule"], r["rule"]), r["scope_key"] or "")] = {
+        out[(r["caller_norm"], sp_rule_class(r["rule"]), r["scope_key"] or "")] = {
             "review_status": "APPROVED", "exec_status": "BLOCKED" if int(r["verified"] or 0) else "VERIFICATION_PENDING", "decided_by": "auto-block (rule)",
             "decided_at": r["blocked_at"], "blocked_at": r["blocked_at"]}
     return out
@@ -17600,6 +17600,7 @@ SW_DDL = [
     "CREATE TABLE IF NOT EXISTS sw_hist (caller_norm TEXT PRIMARY KEY, calls INTEGER, qualified INTEGER, updated_at TEXT)",
     "CREATE TABLE IF NOT EXISTS sw_lock (id INTEGER PRIMARY KEY, holder TEXT, until_ts TEXT)",
     "CREATE TABLE IF NOT EXISTS sw_notes (k TEXT PRIMARY KEY, summary TEXT, reason TEXT, updated_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS sw_rule_cfg (k TEXT PRIMARY KEY, v TEXT, updated_at TEXT)",
     "CREATE TABLE IF NOT EXISTS sw_rule_blocks (rkey TEXT PRIMARY KEY, caller_norm TEXT, rule TEXT, scope_key TEXT, campaign TEXT, campaign_id TEXT, block_id TEXT, blocked_at TEXT, verified INTEGER DEFAULT 0, "
     "reason TEXT, summary TEXT, unblocked_at TEXT)",
 ]
@@ -17731,6 +17732,19 @@ class SwLedger:
             self._run([("INSERT INTO sw_notes(k, summary, reason, updated_at) VALUES (?,?,?,?) ON CONFLICT(k) DO UPDATE SET summary=excluded.summary, reason=excluded.reason, updated_at=excluded.updated_at",
                         (k, s16_scrub(sm, 300), s16_scrub(rs, 300), now_s)) for k, sm, rs in rows[i:i + 100]])
 
+    def cfg_get(self):
+        """The rule settings made in the app (written by the APP, read by the worker)."""
+        try:
+            r = self._run([("SELECT v FROM sw_rule_cfg WHERE k='rules'", ())])[0]
+            return sp_rules_cfg_norm(r[0]["v"]) if r else sp_rules_cfg_norm({})
+        except Exception:
+            return sp_rules_cfg_norm({})
+
+    def cfg_set(self, cfg, now_s):
+        c = sp_rules_cfg_norm(cfg)
+        self._run([("INSERT INTO sw_rule_cfg(k, v, updated_at) VALUES ('rules', ?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at", (json.dumps(c), now_s))])
+        return c
+
     def rule_blocks(self):
         return self._run([("SELECT * FROM sw_rule_blocks ORDER BY blocked_at DESC", ())])[0]
 
@@ -17761,9 +17775,10 @@ class SwLedger:
             ("SELECT k, summary, reason FROM sw_notes", ()),
             ("SELECT * FROM sw_rule_blocks ORDER BY blocked_at DESC", ()),
             ("SELECT proposal_id, caller_norm, MIN(ts) AS first_flagged, MAX(detail) AS detail FROM sw_log WHERE outcome='RULE_WOULD_BLOCK' AND proposal_id NOT IN (SELECT rkey FROM sw_rule_blocks) "
-             "GROUP BY proposal_id, caller_norm ORDER BY first_flagged DESC LIMIT 300", ())])
+             "GROUP BY proposal_id, caller_norm ORDER BY first_flagged DESC LIMIT 300", ()),
+            ("SELECT v FROM sw_rule_cfg WHERE k='rules'", ())])
         return {"state": {x["k"]: x for x in r[n]}, "blocks": r[n + 1], "recent": r[n + 2], "would": r[n + 3], "would_total": int(r[n + 4][0]["n"]) if r[n + 4] else 0,
-                "notes": {x["k"]: x for x in r[n + 5]}, "rule_blocks": r[n + 6], "rule_would": r[n + 7]}
+                "notes": {x["k"]: x for x in r[n + 5]}, "rule_blocks": r[n + 6], "rule_would": r[n + 7], "rules_cfg": sp_rules_cfg_norm(r[n + 8][0]["v"]) if r[n + 8] else sp_rules_cfg_norm({})}
 
     def recent(self, limit=300):
         return self._run([("SELECT ts, mode, caller_norm, proposal_id, confidence, outcome, detail FROM sw_log ORDER BY id DESC LIMIT ?", (int(limit),))])[0]
@@ -17954,16 +17969,65 @@ def sp_auto_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, n
 # ---------------------------------------------------------------------------------------------------------------------
 # Rule-based auto-blocks (from the QC report / summary): VoIP + silent calls, and wrong-number calls (blocked for THAT campaign only)
 # ---------------------------------------------------------------------------------------------------------------------
-SP_RULE_CLASSES = {"VOIP_SILENT": "RULE_VOIP_SILENT", "WRONG_NUMBER": "RULE_WRONG_NUMBER", "VOIP_UNCLEAR": "RULE_VOIP_UNCLEAR"}
+SP_RULE_CLASSES = {"VOIP_SILENT": "RULE_VOIP_SILENT", "WRONG_NUMBER": "RULE_WRONG_NUMBER", "VOIP_NO_TOPIC": "RULE_VOIP_NO_TOPIC"}
 SP_RULE_LABELS = {"VOIP_SILENT": "VoIP + silent call (no voice)", "WRONG_NUMBER": "Wrong number (this campaign only)",
-                  "VOIP_UNCLEAR": "VoIP + unclear call ended by the caller (this campaign only)"}
-SP_RULE_CAMPAIGN = ("WRONG_NUMBER", "VOIP_UNCLEAR")                  # rules whose block is for the call's own campaign only
-SP_UNCLEAR_PAT = re.compile(r"not clear enough to summari[sz]e", re.I)
-SP_CALLER_ENDED_PAT = re.compile(r"caller ended the call", re.I)
+                  "VOIP_NO_TOPIC": "VoIP + no clear caller topic (this campaign only)"}
+SP_RULE_CAMPAIGN = ("WRONG_NUMBER", "VOIP_NO_TOPIC")                  # rules whose block is for the call's own campaign only
+SP_NO_TOPIC_PAT = re.compile(r"no clear caller topic identified", re.I)
 
 
-def sp_rules_enabled(rule):
-    return _sp_truthy("SPAM_AUTO_" + rule, "true")
+SP_CFG_FIELDS = {"summary": "Summary (column H)", "note": "Note (column G)", "qc": "AI QC report (column K)", "any": "Summary, Note or QC report"}
+
+
+def sp_rules_cfg_norm(cfg):
+    """The rule settings made in the app ({"off": [built-in rules turned off], "custom": [{id, name, field, contains, voip, scope, on}]}), cleaned and validated. Anything odd is dropped."""
+    out = {"off": [], "custom": []}
+    try:
+        c = cfg if isinstance(cfg, dict) else json.loads(cfg or "{}")
+    except Exception:
+        c = {}
+    out["off"] = [k for k in (c.get("off") or []) if k in SP_RULE_CLASSES]
+    seen = set()
+    for r in (c.get("custom") or [])[:20]:
+        try:
+            rid = re.sub(r"[^a-z0-9]", "", str(r.get("id") or "").lower())[:12]
+            txt = re.sub(r"\s+", " ", str(r.get("contains") or "").strip())
+            if not rid or rid in seen or len(txt) < 6 or str(r.get("field")) not in SP_CFG_FIELDS or str(r.get("scope")) not in ("campaign", "all"):
+                continue                                              # a too-short text would match almost every call
+            seen.add(rid)
+            out["custom"].append({"id": rid, "name": re.sub(r"\s+", " ", str(r.get("name") or txt).strip())[:80] or txt[:80], "field": str(r["field"]), "contains": txt[:200],
+                                  "voip": bool(r.get("voip")), "scope": str(r["scope"]), "on": bool(r.get("on", True))})
+        except Exception:
+            continue
+    return out
+
+
+def sp_custom_key(r):
+    return ("CUSTOM_C_" if r["scope"] == "campaign" else "CUSTOM_A_") + r["id"]
+
+
+def sp_rule_is_campaign(rule):
+    return rule in SP_RULE_CAMPAIGN or str(rule).startswith("CUSTOM_C_")
+
+
+def sp_rule_class(rule):
+    return SP_RULE_CLASSES.get(rule) or "RULE_" + str(rule)
+
+
+def sp_rule_label(rule, cfg=None):
+    if rule in SP_RULE_LABELS:
+        return SP_RULE_LABELS[rule]
+    for r in sp_rules_cfg_norm(cfg)["custom"]:
+        if sp_custom_key(r) == rule:
+            return r["name"] + (" (this campaign only)" if r["scope"] == "campaign" else " (all campaigns)")
+    return str(rule)
+
+
+def sp_rules_enabled(rule, cfg=None):
+    c = sp_rules_cfg_norm(cfg)
+    if rule in SP_RULE_CLASSES:
+        return _sp_truthy("SPAM_AUTO_" + rule, "true") and rule not in c["off"]
+    return any(sp_custom_key(r) == rule and r["on"] for r in c["custom"])
 
 
 def sp_rules_mode():
@@ -17993,9 +18057,9 @@ def sp_call_utc(ts):
         return None
 
 
-def sp_rule_hits(df):
+def sp_rule_hits(df, cfg=None):
     """Calls that match a rule, read from the loaded rows. VOIP_SILENT: column M 'Line Type' says VoIP AND the QC 'Call Type' is SILENT / NO RESPONSE.
-    VOIP_UNCLEAR: column M 'Line Type' says VoIP AND (column H 'ShortSummary' says 'No clear caller topic identified') AND the call has a campaign name (column D) -> blocked for the call's own campaign only.
+    VOIP_NO_TOPIC: Line Type is VoIP AND column H (ShortSummary) says 'No clear caller topic identified' -> blocked for the call's own campaign only.
     WRONG_NUMBER: the QC 'Call Type' is WRONG NUMBER (or the QC reason / summary says 'wrong number') AND the call has a campaign name (column D): the block is for that campaign only.
     -> list of dicts."""
     if df is None or not len(df):
@@ -18005,12 +18069,19 @@ def sp_rule_hits(df):
         return []
     low = {str(x).strip().lower(): x for x in df.columns}
     sc = next((low[n] for n in ("shortsummary", "short summary", "summary") if n in low), None)
-    nc = low.get("note")                                              # column G 'Note' carries the same kind of call summary
+    nc = low.get("note")                                              # column G 'Note' (used by custom rules)
     qcs = df[c["qc"]].astype(str)
     pre = qcs.str.contains(r"SILENT|NO RESPONSE|WRONG\s*NUMBER", case=False, na=False, regex=True)
     for col_ in (sc, nc):
         if col_:
-            pre = pre | df[col_].astype(str).str.contains(r"wrong\s*number|not clear enough to summari", case=False, na=False, regex=True)
+            pre = pre | df[col_].astype(str).str.contains(r"wrong\s*number|no clear caller topic identified", case=False, na=False, regex=True)
+    cc = [r for r in sp_rules_cfg_norm(cfg)["custom"] if r["on"]]
+    ccols = {"summary": [sc], "note": [nc], "qc": [c["qc"]], "any": [sc, nc, c["qc"]]}
+    for r in cc:
+        cols_ = [x for x in ccols[r["field"]] if x]
+        for x in cols_:
+            pre = pre | df[x].astype(str).str.contains(re.escape(r["contains"]), case=False, na=False, regex=True)
+    off_ = set(sp_rules_cfg_norm(cfg)["off"])
     out, seen = [], set()
     for i in np.flatnonzero(pre.to_numpy()):
         row = df.iloc[i]
@@ -18027,13 +18098,21 @@ def sp_rule_hits(df):
             rule = "VOIP_SILENT"
         elif re.match(r"WRONG\s*NUMBER", ct) or (ct in ("", "OTHER") and re.search(r"wrong\s*number", q["reason"] + " " + both, re.I)):
             rule = "WRONG_NUMBER"
-        elif "voip" in g_("line").lower() and SP_UNCLEAR_PAT.search(both) and SP_CALLER_ENDED_PAT.search(both):
-            rule = "VOIP_UNCLEAR"
+        elif "voip" in g_("line").lower() and SP_NO_TOPIC_PAT.search(summ):                  # column H (ShortSummary) only
+            rule = "VOIP_NO_TOPIC"
+        if rule in off_:
+            rule = None
+        if not rule:                                                      # the rules made in the app (checked after the built-in ones)
+            hay = {"summary": summ, "note": note, "qc": str(row[c["qc"]]), "any": " ".join((summ, note, str(row[c["qc"]])))}
+            for r in cc:
+                if r["contains"].lower() in hay[r["field"]].lower() and (not r["voip"] or "voip" in g_("line").lower()):
+                    rule = sp_custom_key(r)
+                    break
         if not rule:
             continue
         norm = sp_norm_caller(g_("caller"))
         camp = g_("campaign")
-        if not norm or (rule in SP_RULE_CAMPAIGN and not camp):
+        if not norm or (sp_rule_is_campaign(rule) and not camp):
             continue
         key, kind = sp_call_key(g_("call_id"), g_("recording"), g_("date"), g_("caller"), g_("buyer"), g_("publisher"), g_("campaign"), g_("duration"))
         if key in seen:
@@ -18041,8 +18120,10 @@ def sp_rule_hits(df):
         seen.add(key)
         if rule == "VOIP_SILENT":
             reason = "VoIP line + silent call (" + (q["reason"] or q["issue"] or "no voice") + ")"
-        elif rule == "VOIP_UNCLEAR":
-            reason = f"VoIP line + unclear call ended by the caller on campaign '{camp}' (summary: {both[:120]})"
+        elif rule == "VOIP_NO_TOPIC":
+            reason = f"VoIP line + 'No clear caller topic identified' on campaign '{camp}'"
+        elif rule not in SP_RULE_CLASSES:
+            reason = f"Rule '{sp_rule_label(rule, cfg)}'" + (f" on campaign '{camp}'" if sp_rule_is_campaign(rule) else "")
         else:
             reason = f"Wrong number on campaign '{camp}'" + (": " + q["reason"] if q["reason"] and q["reason"].lower() != "none" else "")
         out.append({"key": key, "kind": kind, "rule": rule, "norm": norm, "raw": g_("caller"), "campaign": camp, "reason": s16_scrub(reason, 300), "summary": s16_scrub(summ or note or q["reason"], 300),
@@ -18052,10 +18133,10 @@ def sp_rule_hits(df):
 
 
 @_sp_needs_store
-def sp_rules_scan(store, df, now, since_utc=None, tab_default=""):
+def sp_rules_scan(store, df, now, since_utc=None, tab_default="", cfg=None):
     """Stores the rule matches as incidents (class RULE_VOIP_SILENT / RULE_WRONG_NUMBER) - only calls made at or after `since_utc` ('from now on'), and never a call that already is a spam incident."""
     now_s = s16_ts(now)
-    hits = sp_rule_hits(df)
+    hits = sp_rule_hits(df, cfg)
     out = {"hits": len(hits), "new": 0, "old": 0}
     keep = []
     for h in hits:
@@ -18071,13 +18152,13 @@ def sp_rules_scan(store, df, now, since_utc=None, tab_default=""):
             if cx.execute("SELECT 1 FROM sp_incidents WHERE call_key=?", (h["key"],)).fetchone():
                 continue
             iid = sp_incident_id(h["key"])
-            scope = h["campaign"] if h["rule"] in SP_RULE_CAMPAIGN else "all campaigns"
+            scope = h["campaign"] if sp_rule_is_campaign(h["rule"]) else "all campaigns"
             ev = s16_json({"evidence": [h["reason"], "block scope: " + scope], "rule": h["rule"], "campaign": h["campaign"], "summary": h["summary"],
-                           "decision_basis": "rule: " + SP_RULE_LABELS[h["rule"]]})
+                           "decision_basis": "rule: " + sp_rule_label(h["rule"], cfg)})
             cx.execute("""INSERT INTO sp_incidents(id, call_key, key_kind, call_id, call_ts, caller_raw, caller_norm, buyer, publisher, campaign, source_tab, classification, category,
                        confidence, evidence, rules, qc_fp, first_seen, last_seen, times_seen, sheet_state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'pending')""",
                        (iid, h["key"], h["kind"], h["call_id"], h["ts"], h["raw"], h["norm"], h["buyer"], h["publisher"], h["campaign"], h["tab"] or tab_default,
-                        SP_RULE_CLASSES[h["rule"]], SP_RULE_LABELS[h["rule"]], 100, ev, json.dumps([h["rule"]]), "rule", now_s, now_s))
+                        sp_rule_class(h["rule"]), sp_rule_label(h["rule"], cfg), 100, ev, json.dumps([h["rule"]]), "rule", now_s, now_s))
             out["new"] += 1
     store._tx(fn)
     try:                                                    # call / QUALIFIED-call counts of the rule callers and of EVERY caller that ever made a QUALIFIED call (a rule never blocks those)
@@ -18093,21 +18174,21 @@ def sp_rules_scan(store, df, now, since_utc=None, tab_default=""):
 
 
 @_sp_needs_store
-def sp_rule_candidates(store, skip):
+def sp_rule_candidates(store, skip, cfg=None):
     """One entry per (number, rule, scope): the number is blocked for all campaigns (VOIP_SILENT) or for the one campaign of the call (WRONG_NUMBER)."""
-    rows = store._q("SELECT caller_norm, classification, campaign, MAX(call_ts) AS last_call, COUNT(*) AS n FROM sp_incidents WHERE classification IN ('RULE_VOIP_SILENT','RULE_WRONG_NUMBER','RULE_VOIP_UNCLEAR') AND caller_norm<>'' "
-                    "GROUP BY caller_norm, classification, CASE WHEN classification IN ('RULE_WRONG_NUMBER','RULE_VOIP_UNCLEAR') THEN lower(trim(campaign)) ELSE '' END ORDER BY last_call DESC")
+    rows = store._q("SELECT caller_norm, classification, campaign, MAX(call_ts) AS last_call, COUNT(*) AS n FROM sp_incidents WHERE classification LIKE 'RULE_%' AND caller_norm<>'' "
+                    "GROUP BY caller_norm, classification, CASE WHEN classification IN ('RULE_WRONG_NUMBER','RULE_VOIP_NO_TOPIC') OR classification LIKE 'RULE_CUSTOM_C_%' THEN lower(trim(campaign)) ELSE '' END ORDER BY last_call DESC")
     out = []
     for r in rows:
         norm = r["caller_norm"]
-        rule = next(k_ for k_, v_ in SP_RULE_CLASSES.items() if v_ == r["classification"])
-        if norm in skip or not sp_rules_enabled(rule):
+        rule = str(r["classification"])[5:]
+        if norm in skip or not sp_rules_enabled(rule, cfg):
             continue
         if sp_allowlisted(store, norm):
             continue
         if (sp_caller_stats(store, norm).get("qualified") or 0) > 0:
             continue                                                  # a QUALIFIED call exists for this number: a person decides
-        camp = str(r["campaign"] or "").strip() if rule in SP_RULE_CAMPAIGN else ""
+        camp = str(r["campaign"] or "").strip() if sp_rule_is_campaign(rule) else ""
         scope = re.sub(r"\s+", " ", camp.lower())
         last = store._q("SELECT call_key, evidence FROM sp_incidents WHERE caller_norm=? AND classification=? AND (?='' OR lower(trim(campaign))=?) ORDER BY call_ts DESC LIMIT 1", (norm, r["classification"], scope, scope))
         ck = last[0]["call_key"] if last else ""
@@ -18122,7 +18203,7 @@ def sp_rule_candidates(store, skip):
 
 
 @_sp_needs_store
-def sp_rules_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, notes=None, since_utc=None):
+def sp_rules_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, notes=None, since_utc=None, cfg=None):
     """One pass over the rule matches. Shadow (default) only LOGS what it would block. Live: VOIP_SILENT is blocked with the normal scope; WRONG_NUMBER only with the call's own campaign ID.
     If that ID is unknown the number is NOT blocked (never widened to all campaigns)."""
     now_s = s16_ts(now)
@@ -18140,7 +18221,7 @@ def sp_rules_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, 
     ad = None
     try:
         skip = set(skip or ())
-        cands = sp_rule_candidates(store, skip)
+        cands = sp_rule_candidates(store, skip, cfg)
         res["candidates"] = len(cands)
         try:
             ledger.notes_save([(c_["rkey"], c_["summary"], c_["reason"]) for c_ in cands[:400]], now_s)
@@ -18164,7 +18245,7 @@ def sp_rules_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, 
         for c_ in cands:
             norm, rule, rkey = c_["norm"], c_["rule"], c_["rkey"]
             summ = c_["summary"]
-            label = SP_RULE_LABELS[rule] + (f" [{c_['campaign']}]" if rule in SP_RULE_CAMPAIGN else "")
+            label = sp_rule_label(rule, cfg) + (f" [{c_['campaign']}]" if sp_rule_is_campaign(rule) else "")
             if mode == "shadow":
                 if not ledger.rule_seen(rkey, "RULE_WOULD_BLOCK"):
                     ledger.log(now_s, run_id, mode, norm, rkey, 100, "RULE_WOULD_BLOCK", f"{label}; shadow mode, nothing sent to Ringba")
@@ -18174,7 +18255,7 @@ def sp_rules_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, 
                 res["held_by_limit"] += 1
                 continue
             cid = None
-            if rule in SP_RULE_CAMPAIGN:
+            if sp_rule_is_campaign(rule):
                 cid = ad.resolve_campaign(c_["campaign"]) if hasattr(ad, "resolve_campaign") else None
                 if not cid:
                     res["no_campaign_id"] += 1
@@ -18183,10 +18264,10 @@ def sp_rules_run(store, ledger, now=None, adapter=None, run_id=None, skip=None, 
                                    f"Ringba campaign ID for '{c_['campaign']}' is unknown, so this number was NOT blocked (it is never widened to all campaigns). Add it to SPAM_CAMPAIGN_IDS, e.g. {{\"{c_['campaign']}\": \"<campaign id>\"}}.")
                     continue
             try:
-                r_ = ad.block(norm, campaign=cid) if rule in SP_RULE_CAMPAIGN else ad.block(norm)
+                r_ = ad.block(norm, campaign=cid) if sp_rule_is_campaign(rule) else ad.block(norm)
                 done += 1
                 if r_ in ("posted", "already_listed", "conflict_possibly_listed"):
-                    ok_v = bool(ad.verify(norm, cid)) if rule in SP_RULE_CAMPAIGN else bool(ad.verify(norm))
+                    ok_v = bool(ad.verify(norm, cid)) if sp_rule_is_campaign(rule) else bool(ad.verify(norm))
                     st_ = "BLOCKED" if ok_v else "VERIFICATION_PENDING"
                 else:
                     st_ = "FAILED"
@@ -18433,7 +18514,74 @@ def _sp_tab_auto(store, ident, now, full=False):
         st.info("Press 'Load / refresh worker status' to see what the worker did.")
         return
     utc = pd.Timestamp.now("UTC").tz_localize(None)       # the worker stores UTC times: compare with the real UTC clock, not the report time zone
+    if snap.get("data") is not None:
+        _sp_rules_editor(snap, now)
     _sp_auto_view(store, ident, now, full, snap, utc)
+
+
+def _sp_rules_save(snap, cfg, now):
+    """Writes the rule settings to Turso (the worker reads them at its next run) and updates the loaded snapshot. -> (ok, text)"""
+    led = _sp_turso_ledger()
+    if led is None:
+        return False, "Turso is not configured in this app's Secrets, so the settings cannot reach the worker."
+    try:
+        led.init()
+        c = led.cfg_set(cfg, s16_ts(now))
+    except Exception as exc:
+        return False, "Could not save the rule settings (" + type(exc).__name__ + ")."
+    snap["data"]["rules_cfg"] = c
+    return True, "Saved. The worker uses the new rules from its next run (within about 5 minutes)."
+
+
+def _sp_rules_editor(snap, now):
+    """Block rules you can switch off ('dismiss') or add. Only the worker blocks; this page only stores the rule settings."""
+    cfg = sp_rules_cfg_norm((snap.get("data") or {}).get("rules_cfg"))
+    with st.expander("Block rules: add or dismiss", expanded=False):
+        st.caption("The rules decide which calls the worker blocks on its own. A rule you add follows the same mode as the other rules (SPAM_AUTO_RULES_MODE: shadow = only logged), "
+                   "never blocks an allow-listed number or one with a QUALIFIED call, and is applied to new calls only. Turn a rule off to dismiss it; the numbers it already blocked stay blocked in Ringba.")
+        names = {"VOIP_SILENT": "VoIP + silent call (all campaigns)", "WRONG_NUMBER": "Wrong number (that campaign only)", "VOIP_NO_TOPIC": "VoIP + 'No clear caller topic identified' in column H (that campaign only)"}
+        offs = set(cfg["off"])
+        st.markdown("**Built-in rules**")
+        keep_on = {k: st.checkbox(v, value=k not in offs, key="sp_rule_on_" + k) for k, v in names.items()}
+        cust = cfg["custom"]
+        flags = {}
+        if cust:
+            st.markdown("**Your rules**")
+        for r in cust:
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                on_ = st.checkbox(f"{r['name']} · {SP_CFG_FIELDS[r['field']]} contains \"{r['contains']}\"" + (" · VoIP only" if r["voip"] else "") + (" · that campaign only" if r["scope"] == "campaign" else " · all campaigns"),
+                                  value=r["on"], key="sp_rule_c_on_" + r["id"])
+            with c2:
+                rm_ = st.checkbox("Dismiss (remove)", value=False, key="sp_rule_c_rm_" + r["id"])
+            flags[r["id"]] = (on_, rm_)
+        if st.button("Save rule on/off changes", key="sp_rule_save"):
+            new = {"off": [k for k, v in keep_on.items() if not v],
+                   "custom": [dict(r, on=flags[r["id"]][0]) for r in cust if not flags[r["id"]][1]]}
+            ok, msg = _sp_rules_save(snap, new, now)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+        st.markdown("**Add a rule**")
+        nm = st.text_input("Rule name", key="sp_rule_new_name")
+        fld = st.selectbox("Look in", list(SP_CFG_FIELDS), format_func=lambda k: SP_CFG_FIELDS[k], key="sp_rule_new_field")
+        txt = st.text_input("The text contains (at least 6 characters, not case sensitive)", key="sp_rule_new_text")
+        vp = st.checkbox("Only when Line Type (column M) is VoIP", value=True, key="sp_rule_new_voip")
+        scp = st.selectbox("Block for", ["campaign", "all"], format_func=lambda k: "that call's campaign only (column D)" if k == "campaign" else "all campaigns", key="sp_rule_new_scope")
+        if st.button("Add rule", key="sp_rule_add"):
+            if len(re.sub(r"\s+", " ", txt.strip())) < 6:
+                st.error("The text must have at least 6 characters, so that it cannot match almost every call.")
+            elif len(cust) >= 20:
+                st.error("At most 20 rules of your own.")
+            else:
+                rid = hashlib.sha1((nm + txt + str(time.time())).encode("utf-8")).hexdigest()[:8]
+                new = {"off": cfg["off"], "custom": cust + [{"id": rid, "name": nm.strip() or txt.strip(), "field": fld, "contains": txt.strip(), "voip": bool(vp), "scope": scp, "on": True}]}
+                ok, msg = _sp_rules_save(snap, new, now)
+                if ok:
+                    st.success("Rule added. " + msg)
+                else:
+                    st.error(msg)
 
 
 def sp_call_date_text(v):
@@ -18456,7 +18604,7 @@ def sp_call_date_text(v):
         return str(v)
 
 
-def sp_auto_frames(store, blocks, would, recent, full=False, notes=None, rule_blocks=None, rule_would=None):
+def sp_auto_frames(store, blocks, would, recent, full=False, notes=None, rule_blocks=None, rule_would=None, cfg=None):
     """The three tables of the Auto-block tab with DATES: when each number was blocked / flagged / logged (shown in SPAM_SHEET_TZ, default America/New_York, 12-hour) and the date of its
     latest spam call and the number of spam calls (read from this app's own incident records). -> (blocks_df, would_df, recent_df)"""
     info = {}
@@ -18490,7 +18638,7 @@ def sp_auto_frames(store, blocks, would, recent, full=False, notes=None, rule_bl
         rb = pd.DataFrame(rule_blocks)
         rb["Caller ID"] = rb["caller_norm"].map(L)
         rb["Blocked on"] = rb["blocked_at"].map(sp_local_ts)
-        rb["Rule"] = rb["rule"].map(lambda r: SP_RULE_LABELS.get(r, r))
+        rb["Rule"] = rb["rule"].map(lambda r: sp_rule_label(r, cfg))
         rb["Scope"] = rb["campaign"].map(lambda v: v or "all campaigns")
         rb["Summary"] = [str(sm or "")[:300] or summ_of(k) for sm, k in zip(rb["summary"], rb["rkey"])]
         rb["Reason"] = rb["reason"].fillna("")
@@ -18577,7 +18725,7 @@ def _sp_auto_view(store, ident, now, full, snap, utc):
     c1.metric("Blocked by the worker (active)", sum(1 for b in blocks if not b.get("unblocked_at")) + sum(1 for b in rule_blocks if not b.get("unblocked_at")))
     c2.metric("Flagged in shadow mode, still not blocked", len(would) + len(rule_would))
     c3.metric("Ever flagged in shadow mode", d.get("would_total", 0))
-    bdf, wdf, rdf = sp_auto_frames(store, blocks, would, recent, full, notes=d.get("notes"), rule_blocks=rule_blocks, rule_would=rule_would)
+    bdf, wdf, rdf = sp_auto_frames(store, blocks, would, recent, full, notes=d.get("notes"), rule_blocks=rule_blocks, rule_would=rule_would, cfg=d.get("rules_cfg"))
     st.caption(f"Block / flag times are shown in {sp_sheet_tz()} (SPAM_SHEET_TZ), 12-hour. 'Last spam call' is the call's own time as in the sheet (12-hour).")
     if would or rule_would:
         st.markdown("**Shadow mode: these Caller IDs WOULD be blocked** (nothing was sent to Ringba). Check them, then switch the worker to live.")
