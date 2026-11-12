@@ -27,6 +27,34 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+def ui_password_gate():
+    """If APP_PASSWORD is set (Streamlit Secrets or environment), nothing of the app is drawn or loaded until it is entered (once per browser session). Not set = no password screen.
+    The worker (Render) and the Apps Script never open this page, so the automation is not affected."""
+    import hmac
+    pw = ""
+    try:
+        pw = str(st.secrets.get("APP_PASSWORD", "") or "")
+    except Exception:
+        pw = ""
+    pw = pw or os.environ.get("APP_PASSWORD", "")
+    if not pw or st.session_state.get("ui_authed") is True:
+        return
+    st.markdown("### 🔒 Sign in")
+    entered = st.text_input("Password", type="password", key="ui_pw")
+    if st.button("Sign in", key="ui_pw_btn") or entered:
+        if hmac.compare_digest(entered.encode("utf-8"), pw.encode("utf-8")):
+            st.session_state["ui_authed"] = True
+            return
+        n = int(st.session_state.get("ui_pw_fails", 0)) + 1
+        st.session_state["ui_pw_fails"] = n
+        time.sleep(min(2 * n, 10))                                       # slows down guessing
+        st.error("Wrong password.")
+    st.stop()
+
+
+ui_password_gate()
+
 # (the old page title is replaced by the top bar below the menu)
 # ---------------------------------------------------------------
 # UI shell (look & navigation only). Every feature below is unchanged: this block only decides WHICH existing section is drawn on which
